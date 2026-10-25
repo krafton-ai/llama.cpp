@@ -4445,6 +4445,456 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+struct test_raon_situ_fuse : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int input_mode;
+    const int fallback;
+    const int alias_mode; // 1 = gate, 2 = up, 3 = partial gate overlap
+    ggml_tensor * raw_gate = nullptr;
+    ggml_tensor * raw_up = nullptr;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * up = nullptr;
+    ggml_tensor * backing = nullptr;
+    ggml_tensor * activation = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_raon_situ_fuse(std::array<int64_t, 4> ne, int input_mode = 0, int fallback = 0, int alias_mode = 0)
+        : ne(ne), input_mode(input_mode), fallback(fallback), alias_mode(alias_mode) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return fallback || alias_mode == 3 ? "RAON_SITU_FALLBACK" : "RAON_SITU_POSITIVE";
+    }
+    std::string vars() override { return VARS_TO_STR4(ne, input_mode, fallback, alias_mode); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-10; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = {result};
+        nodes.insert(nodes.end(), sentinels.begin(), sentinels.end());
+        return nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        std::array<int64_t, 4> up_ne = ne;
+        if (fallback == 6) {
+            up_ne[1] = 1;
+        }
+        raw_gate = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        raw_up = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, up_ne.data());
+        gate = ggml_dup(ctx, raw_gate);
+        up = ggml_dup(ctx, raw_up);
+        if (alias_mode) {
+            backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(gate) + 1);
+        }
+        if (fallback != 5 && gf) {
+            ggml_build_forward_expand(gf, gate);
+            ggml_build_forward_expand(gf, up);
+        }
+        ggml_tensor * g_scaled = ggml_scale_bias(ctx, gate, 0.25f, fallback == 2 ? 0.125f : 0.0f);
+        ggml_tensor * g_cap = ggml_scale(ctx, ggml_tanh(ctx, g_scaled), 4.0f);
+        ggml_tensor * sig_source = fallback == 3 ? up : gate;
+        ggml_tensor * sigmoid = fallback == 7 ? ggml_tanh(ctx, sig_source) : ggml_sigmoid(ctx, sig_source);
+        ggml_tensor * g_act = ggml_mul(ctx, g_cap, sigmoid);
+        ggml_tensor * u_cap = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f / 25.0f)),
+                fallback == 4 ? 26.0f : 25.0f);
+        activation = ggml_mul(ctx, g_act, u_cap);
+        ggml_set_name(activation, "raon_situ_test");
+        result = fallback == 1 ? ggml_add(ctx, activation, g_cap) : activation;
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * tensor : {raw_gate, raw_up}) {
+            std::vector<float> values(ggml_nelements(tensor));
+            for (size_t j = 0; j < values.size(); ++j) {
+                values[j] = tensor == raw_gate ? ((int) (j % 33) - 16) / 8.0f
+                                              : ((int) ((j*7) % 29) - 14) / 3.0f;
+                if (input_mode == 1) {
+                    values[j] = j % 2 == 0 ? -80.0f : 80.0f;
+                } else if (input_mode == 2) {
+                    values[j] *= 1e-7f;
+                } else if (input_mode == 3) {
+                    values[j] = j % 3 == 0 ? 0.0f : (j % 3 == 1 ? -1000.0f : 1000.0f);
+                }
+            }
+            ggml_backend_tensor_set(tensor, values.data(), 0, values.size()*sizeof(float));
+        }
+        if (alias_mode) {
+            ggml_tensor * input = alias_mode == 2 ? up : gate;
+            GGML_ASSERT(input->buffer == backing->buffer && activation->buffer == backing->buffer);
+            input->data = backing->data;
+            activation->data = (char *) input->data + (alias_mode == 3 ? sizeof(float) : 0);
+        }
+    }
+};
+
+struct test_raon_hc_rms_tail_fuse : public test_case {
+    const int64_t n_tokens;
+    const int input_mode;
+    const int fallback;
+    const int alias_mode;
+    const float eps;
+    ggml_tensor * flat = nullptr;
+    ggml_tensor * raw_selector = nullptr;
+    ggml_tensor * selector = nullptr;
+    ggml_tensor * mean = nullptr;
+    ggml_tensor * backing = nullptr;
+    ggml_tensor * fused_out = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_raon_hc_rms_tail_fuse(int64_t n_tokens, int input_mode = 0, int fallback = 0,
+            int alias_mode = 0, float eps = 1e-6f)
+        : n_tokens(n_tokens), input_mode(input_mode), fallback(fallback), alias_mode(alias_mode), eps(eps) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RAON_HC_RMS_TAIL_FUSE";
+    }
+    std::string vars() override { return VARS_TO_STR5(n_tokens, input_mode, fallback, alias_mode, eps); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-10; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = {result};
+        nodes.insert(nodes.end(), sentinels.begin(), sentinels.end());
+        return nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t width = fallback == 3 ? 18 : 17;
+        flat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, n_tokens);
+        raw_selector = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_tokens);
+        selector = ggml_dup(ctx, raw_selector);
+        mean = ggml_mean(ctx, ggml_sqr(ctx, flat));
+        if (fallback == 4) {
+            mean = ggml_dup(ctx, mean);
+        }
+        ggml_tensor * scaled = ggml_scale_bias(ctx, mean, fallback == 2 ? 2.0f : 1.0f, eps);
+        fused_out = ggml_div(ctx, selector, ggml_sqrt(ctx, scaled));
+        result = fallback == 1 ? ggml_add(ctx, fused_out, ggml_repeat(ctx, scaled, fused_out)) : fused_out;
+        if (alias_mode) {
+            backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width*n_tokens + 1);
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        std::vector<float> x(ggml_nelements(flat));
+        std::vector<float> v(ggml_nelements(raw_selector));
+        for (size_t i = 0; i < x.size(); ++i) {
+            x[i] = ((int) (i % 9) - 4) * 0.25f;
+            if (input_mode == 1) { x[i] = 0.0f; }
+            if (input_mode == 2) { x[i] *= 1e10f; }
+            if (input_mode == 3) { x[i] *= 1e-12f; }
+        }
+        for (size_t i = 0; i < v.size(); ++i) {
+            v[i] = ((int) ((i*7) % 31) - 15) * 0.125f;
+        }
+        ggml_backend_tensor_set(flat, x.data(), 0, x.size()*sizeof(float));
+        ggml_backend_tensor_set(raw_selector, v.data(), 0, v.size()*sizeof(float));
+        if (alias_mode == 1) {
+            GGML_ASSERT(selector->buffer == backing->buffer && fused_out->buffer == backing->buffer);
+            selector->data = backing->data;
+            fused_out->data = backing->data;
+        } else if (alias_mode == 2) {
+            GGML_ASSERT(mean->buffer == backing->buffer && fused_out->buffer == backing->buffer);
+            mean->data = backing->data;
+            fused_out->data = (char *) backing->data + sizeof(float);
+        }
+    }
+};
+
+struct test_raon_hc_helmert_fuse : public test_case {
+    const int64_t n_tokens;
+    const int input_mode;
+    const int basis;
+    const int fallback;
+    const int alias_mode;
+    ggml_tensor * h = nullptr;
+    ggml_tensor * h_other = nullptr;
+    ggml_tensor * raw_z = nullptr;
+    ggml_tensor * z = nullptr;
+    ggml_tensor * backing = nullptr;
+    ggml_tensor * fused_out = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_raon_hc_helmert_fuse(int64_t n_tokens, int input_mode = 0, int basis = -1,
+            int fallback = 0, int alias_mode = 0)
+        : n_tokens(n_tokens), input_mode(input_mode), basis(basis), fallback(fallback), alias_mode(alias_mode) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RAON_HC_HELMERT_FUSE";
+    }
+    std::string vars() override { return VARS_TO_STR5(n_tokens, input_mode, basis, fallback, alias_mode); }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    double max_nmse_err() override { return 1e-10; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = {result};
+        nodes.insert(nodes.end(), sentinels.begin(), sentinels.end());
+        return nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        h = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_F32, 3, 4);
+        if (fallback == 2) {
+            h_other = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_F32, 3, 4);
+        }
+        raw_z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, fallback == 4 ? 4 : 3, 3, n_tokens);
+        ggml_tensor * copied = ggml_dup(ctx, raw_z);
+        z = fallback == 4 ? ggml_view_3d(ctx, copied, 3, 3, n_tokens,
+                copied->nb[1], copied->nb[2], 0) : copied;
+        ggml_tensor * first = ggml_mul_mat(ctx, h, z);
+        ggml_tensor * transposed = fallback == 3 ? ggml_permute(ctx, first, 1, 0, 2, 3) : ggml_transpose(ctx, first);
+        fused_out = ggml_mul_mat(ctx, h_other ? h_other : h, ggml_cont(ctx, transposed));
+        result = fallback == 1 ? ggml_add(ctx, fused_out, ggml_repeat(ctx, ggml_sum(ctx, first), fused_out)) : fused_out;
+        if (alias_mode) {
+            backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16*n_tokens + 1);
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        float h_values[12];
+        float other_values[12];
+        for (int row = 0; row < 4; ++row) {
+            for (int k = 0; k < 3; ++k) {
+                h_values[row*3 + k] = (row <= k ? 1.0f : row == k + 1 ? -(float) (k + 1) : 0.0f) /
+                    sqrtf((k + 1)*(k + 2));
+                if (input_mode == 1) {
+                    h_values[row*3 + k] = ((row*5 + k*7) % 13 - 6) * 0.25f;
+                }
+                other_values[row*3 + k] = h_values[row*3 + k] + (row*3 + k + 1) * 0.03125f;
+            }
+        }
+        std::vector<float> values(ggml_nelements(raw_z));
+        const int row_width = raw_z->ne[0];
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int col = 0; col < 3; ++col) {
+                for (int k = 0; k < row_width; ++k) {
+                    float value = ((int) ((token*11 + col*7 + k*3) % 23) - 11) * 0.125f;
+                    if (basis >= 0) { value = col*3 + k == basis ? 1.0f + token*0.03125f : 0.0f; }
+                    if (input_mode == 2) { value = k == 0 ? 8192.0f : k == 1 ? -8192.0f : 0.5f; }
+                    values[token*3*row_width + col*row_width + k] = value;
+                }
+            }
+        }
+        ggml_backend_tensor_set(h, h_values, 0, sizeof(h_values));
+        if (h_other) {
+            ggml_backend_tensor_set(h_other, other_values, 0, sizeof(other_values));
+        }
+        ggml_backend_tensor_set(raw_z, values.data(), 0, values.size()*sizeof(float));
+        if (alias_mode) {
+            GGML_ASSERT(z->buffer == backing->buffer && fused_out->buffer == backing->buffer);
+            z->data = backing->data;
+            fused_out->data = (char *) backing->data + sizeof(float);
+        }
+    }
+};
+
+struct test_raon_hc_affine_fuse : public test_case {
+    const int kind; // 0 = pre, 1 = post, 2 = Helmert coordinates
+    const int64_t n_tokens;
+    const int input_mode;
+    const int fallback; // 1 = external consumer, 2/3 = wrong base/scale offset, 4 = post bias, 5 = unary
+    const int alias_mode; // 1 = same start, 2 = one-float offset
+    ggml_tensor * raw_mixes = nullptr;
+    ggml_tensor * mixes = nullptr;
+    ggml_tensor * mixes_view = nullptr;
+    ggml_tensor * scale = nullptr;
+    ggml_tensor * base = nullptr;
+    ggml_tensor * backing = nullptr;
+    ggml_tensor * affine_out = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_raon_hc_affine_fuse(int kind, int64_t n_tokens, int input_mode = 0, int fallback = 0, int alias_mode = 0)
+        : kind(kind), n_tokens(n_tokens), input_mode(input_mode), fallback(fallback), alias_mode(alias_mode) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RAON_HC_AFFINE_FUSE";
+    }
+    std::string vars() override { return VARS_TO_STR5(kind, n_tokens, input_mode, fallback, alias_mode); }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    double max_nmse_err() override { return 1e-10; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = {result};
+        nodes.insert(nodes.end(), sentinels.begin(), sentinels.end());
+        return nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        const int64_t width = kind == 2 ? 9 : 4;
+        const int64_t offset = 4*kind;
+        raw_mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 17, n_tokens);
+        mixes = ggml_dup(ctx, raw_mixes);
+        scale = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, 4);
+        base = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, 17);
+        if (alias_mode) {
+            backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 17*n_tokens + 1);
+        }
+        mixes_view = ggml_view_2d(ctx, mixes, width, n_tokens, mixes->nb[1], offset*sizeof(float));
+        ggml_tensor * sv = ggml_view_1d(ctx, scale, 1, (fallback == 3 ? (kind + 1) % 3 : kind)*sizeof(float));
+        ggml_tensor * mul = ggml_mul(ctx, mixes_view, sv);
+        const int64_t base_offset = fallback == 2 ? (offset == 0 ? 1 : offset - 1) : offset;
+        ggml_tensor * bv = ggml_view_1d(ctx, base, width, base_offset*sizeof(float));
+        ggml_tensor * affine = ggml_add(ctx, mul, bv);
+        if (kind == 2) {
+            affine_out = ggml_cont_3d(ctx, affine, 3, 3, n_tokens);
+        } else {
+            affine_out = fallback == 5 ? ggml_tanh(ctx, affine) : ggml_sigmoid(ctx, affine);
+            if (kind == 1) {
+                affine_out = ggml_scale_bias(ctx, affine_out, 2.0f, fallback == 4 ? 0.25f : 0.0f);
+            }
+        }
+        result = affine_out;
+        if (fallback == 1) {
+            ggml_tensor * external = kind == 2 ? ggml_reshape_3d(ctx, mul, 3, 3, n_tokens) : mul;
+            result = ggml_add(ctx, affine_out, external);
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        std::vector<float> values(17*n_tokens);
+        float scales[4] = {0.2f, -0.1f, 0.5f, 0.3f};
+        float bases[17];
+        for (int j = 0; j < 17; ++j) {
+            bases[j] = (j - 8) / 13.0f;
+        }
+        for (size_t j = 0; j < values.size(); ++j) {
+            values[j] = ((int) ((j*11) % 25) - 12) / 7.0f;
+            if (input_mode == 1) {
+                values[j] = j % 2 == 0 ? -80.0f : 80.0f;
+            } else if (input_mode == 2) {
+                // MUL rounds 4097*4097 to 16785408; a contracted FMA would leave 1.
+                values[j] = 4097.0f;
+            }
+        }
+        if (input_mode != 0) {
+            for (float & value : scales) { value = input_mode == 2 ? 4097.0f : 1.0f; }
+            for (int j = 0; j < 17; ++j) {
+                // Keep some z outputs nonzero so its normalized error has a finite denominator.
+                bases[j] = input_mode == 2 ? -16785408.0f + 2.0f*(j % 2) : 0.0f;
+            }
+        }
+        ggml_backend_tensor_set(raw_mixes, values.data(), 0, values.size()*sizeof(float));
+        ggml_backend_tensor_set(scale, scales, 0, sizeof(scales));
+        ggml_backend_tensor_set(base, bases, 0, sizeof(bases));
+        if (alias_mode) {
+            GGML_ASSERT(mixes->buffer == backing->buffer && mixes_view->buffer == backing->buffer &&
+                    affine_out->buffer == backing->buffer);
+            // Only data pointers change: the CPU graph copy keeps independent output storage.
+            mixes->data = backing->data;
+            mixes_view->data = (char *) mixes->data + mixes_view->view_offs;
+            affine_out->data = (char *) mixes_view->data + (alias_mode == 2 ? sizeof(float) : 0);
+        }
+    }
+};
+
+struct test_raon_hc_comb_fuse : public test_case {
+    const int64_t n_tokens;
+    const float eta;
+    const int input_mode;
+    const int fallback;
+    const int alias_mode;
+    ggml_tensor * e = nullptr;
+    ggml_tensor * raw_e = nullptr;
+    ggml_tensor * backing = nullptr;
+    ggml_tensor * scale = nullptr;
+    ggml_tensor * chart = nullptr;
+    ggml_tensor * identity = nullptr;
+    ggml_tensor * comb = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_raon_hc_comb_fuse(int64_t n_tokens, float eta, int input_mode = 0, int fallback = 0, int alias_mode = 0)
+        : n_tokens(n_tokens), eta(eta), input_mode(input_mode), fallback(fallback), alias_mode(alias_mode) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RAON_HC_COMB_FUSE";
+    }
+    std::string vars() override { return VARS_TO_STR5(n_tokens, eta, input_mode, fallback, alias_mode); }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    double max_nmse_err() override { return 1e-10; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (!alias_mode) {
+            return {};
+        }
+        std::vector<ggml_tensor *> nodes = {result};
+        nodes.insert(nodes.end(), sentinels.begin(), sentinels.end());
+        return nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        raw_e = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, n_tokens);
+        e = alias_mode ? ggml_dup(ctx, raw_e) : raw_e;
+        if (alias_mode) {
+            backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16*n_tokens + 1);
+        }
+        scale = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, 4);
+        chart = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_F32, 4, 4);
+        identity = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_F32, 4, 4);
+
+        ggml_tensor * neg = ggml_neg(ctx, ggml_div(ctx, e, chart));
+        ggml_tensor * ratio = ggml_reshape_2d(ctx, neg, 16, n_tokens);
+        ggml_tensor * rho = ggml_pool_1d(ctx, ratio,
+                fallback == 2 ? GGML_OP_POOL_AVG : GGML_OP_POOL_MAX, 16, 16, 0);
+        rho = ggml_scale_bias(ctx, ggml_clamp(ctx, rho, fallback == 3 ? 0.25f : 0.0f, INFINITY), 1.0f, 1.0f);
+        rho = ggml_reshape_3d(ctx, rho, 1, 1, n_tokens);
+        ggml_tensor * phi = ggml_add(ctx, ggml_div(ctx, e, rho), chart);
+        ggml_tensor * gamma = ggml_sigmoid(ctx, ggml_view_1d(ctx, scale, 1, 3*sizeof(float)));
+        comb = ggml_add(ctx, ggml_mul(ctx, ggml_sub(ctx, phi, identity), gamma), identity);
+        // An intermediate with an external consumer must not be elided.
+        result = fallback == 1 ? ggml_add(ctx, comb, neg) : comb;
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        std::vector<float> values(16*n_tokens);
+        for (size_t i = 0; i < values.size(); ++i) {
+            float value = ((int) ((i*11) % 25) - 12) / 7.0f;
+            if (input_mode == 1) { value = std::abs(value) + 0.125f; }
+            if (input_mode == 2) { value *= 1000.0f; }
+            if (input_mode == 3) { value = 0.0f; }
+            values[i] = value;
+        }
+        float identity_values[16];
+        float chart_values[16];
+        for (int i = 0; i < 16; ++i) {
+            identity_values[i] = i % 5 == 0 ? 1.0f : 0.0f;
+            chart_values[i] = 0.5f*identity_values[i] + 0.125f;
+        }
+        const float scales[4] = {0.2f, -0.1f, 0.5f, eta};
+        ggml_backend_tensor_set(raw_e, values.data(), 0, values.size()*sizeof(float));
+        ggml_backend_tensor_set(scale, scales, 0, sizeof(scales));
+        ggml_backend_tensor_set(chart, chart_values, 0, sizeof(chart_values));
+        ggml_backend_tensor_set(identity, identity_values, 0, sizeof(identity_values));
+        if (alias_mode) {
+            GGML_ASSERT(e->buffer == backing->buffer && comb->buffer == backing->buffer);
+            // Leave view metadata unset so the CPU reference allocates independent tensors.
+            e->data = backing->data;
+            comb->data = (char *) backing->data + (alias_mode == 2 ? sizeof(float) : 0);
+        }
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_hc;
@@ -5334,6 +5784,19 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_raon_q6k_head : public test_mul_mat {
+    const bool fallback;
+
+    explicit test_raon_q6k_head(int mode = 0)
+        : test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, mode == 2 ? 257 : 259840,
+                mode == 1 ? 2 : 1, 2560, {1, 1}, {1, 1}), fallback(mode != 0) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return fallback ? "RAON_Q6K_HEAD_FALLBACK" : "RAON_Q6K_HEAD_POSITIVE";
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -5536,6 +5999,222 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// Exact Raon expert shapes for the opt-in RDNA3 MMVQ specializations.
+// Reuse the existing quantized matmul CPU reference and its unchanged error
+// tolerance. Full shapes use about 190/201 MB of quantized weights; the
+// temporary float initialization is about 1.43 GB and cases run sequentially.
+struct test_raon_mmvq : public test_mul_mat_id {
+    const bool fallback;
+
+    test_raon_mmvq(ggml_type type, bool broadcast, int64_t nt = 1, bool small_shape = false)
+        : test_mul_mat_id(type, GGML_TYPE_F32, small_shape ? 8 : 128, small_shape ? 2 : 6, broadcast,
+                small_shape ? 65 : (type == GGML_TYPE_IQ4_XS ? 1088 : 2560), nt,
+                small_shape ? 256 : (type == GGML_TYPE_IQ4_XS ? 2560 : 1088)),
+          fallback(nt != 1 || small_shape) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return fallback ? "RAON_MMVQ_FALLBACK" : "RAON_MMVQ_POSITIVE";
+    }
+};
+
+// Shared-input RDA/MLA projections. Positive cases observe every projection.
+struct test_raon_projection_group : public test_case {
+    const ggml_type type;
+    const int input_mode;
+    const int fallback; // 1 = token count, 2 = different input, 3 = type, 4 = stride,
+                        // 5 = K, 6 = row count, 7 = precision, 8 = group count
+    const bool exact;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * other_input = nullptr;
+    ggml_tensor * result = nullptr;
+    std::vector<ggml_tensor *> projections;
+    std::vector<ggml_tensor *> differences;
+
+    test_raon_projection_group(ggml_type type, int input_mode = 0, int fallback = 0, bool exact = false)
+        : type(type), input_mode(input_mode), fallback(fallback), exact(exact) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return exact ? "RAON_PROJ_EQUIV" : fallback ? "RAON_PROJ_FALLBACK" : "RAON_PROJ_POSITIVE";
+    }
+    std::string vars() override { return VARS_TO_STR4(type, input_mode, fallback, exact); }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    double max_nmse_err() override { return exact ? 0.0 : 5e-4; }
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return test_case::err(a, b, n);
+        }
+        double error = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            error = std::max(error, (double) std::abs(a[i] - b[i]));
+        }
+        return error;
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes;
+        if (exact) {
+            nodes = differences;
+        } else if (!fallback) {
+            nodes = projections;
+        }
+        // Ordinary fallback fusion may elide a projection and write the final ADD directly.
+        nodes.push_back(result);
+        nodes.insert(nodes.end(), sentinels.begin(), sentinels.end());
+        return nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        const int count = (type == GGML_TYPE_IQ4_XS ? 3 : 2) - (fallback == 8);
+        const int64_t k = fallback == 5 ? 2304 : 2560;
+        const int64_t rows = (type == GGML_TYPE_IQ4_XS ? 5120 : 576) - (fallback == 6);
+        const int64_t nt = fallback == 1 ? 2 : 1;
+        input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, nt);
+        ggml_set_name(input, "raon_proj_input");
+        if (fallback == 2) {
+            other_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, nt);
+        }
+        projections.clear();
+        differences.clear();
+        for (int p = 0; p < count; ++p) {
+            const ggml_type wt = fallback == 3 && p == 1 ? GGML_TYPE_Q8_0 : type;
+            ggml_tensor * weight = ggml_new_tensor_2d(ctx_weights, wt, k + (fallback == 4 ? 256 : 0), rows);
+            if (fallback == 4) {
+                weight = ggml_view_2d(ctx_weights, weight, k, rows, weight->nb[1], 0);
+            }
+            ggml_tensor * out = ggml_mul_mat(ctx, weight, other_input && p == 1 ? other_input : input);
+            if (fallback == 7 && p == 0) {
+                GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
+            }
+            ggml_format_name(out, "raon_proj_%d", p);
+            if (!fallback && !exact) {
+                // The comparison list alone does not make an intermediate a graph output.
+                ggml_set_output(out);
+            }
+            projections.push_back(out);
+            if (mode == MODE_TEST) {
+                // The real model also expands independent projections before their consumers.
+                ggml_build_forward_expand(gf, out);
+            }
+        }
+        if (exact) {
+            for (ggml_tensor * projected : projections) {
+                ggml_tensor * reference = ggml_mul_mat(ctx, projected->src[0], input);
+                // F32 accumulation preserves the ordinary RDNA3 MMVQ path while rejecting grouping.
+                GGML_ASSERT(ggml_prec_set_acc(reference, GGML_PREC_F32));
+                differences.push_back(ggml_sub(ctx, projected, reference));
+            }
+        }
+        const std::vector<ggml_tensor *> & outputs = exact ? differences : projections;
+        result = outputs[0];
+        for (size_t p = 1; p < outputs.size(); ++p) {
+            result = ggml_add(ctx, result, outputs[p]);
+        }
+        if (!exact && fallback == 0 && input_mode == 2) {
+            // External consumers are valid because every projection is a fusion output.
+            result = ggml_add(ctx, result, ggml_scale(ctx, projections[0], -0.25f));
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->view_src) {
+                init_tensor_uniform(t);
+            }
+        }
+        if (input_mode != 0) {
+            std::vector<float> values(ggml_nelements(input));
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = input_mode == 1 ? (1 + i % 19)/19.0f :
+                        (i % 7 == 0 ? 0.0f : (i % 2 == 0 ? -1.0f : 1.0f)*(1 + i % 23)/23.0f);
+            }
+            ggml_backend_tensor_set(input, values.data(), 0, values.size()*sizeof(float));
+        }
+    }
+};
+
+// Two expert projections followed by the full Raon SiTU activation.
+struct test_raon_situ_mmvq : public test_mul_mat_id {
+    const int fallback;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * backing = nullptr;
+    ggml_tensor * activation = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_raon_situ_mmvq(bool broadcast, int fallback = 0)
+        : test_mul_mat_id(fallback == 6 ? GGML_TYPE_IQ4_NL : GGML_TYPE_IQ4_XS, GGML_TYPE_F32,
+                fallback == 5 ? 8 : 128, fallback == 5 ? 2 : 6, broadcast,
+                fallback == 5 ? 65 : 1088, fallback == 4 ? 2 : 1, fallback == 5 ? 256 : 2560),
+          fallback(fallback) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return fallback ? "RAON_SITU_MMVQ_FALLBACK" : "RAON_SITU_MMVQ_POSITIVE";
+    }
+    std::string vars() override { return test_mul_mat_id::vars() + ",fallback=" + std::to_string(fallback); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = {result};
+        nodes.insert(nodes.end(), sentinels.begin(), sentinels.end());
+        return nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_weight = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * up_weight = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * raw_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, n);
+        input = ggml_dup(ctx, raw_input);
+        ggml_tensor * up_input = fallback == 2 ? ggml_dup(ctx, raw_input) : input;
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_tensor * up_ids = fallback == 3 ? ggml_dup(ctx, ids) : ids;
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weight, input, ids);
+        ggml_tensor * up = ggml_mul_mat_id(ctx, up_weight, up_input, up_ids);
+        if (fallback == 9) {
+            GGML_ASSERT(ggml_prec_set_acc(up, GGML_PREC_F32));
+        }
+        if (gf) {
+            ggml_build_forward_expand(gf, input);
+            ggml_build_forward_expand(gf, up_input);
+            ggml_build_forward_expand(gf, up_ids);
+            ggml_build_forward_expand(gf, gate);
+            ggml_build_forward_expand(gf, up);
+        }
+        ggml_tensor * g_soft = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 0.25f)), 4.0f);
+        ggml_tensor * g_act = ggml_mul(ctx, g_soft, ggml_sigmoid(ctx, gate));
+        ggml_tensor * u_soft = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f / 25.0f)),
+                fallback == 8 ? 26.0f : 25.0f);
+        activation = ggml_mul(ctx, g_act, u_soft);
+        ggml_set_name(activation, "raon_situ_mmvq_test");
+        result = fallback == 1 ? ggml_add(ctx, activation, gate) : activation;
+        if (fallback == 7) {
+            backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                    std::max(ggml_nelements(input), ggml_nelements(activation)) + 1);
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32 && t->op == GGML_OP_NONE) {
+                std::vector<int32_t> values(ggml_nelements(t));
+                for (size_t j = 0; j < values.size(); ++j) {
+                    values[j] = (j * 23 + n_mats - 1) % n_mats;
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            }
+        }
+        if (fallback == 7) {
+            GGML_ASSERT(input->buffer == backing->buffer && activation->buffer == backing->buffer);
+            input->data = backing->data;
+            activation->data = (char *) backing->data + sizeof(float);
+        }
     }
 };
 
@@ -9753,10 +10432,87 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    // Full SiTU, including expert prefill, tails, saturation and in-place output.
+    for (int64_t n_tokens : {1, 2, 17, 512}) {
+        test_cases.emplace_back(new test_raon_situ_fuse({1088, 6, n_tokens, 1}));
+    }
+    test_cases.emplace_back(new test_raon_situ_fuse({12032, 1, 1, 1}));
+    test_cases.emplace_back(new test_raon_situ_fuse({1088, 1, 17, 1}));
+    test_cases.emplace_back(new test_raon_situ_fuse({1, 1, 1, 1}));
+    test_cases.emplace_back(new test_raon_situ_fuse({33, 2, 3, 2}));
+    test_cases.emplace_back(new test_raon_situ_fuse({1025, 1, 1, 1}));
+    for (int input_mode : {1, 2, 3}) {
+        test_cases.emplace_back(new test_raon_situ_fuse({33, 3, 1, 1}, input_mode));
+    }
+    for (int alias_mode : {1, 2, 3}) {
+        test_cases.emplace_back(new test_raon_situ_fuse({1088, 6, 1, 1}, 0, 0, alias_mode));
+    }
+    for (int fallback = 1; fallback <= 7; ++fallback) {
+        test_cases.emplace_back(new test_raon_situ_fuse({1088, 6, 2, 1}, 0, fallback));
+    }
+
+    for (int64_t n_tokens : {1, 2, 17, 512}) {
+        test_cases.emplace_back(new test_raon_hc_rms_tail_fuse(n_tokens));
+        test_cases.emplace_back(new test_raon_hc_helmert_fuse(n_tokens));
+    }
+    test_cases.emplace_back(new test_raon_hc_rms_tail_fuse(17, 1));
+    test_cases.emplace_back(new test_raon_hc_rms_tail_fuse(17, 2));
+    test_cases.emplace_back(new test_raon_hc_rms_tail_fuse(17, 3, 0, 0, 1e-30f));
+    test_cases.emplace_back(new test_raon_hc_rms_tail_fuse(2, 0, 0, 0, 0.0f));
+    test_cases.emplace_back(new test_raon_hc_rms_tail_fuse(1, 0, 0, 1));
+    test_cases.emplace_back(new test_raon_hc_rms_tail_fuse(17, 0, 0, 1));
+    for (int fallback : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_raon_hc_rms_tail_fuse(17, 0, fallback));
+        test_cases.emplace_back(new test_raon_hc_helmert_fuse(17, 0, -1, fallback));
+    }
+    test_cases.emplace_back(new test_raon_hc_rms_tail_fuse(17, 0, 0, 2));
+    for (int basis = 0; basis < 9; ++basis) {
+        test_cases.emplace_back(new test_raon_hc_helmert_fuse(2, 0, basis));
+    }
+    test_cases.emplace_back(new test_raon_hc_helmert_fuse(17, 1));
+    test_cases.emplace_back(new test_raon_hc_helmert_fuse(2, 2));
+    test_cases.emplace_back(new test_raon_hc_helmert_fuse(1, 0, -1, 0, 1));
+    test_cases.emplace_back(new test_raon_hc_helmert_fuse(17, 0, -1, 0, 1));
+
+    for (int mode : {0, 1, 2}) {
+        test_cases.emplace_back(new test_raon_q6k_head(mode));
+    }
+
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 20));
+    for (int64_t n_tokens : {1, 2, 17, 512}) {
+        for (float eta : {-80.0f, 0.3f, 80.0f}) {
+            test_cases.emplace_back(new test_raon_hc_comb_fuse(n_tokens, eta));
+        }
+    }
+    test_cases.emplace_back(new test_raon_hc_comb_fuse(1, 0.3f, 1));
+    test_cases.emplace_back(new test_raon_hc_comb_fuse(17, 0.3f, 2));
+    test_cases.emplace_back(new test_raon_hc_comb_fuse(2, 0.3f, 3));
+    test_cases.emplace_back(new test_raon_hc_comb_fuse(17, 0.3f, 0, 1));
+    test_cases.emplace_back(new test_raon_hc_comb_fuse(17, 0.3f, 0, 2));
+    test_cases.emplace_back(new test_raon_hc_comb_fuse(17, 0.3f, 1, 3));
+    test_cases.emplace_back(new test_raon_hc_comb_fuse(1, 0.3f, 0, 0, 1));
+    test_cases.emplace_back(new test_raon_hc_comb_fuse(17, 0.3f, 0, 0, 1));
+    test_cases.emplace_back(new test_raon_hc_comb_fuse(17, 0.3f, 0, 0, 2));
+    for (int kind : {0, 1, 2}) {
+        for (int64_t n_tokens : {1, 2, 17, 512}) {
+            test_cases.emplace_back(new test_raon_hc_affine_fuse(kind, n_tokens));
+        }
+        test_cases.emplace_back(new test_raon_hc_affine_fuse(kind, 17, 1));
+        test_cases.emplace_back(new test_raon_hc_affine_fuse(kind, 2, 2));
+        test_cases.emplace_back(new test_raon_hc_affine_fuse(kind, 1, 0, 0, 1));
+        for (int fallback : {1, 2, 3}) {
+            test_cases.emplace_back(new test_raon_hc_affine_fuse(kind, 17, 0, fallback));
+        }
+        test_cases.emplace_back(new test_raon_hc_affine_fuse(kind, 1, 0, 0, 2));
+        // Same start does not permit an in-place 17-stride slice to become contiguous.
+        test_cases.emplace_back(new test_raon_hc_affine_fuse(kind, 17, 0, 0, 1));
+    }
+    test_cases.emplace_back(new test_raon_hc_affine_fuse(1, 17, 0, 4));
+    test_cases.emplace_back(new test_raon_hc_affine_fuse(0, 17, 0, 5));
+    test_cases.emplace_back(new test_raon_hc_affine_fuse(1, 17, 0, 5));
     // production n_iter (DeepSeek-V4 uses 20) across batch sizes that cross
     // subgroup and workgroup boundaries; 1 = single-token decode
     for (int64_t n_tokens : {1, 256, 336, 512, 513, 1024, 2048}) {
@@ -11066,6 +11822,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+    test_cases.emplace_back(new test_raon_situ_mmvq(true));
+    test_cases.emplace_back(new test_raon_situ_mmvq(false));
+    for (int fallback = 1; fallback <= 9; ++fallback) {
+        test_cases.emplace_back(new test_raon_situ_mmvq(true, fallback));
+    }
+
+    test_cases.emplace_back(new test_raon_mmvq(GGML_TYPE_IQ4_XS, true));
+    test_cases.emplace_back(new test_raon_mmvq(GGML_TYPE_IQ4_NL, false));
+    test_cases.emplace_back(new test_raon_mmvq(GGML_TYPE_IQ4_XS, true, 2));
+    test_cases.emplace_back(new test_raon_mmvq(GGML_TYPE_IQ4_NL, false, 2));
+    test_cases.emplace_back(new test_raon_mmvq(GGML_TYPE_IQ4_XS, true, 1, true));
+    test_cases.emplace_back(new test_raon_mmvq(GGML_TYPE_IQ4_NL, false, 1, true));
+    for (ggml_type type : { GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K }) {
+        test_cases.emplace_back(new test_raon_projection_group(type));
+        test_cases.emplace_back(new test_raon_projection_group(type, 2));
+        test_cases.emplace_back(new test_raon_projection_group(type, 1, 0, true));
+        test_cases.emplace_back(new test_raon_projection_group(type, 2, 0, true));
+        for (int fallback = 1; fallback <= 8; ++fallback) {
+            test_cases.emplace_back(new test_raon_projection_group(type, 0, fallback));
+        }
+    }
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));

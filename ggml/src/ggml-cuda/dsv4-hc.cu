@@ -1,8 +1,158 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
 
+#include <cfloat>
+
 
 static constexpr int DSV4_HC = 4;
+
+static __global__ void raon_hc_rms_tail_f32(
+        const float * mean, const float * selector, float * dst, float eps, int64_t n_values) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_values) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const float rms = sqrtf(mean[i / 17] + eps);
+    dst[i] = selector[i] / rms;
+}
+
+void ggml_cuda_op_raon_hc_rms_tail(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * mean, const ggml_tensor * selector, ggml_tensor * dst, float eps) {
+    const int64_t n_values = ggml_nelements(dst);
+    const int block_size = 256;
+    const dim3 grid((n_values + block_size - 1) / block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params params(grid, dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(raon_hc_rms_tail_f32, params,
+            (const float *) mean->data, (const float *) selector->data, (float *) dst->data, eps, n_values);
+}
+
+static __global__ void raon_hc_helmert_f32(
+        const float * h, const float * z, float * dst, int64_t n_tokens) {
+    ggml_cuda_pdl_lc();
+    const int64_t token = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= n_tokens) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    float tmp[12];
+    for (int col = 0; col < 3; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            float sum = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                sum = fmaf(h[row*3 + k], z[token*9 + col*3 + k], sum);
+            }
+            tmp[col*4 + row] = sum;
+        }
+    }
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            float sum = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                sum = fmaf(h[row*3 + k], tmp[k*4 + col], sum);
+            }
+            dst[token*16 + col*4 + row] = sum;
+        }
+    }
+}
+
+void ggml_cuda_op_raon_hc_helmert(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * h, const ggml_tensor * z, ggml_tensor * dst) {
+    const int64_t n_tokens = z->ne[2];
+    const int block_size = 128;
+    const dim3 grid((n_tokens + block_size - 1) / block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params params(grid, dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(raon_hc_helmert_f32, params,
+            (const float *) h->data, (const float *) z->data, (float *) dst->data, n_tokens);
+}
+
+// kind: 0 = pre sigmoid, 1 = post sigmoid + magnitude, 2 = Helmert coordinates.
+template <int kind>
+static __global__ void raon_hc_affine_f32(
+        const float * mixes, const float * scale, const float * base, float * dst,
+        int64_t n_values, int64_t mixes_stride, float magnitude, float bias) {
+    constexpr int width = kind == 2 ? 9 : DSV4_HC;
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_values) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    const int64_t lane = i % width;
+    const int64_t token = i / width;
+    // The unfused MUL rounds before ADD, including cancellation-heavy inputs.
+    volatile float product = mixes[token*mixes_stride + lane] * scale[0];
+    float value = product + base[lane];
+    if constexpr (kind != 2) {
+        value = 1.0f / (1.0f + expf(-value));
+    }
+    if constexpr (kind == 1) {
+        value = magnitude * value + bias;
+    }
+    dst[i] = value;
+}
+
+void ggml_cuda_op_raon_hc_affine(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * mixes, const ggml_tensor * scale, const ggml_tensor * base,
+        ggml_tensor * dst, int kind) {
+    GGML_ASSERT(kind >= 0 && kind <= 2);
+    const int64_t n_values = ggml_nelements(dst);
+    const int block_size = 256;
+    const dim3 grid((n_values + block_size - 1) / block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params params(grid, dim3(block_size, 1, 1), 0, ctx.stream());
+    auto kernel = kind == 0 ? raon_hc_affine_f32<0>
+                : kind == 1 ? raon_hc_affine_f32<1> : raon_hc_affine_f32<2>;
+    const float magnitude = kind == 1 ? ggml_get_op_params_f32(dst, 0) : 1.0f;
+    const float bias      = kind == 1 ? ggml_get_op_params_f32(dst, 1) : 0.0f;
+    ggml_cuda_kernel_launch(kernel, params,
+            (const float *) mixes->data, (const float *) scale->data, (const float *) base->data,
+            (float *) dst->data, n_values, mixes->nb[1] / sizeof(float), magnitude, bias);
+}
+
+static __global__ void raon_hc_comb_f32(
+        const float * e, const float * scale, const float * chart,
+        const float * identity, float * dst, int64_t n_tokens) {
+    ggml_cuda_pdl_lc();
+    const int64_t it = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (it >= n_tokens) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    float values[DSV4_HC*DSV4_HC];
+    float maximum = -FLT_MAX;
+    for (int j = 0; j < DSV4_HC*DSV4_HC; ++j) {
+        values[j] = e[it*16 + j];
+        const float ratio = values[j] / chart[j];
+        maximum = max(maximum, -ratio);
+    }
+    const float rho = fminf(fmaxf(maximum, 0.0f), INFINITY) + 1.0f;
+    const float gamma = 1.0f / (1.0f + expf(-scale[3]));
+    for (int j = 0; j < DSV4_HC*DSV4_HC; ++j) {
+        const float normalized = values[j] / rho;
+        const float phi = normalized + chart[j];
+        const float shifted = phi - identity[j];
+        // Keep the separate MUL and ADD rounding of the unfused graph.
+        volatile float weighted = shifted * gamma;
+        dst[it*16 + j] = weighted + identity[j];
+    }
+}
+
+void ggml_cuda_op_raon_hc_comb(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * e, const ggml_tensor * scale, const ggml_tensor * chart,
+        const ggml_tensor * identity, ggml_tensor * dst) {
+    const int64_t n_tokens = e->ne[2];
+    const int block_size = 256;
+    const dim3 grid((n_tokens + block_size - 1) / block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params params(grid, dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(raon_hc_comb_f32, params,
+            (const float *) e->data, (const float *) scale->data,
+            (const float *) chart->data, (const float *) identity->data,
+            (float *) dst->data, n_tokens);
+}
 
 
 static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {

@@ -1270,9 +1270,14 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        for (cudaGraphExec_t chunk : chunk_instances) {
+            CUDA_CHECK(cudaGraphExecDestroy(chunk));
+        }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    // Opt-in chunking retains the original whole-graph path when its size is zero.
+    std::vector<cudaGraphExec_t> chunk_instances;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1501,7 +1506,7 @@ struct ggml_backend_cuda_context {
     // Check if any CUDA graph has an instance for this context
     bool any_cuda_graph_has_instance() const {
         for (const auto & [key, graph] : cuda_graphs) {
-            if (graph && graph->instance != nullptr) {
+            if (graph && (graph->instance != nullptr || !graph->chunk_instances.empty())) {
                 return true;
             }
         }
@@ -1576,6 +1581,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    bool raon_situ = false;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1589,6 +1595,7 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    bool raon_situ = false;
 };
 
 struct ggml_cuda_kernel_launch_params {

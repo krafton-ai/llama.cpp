@@ -1896,6 +1896,17 @@ ggml_tensor * llm_graph_context::build_situ(
     const float beta = hparams.situ_beta;
     const float lb   = hparams.situ_linear_beta;
 
+    static const bool fusion = [] {
+        const char * value = getenv("GGML_CUDA_RAON_SITU_FUSION");
+        const char * mmvq = getenv("GGML_CUDA_RAON_SITU_MMVQ");
+        return (value != nullptr && strcmp(value, "1") == 0) || (mmvq != nullptr && strcmp(mmvq, "1") == 0);
+    }();
+    if (fusion) {
+        // Keep both producers before the activation chain.
+        ggml_build_forward_expand(gf, gate);
+        ggml_build_forward_expand(gf, up);
+    }
+
     ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, gate, 1.0f/beta)), beta);
     act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, gate));
 

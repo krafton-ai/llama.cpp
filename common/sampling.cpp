@@ -13,6 +13,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -450,6 +451,17 @@ struct common_sampler * common_sampler_init(
 void common_sampler_free(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
+    }
+
+    static const bool raon_sampler_perf = [] {
+        const char * value = std::getenv("LLAMA_RAON_SAMPLER_PERF");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (raon_sampler_perf) {
+        const llama_perf_sampler_data data = llama_perf_sampler(gsmpl->chain);
+        LOG_INF("RAON_SAMPLER_PERF total_ms=%.6f chain_ms=%.6f n=%d no_perf=%d backend_requested=%d\n",
+                1e-3*gsmpl->t_total_us, data.t_sample_ms, data.n_sample,
+                (int) gsmpl->params.no_perf, (int) gsmpl->params.backend_sampling);
     }
 
     llama_sampler_free(gsmpl->grmr);

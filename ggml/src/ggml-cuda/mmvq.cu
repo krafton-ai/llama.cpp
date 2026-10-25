@@ -4,6 +4,8 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -618,8 +620,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int raon_rows = 0, int raon_nwarps = 0>
+__launch_bounds__((raon_nwarps ? raon_nwarps : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -636,8 +638,12 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    static_assert(raon_nwarps == 0 || (raon_nwarps == 1 && type == GGML_TYPE_IQ4_NL && ncols_dst == 1),
+            "Raon warp specialization is only implemented for single-token IQ4_NL");
+    constexpr int nwarps = raon_nwarps ? raon_nwarps : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+    static_assert(raon_rows == 0 || (raon_rows == 2 && (type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K) && ncols_dst == 1),
+            "Raon row pairing requires single-token IQ4_XS or Q6_K");
+    constexpr int rows_per_cuda_block = raon_rows ? raon_rows : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -830,6 +836,17 @@ static __global__ void mul_mat_vec_q(
 
             if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
                 float result = tmp[j][i];
+                if constexpr (has_fusion && type == GGML_TYPE_IQ4_XS && ncols_dst == 1) {
+                    if (fusion.raon_situ) {
+                        const float gate_value = tmp_gate[j][i];
+                        const float g_soft = tanhf(gate_value * 0.25f) * 4.0f;
+                        const float g_sigmoid = 1.0f / (1.0f + expf(-gate_value));
+                        const float g_act = g_soft * g_sigmoid;
+                        const float u_soft = tanhf(result * (1.0f / 25.0f)) * 25.0f;
+                        dst[j*stride_col_dst + i] = g_act * u_soft;
+                        continue;
+                    }
+                }
                 if constexpr (has_fusion) {
                     if constexpr (type == GGML_TYPE_NVFP4) {
                         result *= x_scales;
@@ -870,6 +887,90 @@ static __global__ void mul_mat_vec_q(
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+    }
+}
+
+struct raon_projection_args {
+    const void * weights[3];
+    float * outputs[3];
+};
+
+template <ggml_type type>
+__launch_bounds__(calc_nwarps(type, 1, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_raon_proj(
+        const raon_projection_args args, const block_q8_1 * y, const int ncols_x) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps = calc_nwarps(type, 1, get_device_table_id());
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr int blocks_per_iter = vdr*nwarps*warp_size/qi;
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
+    const int row = blockIdx.x;
+    const int blocks_per_row = ncols_x/qk;
+    const void * weights = args.weights[blockIdx.y];
+    float * dst = args.outputs[blockIdx.y];
+
+    ggml_cuda_pdl_sync();
+    float tmp = 0.0f;
+    for (int kbx = tid/(qi/vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx*(qk/QK8_1);
+        const int kqs = vdr*(tid%(qi/vdr));
+        tmp += vec_dot_q_cuda(weights, &y[kby], row*blocks_per_row + kbx, kqs);
+    }
+
+    // Keep the single-row MMVQ reduction order for each independent output.
+    __shared__ float partial[nwarps > 1 ? nwarps - 1 : 1][warp_size];
+    if (threadIdx.y > 0) {
+        partial[threadIdx.y - 1][threadIdx.x] = tmp;
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+#pragma unroll
+    for (int w = 0; w < nwarps - 1; ++w) {
+        tmp += partial[w][threadIdx.x];
+    }
+    tmp = warp_reduce_sum<warp_size>(tmp);
+    if (threadIdx.x == 0) {
+        dst[row] = tmp;
+    }
+}
+
+template <ggml_type type>
+static void launch_raon_projection_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int count) {
+    const ggml_tensor * input = nodes[0]->src[1];
+    const int64_t padded = GGML_PAD(input->ne[0], MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<block_q8_1> quantized(ctx.pool(), padded/QK8_1);
+    cudaStream_t stream = ctx.stream();
+    quantize_row_q8_1_cuda((const float *) input->data, nullptr, quantized.get(), type,
+            input->ne[0], input->nb[1]/sizeof(float), input->nb[2]/sizeof(float), input->nb[3]/sizeof(float),
+            padded, 1, 1, 1, stream);
+
+    raon_projection_args args{};
+    for (int p = 0; p < count; ++p) {
+        args.weights[p] = nodes[p]->src[0]->data;
+        args.outputs[p] = (float *) nodes[p]->data;
+    }
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int nwarps = calc_nwarps(type, 1, MMVQ_PARAMETERS_RDNA3_0);
+    const dim3 grid(nodes[0]->ne[0], count, 1);
+    const dim3 block(warp_size, nwarps, 1);
+    const ggml_cuda_kernel_launch_params launch_params(grid, block, 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_raon_proj<type>, launch_params, args, quantized.get(), (int) input->ne[0]);
+}
+
+void ggml_cuda_mul_mat_vec_q_raon_proj(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int count) {
+    GGML_ASSERT(GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[ctx.device].cc));
+    GGML_ASSERT(count == 2 || count == 3);
+    if (nodes[0]->src[0]->type == GGML_TYPE_IQ4_XS) {
+        GGML_ASSERT(count == 3);
+        launch_raon_projection_group<GGML_TYPE_IQ4_XS>(ctx, nodes, count);
+    } else {
+        GGML_ASSERT(nodes[0]->src[0]->type == GGML_TYPE_Q6_K && count == 2);
+        launch_raon_projection_group<GGML_TYPE_Q6_K>(ctx, nodes, count);
     }
 }
 
@@ -1131,6 +1232,86 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     const bool has_ids = ids != nullptr;
+
+    if (fusion.raon_situ) {
+        GGML_ASSERT(table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_IQ4_XS && has_ids);
+        GGML_ASSERT(ncols_dst == 1 && ncols_x == 2560 && nrows_x == 1088 && nchannels_x == 128 && nchannels_dst == 6);
+    }
+
+#if defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        static const bool raon_head_rpb2 = [] {
+            const char * value = std::getenv("GGML_CUDA_RAON_Q6K_HEAD_RPB2");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        if (raon_head_rpb2 && table_id == MMVQ_PARAMETERS_RDNA3_0 && !has_ids && ncols_dst == 1 &&
+                nsamples_x == 1 && nsamples_dst == 1 && ncols_x == 2560 && nrows_x == 259840 &&
+                nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 &&
+                stride_row_x == ncols_x / QK_K && stride_col_dst == nrows_x &&
+                fusion.shared_up == nullptr && fusion.gate == nullptr &&
+                fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
+                fusion.x_scale == nullptr && fusion.gate_scale == nullptr) {
+            const dim3 block_nums(nrows_x / 2, 1, 1);
+            const dim3 block_dims(warp_size, calc_nwarps(type, 1, table_id), 1);
+            const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, false, false, false, 2>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+
+    // IQ4_XS uses one warp per row on RDNA3. Pair independent rows without
+    // changing their K partition or reduction tree, so activation loads and
+    // address calculations can be reused while the number of blocks halves.
+    // The even-row guard is required: the inner loop reads every paired row.
+    if constexpr (type == GGML_TYPE_IQ4_XS) {
+        static const bool raon_iq4xs_rpb2 = [] {
+            const char * value = std::getenv("GGML_CUDA_RAON_IQ4XS_RPB2");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        if (raon_iq4xs_rpb2 && table_id == MMVQ_PARAMETERS_RDNA3_0 && has_ids && ncols_dst == 1 &&
+                nsamples_x == 1 && nsamples_dst == 1 && ncols_x == 2560 && nrows_x == 1088 &&
+                nchannels_x == 128 && nchannels_dst == 6 && fusion.shared_up == nullptr &&
+                fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
+                fusion.x_scale == nullptr && fusion.gate_scale == nullptr) {
+            const dim3 block_nums(nrows_x / 2, nchannels_dst, 1);
+            const dim3 block_dims(warp_size, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, false, false, false, 2>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+    // Raon's down experts have only 34 IQ4_NL blocks per row (K = 1088).
+    // The RDNA3 default eight-warps block assigns 128 blocks per iteration,
+    // leaving most lanes idle and requiring a cross-warp reduction. Use a
+    // single warp only for the measured Raon shape. This changes the floating
+    // accumulation tree, so numerical and actual-output parity must be tested.
+    if constexpr (type == GGML_TYPE_IQ4_NL) {
+        static const bool raon_iq4nl_warp1 = [] {
+            const char * value = std::getenv("GGML_CUDA_RAON_IQ4NL_WARP1");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        if (raon_iq4nl_warp1 && table_id == MMVQ_PARAMETERS_RDNA3_0 && has_ids && ncols_dst == 1 &&
+                nsamples_x == 1 && nsamples_dst == 1 && ncols_x == 1088 && nrows_x == 2560 &&
+                nchannels_x == 128 && nchannels_dst == 6 && fusion.shared_up == nullptr &&
+                fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
+                fusion.x_scale == nullptr && fusion.gate_scale == nullptr) {
+            const dim3 block_nums(nrows_x, nchannels_dst, 1);
+            const dim3 block_dims(warp_size, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, false, false, false, 0, 1>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+#endif
 
     // How the K loop divides up at the baseline block width, both decisions below use these.
     constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
@@ -1535,6 +1716,14 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        if (fusion->raon_situ) {
+            GGML_ASSERT(GGML_CUDA_CC_IS_RDNA3_0(cc) && src0->type == GGML_TYPE_IQ4_XS);
+            GGML_ASSERT(ids && fusion->gate && ne00 == 2560 && ne01 == 1088 && ne02 == 128 && ne03 == 1);
+            GGML_ASSERT(ne2 == 1 && ne1 == 6 && ne3 == 1 && (ne11 == 1 || ne11 == 6));
+            GGML_ASSERT(!fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
+            GGML_ASSERT(!fusion->shared_up && !fusion->shared_gate && !fusion->shared_dst);
+            fusion_local.raon_situ = true;
+        }
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

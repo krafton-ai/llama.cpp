@@ -4,6 +4,21 @@
 
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+#include <cstring>
+
+static bool raon_group_projections(bool rda) {
+    static const int mode = [] {
+        const char * value = std::getenv("GGML_CUDA_RAON_PROJ_FUSION");
+        if (!value) { return 0; }
+        if (std::strcmp(value, "1") == 0) { return 3; }
+        if (std::strcmp(value, "rda") == 0) { return 1; }
+        if (std::strcmp(value, "mla") == 0) { return 2; }
+        return 0;
+    }();
+    return (mode & (rda ? 1 : 2)) != 0;
+}
+
 void llama_model_raon1::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
@@ -250,9 +265,25 @@ ggml_tensor * llama_model_raon1::graph::build_rda_layer(
 
     ggml_tensor * conv_states_seq = build_rs(inp_rs, inp_rs->mctx->get_r_l(il), hparams.n_embd_r(), n_seqs);
 
-    ggml_tensor * Qcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wq, cur), layer.ssm_q_conv, 0, il);
-    ggml_tensor * Kcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wk, cur), layer.ssm_k_conv, 1, il);
-    ggml_tensor * Vcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wv, cur), layer.ssm_v_conv, 2, il);
+    ggml_tensor * Qcur;
+    ggml_tensor * Kcur;
+    ggml_tensor * Vcur;
+    if (raon_group_projections(true)) {
+        ggml_tensor * q_proj = build_lora_mm(layer.wq, cur);
+        ggml_tensor * k_proj = build_lora_mm(layer.wk, cur);
+        ggml_tensor * v_proj = build_lora_mm(layer.wv, cur);
+        // Keep independent projections adjacent before convolution expands its state copies.
+        ggml_build_forward_expand(gf, q_proj);
+        ggml_build_forward_expand(gf, k_proj);
+        ggml_build_forward_expand(gf, v_proj);
+        Qcur = build_rda_conv(inp_rs, conv_states_seq, q_proj, layer.ssm_q_conv, 0, il);
+        Kcur = build_rda_conv(inp_rs, conv_states_seq, k_proj, layer.ssm_k_conv, 1, il);
+        Vcur = build_rda_conv(inp_rs, conv_states_seq, v_proj, layer.ssm_v_conv, 2, il);
+    } else {
+        Qcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wq, cur), layer.ssm_q_conv, 0, il);
+        Kcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wk, cur), layer.ssm_k_conv, 1, il);
+        Vcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wv, cur), layer.ssm_v_conv, 2, il);
+    }
     cb(Qcur, "rda_q_conv", il);
     cb(Kcur, "rda_k_conv", il);
     cb(Vcur, "rda_v_conv", il);
@@ -396,9 +427,17 @@ ggml_tensor * llama_model_raon1::graph::build_mla_layer(
     const int64_t rank = hparams.n_lora_kv;
     const float eps = hparams.f_norm_rms_eps_latent;
     ggml_tensor * q = build_lora_mm(layer.wq_a, cur);
+    ggml_tensor * kv = nullptr;
+    if (raon_group_projections(false)) {
+        kv = build_lora_mm(layer.wkv_a_mqa, cur);
+        ggml_build_forward_expand(gf, q);
+        ggml_build_forward_expand(gf, kv);
+    }
     q = ggml_mul(ctx0, ggml_rms_norm(ctx0, q, eps), layer.attn_q_a_norm);
     q = build_lora_mm(layer.wq_b, q);
-    ggml_tensor * kv = build_lora_mm(layer.wkv_a_mqa, cur);
+    if (!kv) {
+        kv = build_lora_mm(layer.wkv_a_mqa, cur);
+    }
     ggml_tensor * latent = ggml_view_2d(ctx0, kv, rank, n_tokens, kv->nb[1], 0);
     latent = ggml_mul(ctx0, ggml_rms_norm(ctx0, latent, eps), layer.attn_kv_a_norm);
     // NoPE: the "rope" dims of q and k are concatenated as they are, without rotation

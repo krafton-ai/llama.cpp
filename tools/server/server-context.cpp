@@ -39,6 +39,81 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Keep this comparison complete when common_params_sampling gains a field.
+static bool server_sampling_params_equal(const common_params_sampling & a, const common_params_sampling & b) {
+    if (a.seed                   != b.seed                   ||
+        a.n_prev                 != b.n_prev                 ||
+        a.n_probs                != b.n_probs                ||
+        a.min_keep               != b.min_keep               ||
+        a.top_k                  != b.top_k                  ||
+        a.top_p                  != b.top_p                  ||
+        a.min_p                  != b.min_p                  ||
+        a.xtc_probability        != b.xtc_probability        ||
+        a.xtc_threshold          != b.xtc_threshold          ||
+        a.typ_p                  != b.typ_p                  ||
+        a.temp                   != b.temp                   ||
+        a.dynatemp_range         != b.dynatemp_range         ||
+        a.dynatemp_exponent      != b.dynatemp_exponent      ||
+        a.penalty_last_n         != b.penalty_last_n         ||
+        a.penalty_repeat         != b.penalty_repeat         ||
+        a.penalty_freq           != b.penalty_freq           ||
+        a.penalty_present        != b.penalty_present        ||
+        a.dry_multiplier         != b.dry_multiplier         ||
+        a.dry_base               != b.dry_base               ||
+        a.dry_allowed_length     != b.dry_allowed_length     ||
+        a.dry_penalty_last_n     != b.dry_penalty_last_n     ||
+        a.adaptive_target        != b.adaptive_target        ||
+        a.adaptive_decay         != b.adaptive_decay         ||
+        a.mirostat               != b.mirostat               ||
+        a.top_n_sigma            != b.top_n_sigma            ||
+        a.mirostat_tau           != b.mirostat_tau           ||
+        a.mirostat_eta           != b.mirostat_eta           ||
+        a.ignore_eos             != b.ignore_eos             ||
+        a.no_perf                != b.no_perf                ||
+        a.timing_per_token       != b.timing_per_token       ||
+        a.user_sampling_config   != b.user_sampling_config   ||
+        a.dry_sequence_breakers  != b.dry_sequence_breakers  ||
+        a.samplers               != b.samplers               ||
+        a.grammar.type           != b.grammar.type           ||
+        a.grammar.grammar        != b.grammar.grammar        ||
+        a.grammar_lazy           != b.grammar_lazy           ||
+        a.preserved_tokens       != b.preserved_tokens       ||
+        a.generation_prompt      != b.generation_prompt      ||
+        a.reasoning_budget_tokens  != b.reasoning_budget_tokens  ||
+        a.reasoning_budget_start   != b.reasoning_budget_start   ||
+        a.reasoning_budget_end     != b.reasoning_budget_end     ||
+        a.reasoning_budget_forced  != b.reasoning_budget_forced  ||
+        a.reasoning_budget_message != b.reasoning_budget_message ||
+        a.reasoning_control      != b.reasoning_control      ||
+        a.backend_sampling       != b.backend_sampling       ||
+        a.grammar_triggers.size() != b.grammar_triggers.size() ||
+        a.logit_bias.size()       != b.logit_bias.size()       ||
+        a.logit_bias_eog.size()   != b.logit_bias_eog.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < a.grammar_triggers.size(); ++i) {
+        if (a.grammar_triggers[i].type  != b.grammar_triggers[i].type  ||
+            a.grammar_triggers[i].value != b.grammar_triggers[i].value ||
+            a.grammar_triggers[i].token != b.grammar_triggers[i].token) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.logit_bias.size(); ++i) {
+        if (a.logit_bias[i].token != b.logit_bias[i].token ||
+            a.logit_bias[i].bias  != b.logit_bias[i].bias) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.logit_bias_eog.size(); ++i) {
+        if (a.logit_bias_eog[i].token != b.logit_bias_eog[i].token ||
+            a.logit_bias_eog[i].bias  != b.logit_bias_eog[i].bias) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -356,6 +431,17 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
+    // While idle, the retained sampler belongs to task_prev.
+    bool smpl_reuse = false;
+
+    void clear_sampler_reuse() {
+        if (smpl_reuse) {
+            llama_synchronize(ctx_tgt);
+            llama_set_sampler(ctx_tgt, id, nullptr);
+            smpl_reuse = false;
+        }
+    }
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -406,7 +492,9 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        if (!smpl_reuse) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -1046,6 +1134,13 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        for (auto & slot : slots) {
+            if (slot.smpl_reuse) {
+                slot.clear_sampler_reuse();
+                slot.smpl.reset();
+            }
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1922,8 +2017,9 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
+            common_sampler_ptr smpl_new;
             try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                smpl_new.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -1937,11 +2033,45 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
-            // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+            static const bool reuse_enabled = [] {
+                const char * value = getenv("LLAMA_SERVER_BACKEND_SAMPLER_REUSE");
+                return value && std::string(value) == "1";
+            }();
+            static const bool reuse_trace = [] {
+                const char * value = getenv("LLAMA_SERVER_SAMPLER_REUSE_TRACE");
+                return value && std::string(value) == "1";
+            }();
+
+            const bool reuse_eligible = reuse_enabled && use_backend_sampling &&
+                params_base.n_parallel == 1 && task.type == SERVER_TASK_TYPE_COMPLETION &&
+                !task.is_child() && task.child_tasks.empty() &&
+                !spec && !ctx_dft && !mctx && slot.lora.empty() && params_base.lora_adapters.empty() &&
+                common_grammar_value(task.params.sampling.grammar).empty() &&
+                !task.params.sampling.grammar_lazy && !task.params.sampling.reasoning_control &&
+                task.params.sampling.reasoning_budget_tokens < 0;
+            const bool reuse_hit = reuse_eligible && slot.smpl_reuse && slot.smpl && slot.task_prev &&
+                server_sampling_params_equal(slot.task_prev->params.sampling, task.params.sampling);
+
+            if (reuse_hit) {
+                llama_synchronize(ctx_tgt);
+                // Restore fresh request state without changing the registered chain or its graph inputs.
+                common_sampler_copy(smpl_new.get(), slot.smpl.get());
             } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.clear_sampler_reuse();
+                slot.smpl = std::move(smpl_new);
+
+                // TODO: tmp until backend sampling is fully implemented
+                if (use_backend_sampling) {
+                    const bool registered = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                    slot.smpl_reuse = reuse_eligible && registered;
+                } else {
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                }
+            }
+
+            if (reuse_trace) {
+                SLT_INF(slot, "backend sampler reuse: eligible=%d hit=%d retained=%d\n",
+                        (int) reuse_eligible, (int) reuse_hit, (int) slot.smpl_reuse);
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -1954,13 +2084,19 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
         } else {
+            slot.clear_sampler_reuse();
             slot.smpl.reset();
         }
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
-        slot.task = std::make_unique<const server_task>(std::move(task));
+        try {
+            slot.task = std::make_unique<const server_task>(std::move(task));
+        } catch (...) {
+            slot.clear_sampler_reuse();
+            throw;
+        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
