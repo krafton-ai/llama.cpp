@@ -354,6 +354,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_k3(params);
         case LLM_ARCH_RAON1:
             return new llama_model_raon1(params);
+        case LLM_ARCH_RAON1_NANO:
+            return new llama_model_raon1_nano(params);
         case LLM_ARCH_GLM5_NEXT:
             return new llama_model_glm5_next(params);
         case LLM_ARCH_STEP35:
@@ -3495,6 +3497,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_RAON1:
+        case LLM_ARCH_RAON1_NANO:
         case LLM_ARCH_GLM5_NEXT:
             return LLAMA_ROPE_TYPE_NONE;
 
