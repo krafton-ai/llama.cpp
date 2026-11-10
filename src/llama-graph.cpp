@@ -2107,7 +2107,10 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     if (down) {
         cur = build_lora_mm(down, cur);
-        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2 ||
+            // Raon-1: the FFN down projection of the last layers exceeds the F16 range (65504) when an F16 weight runs with a
+            // half-precision accumulator (CUDA cuBLAS on prompts); the result is inf, then NaN logits
+            arch == LLM_ARCH_RAON1 || arch == LLM_ARCH_RAON1_NANO) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_prec_set_acc(cur, GGML_PREC_F32);
         }
