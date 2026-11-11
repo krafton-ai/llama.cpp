@@ -1,0 +1,66 @@
+#version 450
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// First pass of the argmax of long rows: workgroup (x, y) takes slice x of row y and writes its max and the lowest
+// index holding it to the temp buffer; argmax_split2 reduces the slices. An empty slot is (-inf, 0xFFFFFFFF), so it
+// loses every tie and the result equals the one-pass argmax (lowest index of the max).
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer T {float data_t[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 256;
+
+shared float tmpmax[BLOCK_SIZE];
+shared uint tmp[BLOCK_SIZE];
+
+void main() {
+    const uint part = gl_WorkGroupID.x;
+    const uint row = gl_WorkGroupID.y;
+    const uint col = gl_LocalInvocationID.x;
+    const uint np = gl_NumWorkGroups.x;
+
+    const uint chunk = (p.KX + np - 1) / np;
+    const uint c0 = part * chunk;
+    const uint c1 = min(c0 + chunk, p.KX);
+
+    float amax = uintBitsToFloat(0xff800000u);
+    uint acol = 0xFFFFFFFFu;
+
+    if (c0 + col < c1) {
+        amax = float(data_a[row*p.KX + c0 + col]);
+        acol = c0 + col;
+    }
+
+    for (uint i = c0 + col + BLOCK_SIZE; i < c1; i += BLOCK_SIZE) {
+        const float val = float(data_a[row*p.KX + i]);
+        if (val > amax) {
+            amax = val;
+            acol = i;
+        }
+    }
+
+    tmp[col] = acol;
+    tmpmax[col] = amax;
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (col < s) {
+            if (tmpmax[col] < tmpmax[col + s] || (tmpmax[col] == tmpmax[col + s] && tmp[col + s] < tmp[col])) {
+                tmpmax[col] = tmpmax[col + s];
+                tmp[col] = tmp[col + s];
+            }
+        }
+        barrier();
+    }
+
+    if (col == 0) {
+        data_t[2*(row*np + part)]     = tmpmax[0];
+        data_t[2*(row*np + part) + 1] = uintBitsToFloat(tmp[0]);
+    }
+}

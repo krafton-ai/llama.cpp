@@ -1,0 +1,55 @@
+#version 450
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// Second pass of the argmax of long rows: one workgroup per row reduces the p.param1 slices written by argmax_split1,
+// ties take the lowest index.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer T {float data_t[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 128;
+
+shared float tmpmax[BLOCK_SIZE];
+shared uint tmp[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint col = gl_LocalInvocationID.x;
+    const uint np = uint(p.param1);
+
+    float amax = uintBitsToFloat(0xff800000u);
+    uint acol = 0xFFFFFFFFu;
+
+    for (uint i = col; i < np; i += BLOCK_SIZE) {
+        const float val = data_t[2*(row*np + i)];
+        const uint idx = floatBitsToUint(data_t[2*(row*np + i) + 1]);
+        if (val > amax || (val == amax && idx < acol)) {
+            amax = val;
+            acol = idx;
+        }
+    }
+
+    tmp[col] = acol;
+    tmpmax[col] = amax;
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (col < s) {
+            if (tmpmax[col] < tmpmax[col + s] || (tmpmax[col] == tmpmax[col + s] && tmp[col + s] < tmp[col])) {
+                tmpmax[col] = tmpmax[col + s];
+                tmp[col] = tmp[col + s];
+            }
+        }
+        barrier();
+    }
+
+    if (col == 0) {
+        data_d[row] = D_TYPE(tmp[0]);
+    }
+}

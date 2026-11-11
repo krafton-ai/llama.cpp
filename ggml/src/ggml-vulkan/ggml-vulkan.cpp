@@ -3579,7 +3579,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    // one invocation walks a row in steps of the workgroup size: a logit vector needs many of them
+    const uint32_t argmax_block_size = std::min({ device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0], 1024u });
+    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { argmax_block_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_argmax_split1_f32, "argmax_split1_f32", argmax_split1_f32_len, argmax_split1_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { 256 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_argmax_split2_f32, "argmax_split2_f32", argmax_split2_f32_len, argmax_split2_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { 128 }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32, "cross_entropy_loss_f32", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -11898,7 +11902,41 @@ void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_context& 
 }
 
 void ggml_vk_argmax(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ARGMAX, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], 0.0f, 0.0f, 0.0f, 0.0f });
+    const uint32_t ncols = (uint32_t)src0->ne[0];
+    const uint32_t nrows = (uint32_t)ggml_nrows(src0);
+    // a few long rows (the logits of a greedy sampler) leave one workgroup per row on the whole GPU; split each row into
+    // slices of about 4096 columns over the GPU and reduce the slices in a second pass (same result, lowest index on ties)
+    if (ncols < 32768 || nrows > 16 || !ggml_is_contiguous(src0)) {
+        ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ARGMAX, { ncols, nrows, 0.0f, 0.0f, 0.0f, 0.0f });
+        return;
+    }
+    const uint32_t nparts = std::min(CEIL_DIV(ncols, 4096u), 128u);
+
+    vk_pipeline pipeline1 = ctx->device->pipeline_argmax_split1_f32;
+    vk_pipeline pipeline2 = ctx->device->pipeline_argmax_split2_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline1, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline2, 1);
+
+    const size_t temp_size = 2 * sizeof(float) * nparts * nrows;
+    if (ctx->prealloc_size_split_k < temp_size) {
+        ctx->prealloc_size_split_k = temp_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    vk_subbuffer src_buf  = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer temp_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    const vk_op_push_constants pc = { ncols, nrows, (float)nparts, 0.0f, 0.0f, 0.0f };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline1, { src_buf, temp_buf }, pc, { nparts, nrows, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline2, { temp_buf, dst_buf }, pc, { nrows, 1, 1 });
+
+    ctx->prealloc_split_k_need_sync = true;
 }
 
 void ggml_vk_count_equal(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
