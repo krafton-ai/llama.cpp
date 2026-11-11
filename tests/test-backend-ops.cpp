@@ -9045,6 +9045,52 @@ struct test_concat_ssm_conv_silu : public test_case {
     }
 };
 
+// GGML_OP_DSV4_HC_POST + the sum of its streams (VIEW + ADD per stream)
+struct test_dsv4_hc_post_sum : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    ggml_tensor * streams = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_POST_SUM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { streams, out }; }
+
+    test_dsv4_hc_post_sum(int64_t n_embd, int64_t n_tokens)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+        ggml_set_name(comb, "comb");
+
+        streams = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        ggml_set_name(streams, "streams");
+
+        ggml_tensor * sum = nullptr;
+        for (int64_t i = 0; i < hc; ++i) {
+            ggml_tensor * si = ggml_view_2d(ctx, streams, n_embd, n_tokens, streams->nb[2], i*streams->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, si) : si;
+        }
+        out = sum;
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12637,6 +12683,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 3000));
     test_cases.emplace_back(new test_concat_ssm_conv_silu(3, 64));
     test_cases.emplace_back(new test_concat_ssm_conv_silu(8, 50));
+
+    test_cases.emplace_back(new test_dsv4_hc_post_sum(512, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post_sum(31, 3));
+    test_cases.emplace_back(new test_dsv4_hc_post_sum(2560, 5));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

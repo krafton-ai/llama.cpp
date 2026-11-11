@@ -9447,6 +9447,62 @@ static void ggml_opencl_fused_mul_mat_pool_max_div_add(ggml_backend_t      backe
     }
 }
 
+// DSV4_HC_POST(branch, x, post, comb) -> VIEW(stream 0), VIEW(stream 1) -> ADD -> (VIEW -> ADD) x (hc - 2)
+// Outputs: the streams (the DSV4_HC_POST node) and their sum (the last ADD).
+static int ggml_opencl_match_dsv4_hc_post_sum(ggml_backend_opencl_context * ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * hp = cgraph->nodes[i];
+    if (!ctx->kernel_dsv4_hc_post_sum || hp->op != GGML_OP_DSV4_HC_POST || !ggml_opencl_f32_rows(hp) ||
+        hp->ne[3] != 1) {
+        return 0;
+    }
+    const int hc   = (int) hp->ne[1];
+    const int last = i + 2 * hc - 1;  // hc VIEWs and hc - 1 ADDs
+    if (hc < 2 || hc > 8 || last >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * prev = nullptr;
+    int                 j    = i + 1;
+    for (int s = 0; s < hc; ++s) {
+        const ggml_tensor * v = cgraph->nodes[j++];
+        if (v->op != GGML_OP_VIEW || v->src[0] != hp || v->view_offs != (size_t) s * hp->nb[1] ||
+            v->ne[0] != hp->ne[0] || v->ne[1] != hp->ne[2] || v->nb[1] != hp->nb[2] ||
+            ggml_opencl_use_count(cgraph, v) != 1) {
+            return 0;
+        }
+        if (s == 0) {
+            prev = v;
+            continue;
+        }
+        if (s == 1) {
+            const ggml_tensor * a = cgraph->nodes[j++];
+            if (a->op != GGML_OP_ADD || a->src[0] != prev || a->src[1] != v) {
+                return 0;
+            }
+            prev = a;
+            continue;
+        }
+        const ggml_tensor * a = cgraph->nodes[j++];
+        if (a->op != GGML_OP_ADD || a->src[0] != prev || a->src[1] != v || ggml_opencl_use_count(cgraph, prev) != 1) {
+            return 0;
+        }
+        prev = a;
+    }
+    if (j - 1 != last || !ggml_opencl_f32_rows(prev) || !ggml_is_contiguous(prev) ||
+        (prev->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    // the streams may replace the residual in place (each work-item reads and writes its own column)
+    if (ggml_opencl_overlaps(hp, hp->src[1]) && !ggml_opencl_same_buffer(hp, hp->src[1])) {
+        return 0;
+    }
+    for (int k = 0; k < 4; ++k) {
+        if (k != 1 && hp->src[k] && ggml_opencl_overlaps(hp, hp->src[k])) {
+            return 0;
+        }
+    }
+    return last;
+}
+
 // DSV4_HC_POST (hp) for up to 8 streams and, when sum is set, the sum of its streams
 static void ggml_opencl_dsv4_hc_post_sum(ggml_backend_t backend, const ggml_tensor * hp, const ggml_tensor * sum) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
@@ -9798,6 +9854,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             ggml_opencl_fused_add_sigmoid_scale(backend, cgraph, i);
             i += 2;
             continue;
+        }
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_DSV4_HC_POST) {
+            const int last = ggml_opencl_match_dsv4_hc_post_sum(backend_ctx, cgraph, i);
+            if (last > 0) {
+                ggml_opencl_dsv4_hc_post_sum(backend, node, cgraph->nodes[last]);
+                i = last;
+                continue;
+            }
         }
         if (!backend_ctx->disable_fusion && node->op == GGML_OP_MUL_MAT) {
             const int last = ggml_opencl_match_mul_mat_pool_max_div_add(backend_ctx, cgraph, i);
