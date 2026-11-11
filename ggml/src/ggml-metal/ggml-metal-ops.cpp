@@ -372,6 +372,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
             } break;
+        case GGML_OP_MLA_EXPAND_KV:
+            {
+                n_fuse = ggml_metal_op_mla_expand_kv(ctx, idx);
+            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 n_fuse = ggml_metal_op_solve_tri(ctx, idx);
@@ -1921,6 +1925,103 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes   (enc, (void *) &H, sizeof(H), ida++);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, B * H, 1, 1, C/H, 1, 1);
+
+    return 1;
+}
+
+// the F16 weight matrix of the head group (step 1 of GGML_OP_MLA_EXPAND_KV), after the op's own output
+size_t ggml_metal_op_mla_expand_kv_extra(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MLA_EXPAND_KV);
+
+    const int64_t n_heads = ggml_get_op_params_i32(op, 1);
+
+    return GGML_PAD((size_t) 2*op->src[1]->ne[0]*op->src[1]->ne[1]*n_heads*sizeof(ggml_fp16_t), 16);
+}
+
+// GGML_OP_MLA_EXPAND_KV: dequantize the group's k_b (transposed) and v_b into one F16 matrix, then one matrix multiply with the
+// F16 latent rows of the cache that stores half straight into K (with the rope part of the cache row) and V
+int ggml_metal_op_mla_expand_kv(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * kc = op->src[0];
+    const ggml_tensor * wk = op->src[1];
+    const ggml_tensor * wv = op->src[2];
+
+    const int32_t head0   = ggml_get_op_params_i32(op, 0);
+    const int32_t n_heads = ggml_get_op_params_i32(op, 1);
+
+    const int32_t nn   = wk->ne[0];
+    const int32_t rank = wk->ne[1];
+    const int32_t nv   = wv->ne[1];
+    const int32_t nr   = kc->ne[0] - rank;
+    const int32_t nk   = nn + nr;
+    const int32_t n_kv = kc->ne[1];
+
+    ggml_metal_buffer_id bid_kc  = ggml_metal_get_buffer_id(kc);
+    ggml_metal_buffer_id bid_k   = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_v   = bid_k;
+    bid_v.offs += (size_t) nk*n_heads*n_kv*sizeof(ggml_fp16_t);
+    ggml_metal_buffer_id bid_w   = bid_k;
+    bid_w.offs += ggml_nbytes(op);
+
+    for (int is_v = 0; is_v < 2; ++is_v) {
+        const ggml_tensor * w = is_v ? wv : wk;
+
+        ggml_metal_kargs_mla_expand_w args = {
+            /*.ne0     =*/ (int32_t) w->ne[0],
+            /*.ne1     =*/ (int32_t) w->ne[1],
+            /*.nb1     =*/ w->nb[1],
+            /*.nb2     =*/ w->nb[2],
+            /*.head0   =*/ head0,
+            /*.n_heads =*/ n_heads,
+            /*.nn      =*/ nn,
+            /*.rank    =*/ rank,
+            /*.is_v    =*/ is_v,
+        };
+
+        auto pipeline = ggml_metal_library_get_pipeline_mla_expand_w(lib, w->type);
+
+        const int n = (int) (w->ne[0]/16*w->ne[1]*n_heads);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w), 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_w, 2);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (n + 255)/256, 1, 1, 256, 1, 1);
+    }
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    ggml_metal_kargs_mla_expand_kv args = {
+        /*.rank =*/ rank,
+        /*.nrow =*/ 2*nn*n_heads,
+        /*.n_kv =*/ n_kv,
+        /*.nbc  =*/ kc->nb[1],
+        /*.nn   =*/ nn,
+        /*.nr   =*/ nr,
+        /*.nbk1 =*/ (uint64_t) nk*sizeof(ggml_fp16_t),
+        /*.nbk2 =*/ (uint64_t) nk*n_heads*sizeof(ggml_fp16_t),
+        /*.nbv1 =*/ (uint64_t) nv*sizeof(ggml_fp16_t),
+        /*.nbv2 =*/ (uint64_t) nv*n_heads*sizeof(ggml_fp16_t),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_mla_expand_kv(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_w,  1);
+    ggml_metal_encoder_set_buffer  (enc, bid_kc, 2);
+    ggml_metal_encoder_set_buffer  (enc, bid_k,  3);
+    ggml_metal_encoder_set_buffer  (enc, bid_v,  4);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (n_kv + pipeline.nr1 - 1)/pipeline.nr1, (args.nrow + pipeline.nr0 - 1)/pipeline.nr0, 1,
+            32, pipeline.nsg, 1);
 
     return 1;
 }

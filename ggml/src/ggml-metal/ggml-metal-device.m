@@ -1536,6 +1536,12 @@ static bool ggml_metal_supports_mul_mat_op(
     return mm_path;
 }
 
+// weights GGML_OP_MLA_EXPAND_KV can dequantize (kernel_mla_expand_w_*): 16-value chunks of whole blocks
+static bool ggml_metal_mla_expand_w_ok(const struct ggml_tensor * w) {
+    return (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_Q6_K) &&
+        w->ne[0] % ggml_blck_size(w->type) == 0 && w->ne[0] % 16 == 0;
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
@@ -1843,6 +1849,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_MLA_EXPAND_KV:
+            {
+                // ggml_metal_op_mla_expand_kv: F16 / Q8_0 / Q6_K weights, 64-row K and V tiles per head, 32-wide rank steps
+                const struct ggml_tensor * kc = op->src[0];
+                const struct ggml_tensor * wk = op->src[1];
+                const struct ggml_tensor * wv = op->src[2];
+                const int64_t rank = wk->ne[1];
+                const int64_t nr   = kc->ne[0] - rank;
+                return has_simdgroup_mm && kc->type == GGML_TYPE_F16 && kc->nb[1] % 16 == 0 && ggml_metal_mla_expand_w_ok(wk) && ggml_metal_mla_expand_w_ok(wv) &&
+                    wv->ne[1] == wk->ne[0] && wk->ne[0] % 64 == 0 && rank % 32 == 0 && nr > 0 && nr % 16 == 0;
+            }
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT:

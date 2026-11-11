@@ -365,6 +365,196 @@ kernel void kernel_mul_mm(
 
 #endif // GGML_METAL_HAS_TENSOR
 
+// GGML_OP_MLA_EXPAND_KV, step 1: the head group's k_b / v_b (any of the types below) dequantized into one F16 matrix W with
+// 2*nn rows of rank values per head: k_b[:, :, head0 + h] transposed, then v_b[:, :, head0 + h]. One thread per 16 source values
+template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mla_expand_w(
+        constant ggml_metal_kargs_mla_expand_w & args,
+        device const char * src,
+        device       char * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const int nc = args.ne0/16;                     // chunks of 16 per source row
+    const int n  = nc*args.ne1*args.n_heads;
+    if ((int) tpig >= n) {
+        return;
+    }
+    const int c  = tpig % nc;
+    const int i1 = (tpig / nc) % args.ne1;
+    const int h  = tpig / (nc*args.ne1);
+
+    device const block_q * row = (device const block_q *) (src + (uint64_t) (args.head0 + h)*args.nb2 + (uint64_t) i1*args.nb1);
+    half4x4 reg;
+    deq(row + (16*c)/(16*nl), (short) (c % nl), reg);
+
+    device half * w = (device half *) dst + (uint64_t) h*2*args.nn*args.rank;
+    if (args.is_v) {
+        // v_b row i1 (= output row nn + i1) along rank: 16 consecutive values
+        device half * o = w + (uint64_t) (args.nn + i1)*args.rank + 16*c;
+        for (short i = 0; i < 16; ++i) {
+            o[i] = reg[i/4][i%4];
+        }
+    } else {
+        // k_b row i1 (= rank index) holds nn values: output rows 16*c .. 16*c + 15, column i1
+        device half * o = w + (uint64_t) (16*c)*args.rank + i1;
+        for (short i = 0; i < 16; ++i) {
+            o[(uint64_t) i*args.rank] = reg[i/4][i%4];
+        }
+    }
+}
+
+typedef decltype(kernel_mla_expand_w<half4x4, 1, dequantize_f16>) kernel_mla_expand_w_t;
+
+template [[host_name("kernel_mla_expand_w_f16")]]  kernel kernel_mla_expand_w_t kernel_mla_expand_w<half4x4,    1, dequantize_f16>;
+template [[host_name("kernel_mla_expand_w_q8_0")]] kernel kernel_mla_expand_w_t kernel_mla_expand_w<block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_mla_expand_w_q6_K")]] kernel kernel_mla_expand_w_t kernel_mla_expand_w<block_q6_K, QK_NL, dequantize_q6_K>;
+
+// GGML_OP_MLA_EXPAND_KV, step 2: the loads and simdgroup products of kernel_mul_mm (f16 x f16, 64 x 32 tiles), but the tile is
+// stored as half straight into K and V: rows [h*2*nn, h*2*nn + nn) of W give the head's K nope part (K row of nk = nn + nr
+// halves, the rope part copied from the cache row), the next nn rows its V. Needs nn % 64 == 0 and rank % 32 == 0.
+kernel void kernel_mla_expand_kv(
+        constant ggml_metal_kargs_mla_expand_kv & args,
+        device const char * src0,   // W [rank, nrow] F16
+        device const char * src1,   // cache rows [rank + nr] F16, stride nbc
+        device       char * dst,    // K
+        device       char * dst_v,  // V
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = (args.nrow - r0 < NR0) ? (args.nrow - r0) : NR0;
+    const short nr1 = (args.n_kv - r1 < NR1) ? (args.n_kv - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    device const half4x4 * x = (device const half4x4 *)(src0 + (uint64_t) 2*args.rank*(r0 + lr0)) + il0;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const half * y = (device const half *)(src1 + args.nbc*(r1 + lr1)) + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++){
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.rank; loop_k += NK) {
+        half4x4 temp_a = *x;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+
+            const short ib = 8*sx + sy;
+
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+
+            const short ly = (tiitg/NL1)%8;
+
+            const short ib = 4*sx + sy;
+
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device const half2x4 *) y);
+        }
+
+        x += 2;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    // tile 64 rows x 32 tokens through threadgroup memory as float, then 4 threads per token write 16 halves each
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int nn  = args.nn;
+    const int h   = r0/(2*nn);           // head in the group: a 64-row tile never crosses a K / V boundary (nn % 64 == 0)
+    const int j0  = r0 - h*2*nn;
+    const short j = tiitg/4;             // token in the tile
+    const short c = 16*(tiitg%4);        // first of 16 rows
+
+    if (j < nr1) {
+        const int t = r1 + j;
+        threadgroup const float * C = ((threadgroup const float *) shmem) + j*NR0 + c;
+        device half * D = j0 < nn ?
+            (device half *) (dst   + (uint64_t) t*args.nbk2 + (uint64_t) h*args.nbk1) + j0 + c :
+            (device half *) (dst_v + (uint64_t) t*args.nbv2 + (uint64_t) h*args.nbv1) + (j0 - nn) + c;
+        for (short i = 0; i < 16; i += 4) {
+            *(device half4 *) (D + i) = (half4) *(threadgroup const float4 *) (C + i);
+        }
+        if (j0 == 0) {
+            // the rope part of the head's K row, once per head and token
+            device const half * R = (device const half *) (src1 + (uint64_t) t*args.nbc) + args.rank;
+            device       half * K = (device half *) (dst + (uint64_t) t*args.nbk2 + (uint64_t) h*args.nbk1) + nn;
+            for (short i = 0; i < args.nr/4; i += 4) {
+                *(device half4 *) (K + (tiitg%4)*(args.nr/4) + i) = *(device const half4 *) (R + (tiitg%4)*(args.nr/4) + i);
+            }
+        }
+    }
+}
+
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
         constant ggml_metal_kargs_mul_mm_id_map0 & args,

@@ -1564,6 +1564,34 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mla_expand_w(ggml_metal_library_t lib, ggml_type type) {
+    char name[256];
+    snprintf(name, 256, "kernel_mla_expand_w_%s", ggml_type_name(type));
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mla_expand_kv(ggml_metal_library_t lib) {
+    const char * name = "kernel_mla_expand_kv";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    res.nr0  = 64;
+    res.nr1  = 32;
+    res.nsg  = 4;
+    res.smem = 8192;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous_1(op->src[0]));

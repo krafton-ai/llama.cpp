@@ -520,6 +520,33 @@ typedef struct {
     int16_t  r3;
 } ggml_metal_kargs_mul_mm;
 
+// GGML_OP_MLA_EXPAND_KV, step 1: one source tensor (k_b or v_b) of the head group dequantized into the F16 weight matrix
+typedef struct {
+    int32_t  ne0;   // source row length (k_b: nn, v_b: rank)
+    int32_t  ne1;   // source rows per head (k_b: rank, v_b: nv)
+    uint64_t nb1;   // source byte strides: row, head
+    uint64_t nb2;
+    int32_t  head0;
+    int32_t  n_heads;
+    int32_t  nn;    // K nope rows per head (= V rows)
+    int32_t  rank;
+    int32_t  is_v;  // 0: k_b, written transposed to rows [h*2*nn, h*2*nn + nn); 1: v_b, rows [h*2*nn + nn, (h + 1)*2*nn)
+} ggml_metal_kargs_mla_expand_w;
+
+// GGML_OP_MLA_EXPAND_KV, step 2: [2*nn*n_heads, rank] F16 weights x the F16 latent rows of the cache, stored as half into K and V
+typedef struct {
+    int32_t  rank;
+    int32_t  nrow;  // 2*nn*n_heads
+    int32_t  n_kv;
+    uint64_t nbc;   // byte stride of the cache rows
+    int32_t  nn;
+    int32_t  nr;    // rope halves copied from the cache row (after the rank latent values) into each K row
+    uint64_t nbk1;  // K byte strides: head, token
+    uint64_t nbk2;
+    uint64_t nbv1;  // V byte strides: head, token
+    uint64_t nbv2;
+} ggml_metal_kargs_mla_expand_kv;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

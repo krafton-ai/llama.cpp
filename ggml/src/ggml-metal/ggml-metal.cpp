@@ -240,6 +240,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_argmax_extra(tensor);
             } break;
+        case GGML_OP_MLA_EXPAND_KV:
+            {
+                res += ggml_metal_op_mla_expand_kv_extra(tensor);
+            } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
             {
