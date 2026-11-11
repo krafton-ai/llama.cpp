@@ -70,6 +70,7 @@ set(GGML_OPENCL_KERNELS
     dsv4_hc
     pool_1d
     mul_mat_f16_f32_ncol
+    fused_ops
     fill
     clamp
     cpy

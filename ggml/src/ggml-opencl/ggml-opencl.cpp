@@ -757,6 +757,7 @@ struct ggml_backend_opencl_context {
     // prealloc buffers for src0 and src1
     ggml_cl_buffer prealloc_src0;
     ggml_cl_buffer prealloc_src1;
+    ggml_cl_buffer prealloc_fusion_tmp;  // an output of a chain fusion that shares memory with one of its inputs
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_buffer prealloc_adreno_xmem_const;
@@ -856,6 +857,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_pool_1d_f32;
     // decode attention of one KV head against 32 query heads without FA (kernels/mul_mat_f16_f32_ncol*.cl)
     cl_kernel kernel_mul_mat_f16_f32_ncol                    = nullptr;
+    // fused op chains (kernels/fused_ops.cl)
+    cl_kernel kernel_dsv4_hc_post_sum              = nullptr;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
@@ -1725,6 +1728,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (prog) {
             CL_CHECK(clReleaseProgram(prog));
         }
+    }
+
+    // fused_ops
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "fused_ops.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("fused_ops.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_dsv4_hc_post_sum = clCreateKernel(prog, "kernel_dsv4_hc_post_sum", &err), err));
+        GGML_LOG_CONT(".");
+
+        CL_CHECK(clReleaseProgram(prog));
     }
 
     // fill
@@ -8854,12 +8875,125 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// buffer range of a tensor, for the overlap checks of the chain fusions (a fused kernel writes outputs while
+// it still reads its inputs; the allocator may have given an output the memory of an input that dies inside the chain)
+struct ggml_opencl_brange {
+    cl_mem   mem = nullptr;
+    cl_ulong lo = 0, hi = 0;
+};
+
+static ggml_opencl_brange ggml_opencl_range(const ggml_tensor * t) {
+    ggml_opencl_brange           r;
+    const ggml_tensor_extra_cl * e = (const ggml_tensor_extra_cl *) t->extra;
+    if (e) {
+        r.mem = e->data_device;
+        r.lo  = e->offset + t->view_offs;
+        r.hi  = r.lo + ggml_nbytes(t);
+    }
+    return r;
+}
+
+static bool ggml_opencl_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
+    const ggml_opencl_brange x = ggml_opencl_range(a), y = ggml_opencl_range(b);
+    return !x.mem || !y.mem || (x.mem == y.mem && x.lo < y.hi && y.lo < x.hi);
+}
+
 // buffer and offset of a tensor as two kernel arguments
 static void ggml_opencl_arg_tensor(cl_kernel k, cl_uint & idx, const ggml_tensor * t) {
     const ggml_tensor_extra_cl * e   = (const ggml_tensor_extra_cl *) t->extra;
     const cl_ulong               off = e->offset + t->view_offs;
     CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_mem), &e->data_device));
     CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_ulong), &off));
+}
+
+// DSV4_HC_POST (hp) for up to 8 streams and, when sum is set, the sum of its streams
+static void ggml_opencl_dsv4_hc_post_sum(ggml_backend_t backend, const ggml_tensor * hp, const ggml_tensor * sum) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    cl_kernel                     kernel      = backend_ctx->kernel_dsv4_hc_post_sum;
+    const ggml_tensor *           x           = hp->src[0];
+    const ggml_tensor *           res         = hp->src[1];
+    const ggml_tensor *           post        = hp->src[2];
+    const ggml_tensor *           comb        = hp->src[3];
+
+    const int      n        = (int) x->ne[0];
+    const int      nt       = (int) x->ne[1];
+    const int      hc       = (int) res->ne[1];
+    const int      has_comb = comb != nullptr;
+    const int      has_sum  = sum != nullptr;
+    const cl_ulong zero     = 0;
+    const cl_ulong nbx0     = x->nb[0];
+    const cl_ulong nbx1     = x->nb[1];
+    const cl_ulong nbr0     = res->nb[0];
+    const cl_ulong nbr1     = res->nb[1];
+    const cl_ulong nbr2     = res->nb[2];
+    const cl_ulong nbp0     = post->nb[0];
+    const cl_ulong nbp1     = post->nb[1];
+    const cl_ulong nbc0     = comb ? comb->nb[0] : 0;
+    const cl_ulong nbc1     = comb ? comb->nb[1] : 0;
+    const cl_ulong nbc2     = comb ? comb->nb[2] : 0;
+    const cl_ulong nb0      = hp->nb[0];
+    const cl_ulong nb1      = hp->nb[1];
+    const cl_ulong nb2      = hp->nb[2];
+    const cl_ulong nbs1     = sum ? sum->nb[1] : hp->nb[2];
+
+    // the sum goes through the scratch buffer when the allocator gave it the memory of an input or of the streams
+    bool via_tmp = false;
+    if (sum) {
+        via_tmp = ggml_opencl_overlaps(sum, hp);
+        for (int s = 0; s < 4; ++s) {
+            via_tmp = via_tmp || (hp->src[s] && ggml_opencl_overlaps(sum, hp->src[s]));
+        }
+    }
+
+    cl_uint idx = 0;
+    ggml_opencl_arg_tensor(kernel, idx, x);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbx0));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbx1));
+    ggml_opencl_arg_tensor(kernel, idx, res);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbr0));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbr1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbr2));
+    ggml_opencl_arg_tensor(kernel, idx, post);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbp0));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbp1));
+    if (comb) {
+        ggml_opencl_arg_tensor(kernel, idx, comb);
+    } else {
+        // not read without comb
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &((ggml_tensor_extra_cl *) post->extra)->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &zero));
+    }
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbc0));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbc1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbc2));
+    ggml_opencl_arg_tensor(kernel, idx, hp);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &n));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &nt));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &hc));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &has_comb));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &has_sum));
+    if (via_tmp) {
+        backend_ctx->prealloc_fusion_tmp.allocate(backend_ctx->context, ggml_nbytes(sum));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &backend_ctx->prealloc_fusion_tmp.buffer));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &zero));
+    } else {
+        // not written without sum
+        ggml_opencl_arg_tensor(kernel, idx, sum ? sum : hp);
+    }
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbs1));
+
+    size_t lws[2] = { 64, 1 };
+    size_t gws[2] = { (size_t) (n + 63) / 64 * 64, (size_t) nt };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, hp);
+    if (via_tmp) {
+        ggml_tensor_extra_cl * es = (ggml_tensor_extra_cl *) sum->extra;
+        const cl_ulong         os = es->offset + sum->view_offs;
+        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, backend_ctx->prealloc_fusion_tmp.buffer, es->data_device, 0,
+                                     os, ggml_nbytes(sum), 0, nullptr, nullptr));
+    }
 }
 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -9470,6 +9604,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_DSV4_HC_POST:
+            // up to 8 streams: the per-token row kernel; otherwise the per-element kernel
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                    op->type == GGML_TYPE_F32;
@@ -15633,6 +15768,15 @@ static void ggml_cl_tri(ggml_backend_t backend, const ggml_tensor * src0, const 
     size_t global_work_size[1] = { ((size_t)n + local_work_size[0] - 1) / local_work_size[0] * local_work_size[0] };
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_dsv4_hc_post_rows(ggml_backend_t      backend,
+                                      const ggml_tensor * src0,
+                                      const ggml_tensor * src1,
+                                      ggml_tensor *       dst) {
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    ggml_opencl_dsv4_hc_post_sum(backend, dst, nullptr);
 }
 
 static void ggml_cl_pool_1d(ggml_backend_t      backend,
@@ -31015,7 +31159,7 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
             if (!any_on_device) {
                 return false;
             }
-            func = ggml_cl_dsv4_hc_post;
+            func = tensor->src[1]->ne[1] <= 8 ? ggml_cl_dsv4_hc_post_rows : ggml_cl_dsv4_hc_post;
             break;
         case GGML_OP_DSV4_HC_PRE:
             if (!any_on_device) {
