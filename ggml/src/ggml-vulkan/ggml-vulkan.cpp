@@ -6828,7 +6828,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     const ggml_type y_kernel_type = widen_bf16 ? GGML_TYPE_F32 : src1->type;
     const bool f16_f32_kernel = y_kernel_type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+    // the fused swiglu (MAT_VEC_FUSION_FLAGS_GLU) is in the float mat-vec shader only
+    const bool fuse_glu   = ctx->fused_mul_mat_vec_glu == 1;
+    const bool fuse_geglu = ctx->fused_mul_mat_vec_glu == 2;
+    const bool fuse_hc_post = ctx->fused_mul_mat_vec_hc_post;
+    bool quantize_y = !fuse_glu && !fuse_geglu && !fuse_hc_post && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -6983,7 +6987,16 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     uint32_t fusion_flags = 0;
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->num_additional_fused_ops > 0) {
+    if (fuse_glu) {
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_GLU;
+    } else if (fuse_geglu) {
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]->src[1]);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_GEGLU_MUL;
+    } else if (fuse_hc_post) {
+        const ggml_tensor * hp = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, hp->src[1]);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_HC_POST;
+    } else if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
@@ -6992,7 +7005,20 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     vk_subbuffer d_F1 = d_D;
-    if (ctx->num_additional_fused_ops == 2) {
+    uint32_t fuse1_off0 = 0, fuse1_off1 = 0;
+    if (fuse_hc_post) {
+        // post and comb: one binding from the lower one (aligned down) to the end of the higher one
+        const ggml_tensor * hp = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+        const vk_subbuffer sp = ggml_vk_tensor_subbuffer(ctx, hp->src[2], true);
+        const vk_subbuffer sc = ggml_vk_tensor_subbuffer(ctx, hp->src[3], true);
+        const uint64_t op = sp.offset + get_misalign_bytes(ctx, hp->src[2]), oc = sc.offset + get_misalign_bytes(ctx, hp->src[3]);
+        const uint64_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+        const uint64_t lo = std::min(op, oc) / align * align;
+        const uint64_t hi = std::max(op + 4*sizeof(float), oc + 16*sizeof(float));
+        d_F1 = { sp.buffer, lo, hi - lo };
+        fuse1_off0 = (uint32_t) ((op - lo) / sizeof(float));
+        fuse1_off1 = (uint32_t) ((oc - lo) / sizeof(float));
+    } else if (!fuse_glu && !fuse_geglu && ctx->num_additional_fused_ops == 2) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 2];
         const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
 
@@ -7007,10 +7033,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
         uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
         const vk_mat_vec_push_constants pc = {
-            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(fuse_glu ? ne01/2 : ne01),
             stride_batch_x, stride_batch_y, stride_batch_d,
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            fuse1_off0, fuse1_off1,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
@@ -14204,6 +14231,84 @@ static bool ggml_vk_fuse_mul_mat_cpy_f16(const ggml_backend_vk_context * ctx, co
     return (mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
 }
 
+// A mat-vec whose output is the branch input x of a 4-stream hc_post (DSV4_HC_POST with comb), one token: the mat-vec
+// writes the streams itself (MAT_VEC_FUSION_FLAGS_HC_POST), reading post and comb from one binding of the buffer that
+// holds both (they come from the same compute buffer). Views may sit between the two. Returns the hc_post index, or -1
+static int ggml_vk_fuse_mul_mat_hc_post(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor *mul = cgraph->nodes[node_idx];
+    if (mul->op != GGML_OP_MUL_MAT || (mul->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_node_has_n_uses(cgraph, node_idx, 1) ||
+            ggml_nrows(mul) != 1 || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) ||
+            mul->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul->src[1])) {
+        return -1;
+    }
+    int j = node_idx + 1;
+    while (j < cgraph->n_nodes && j <= node_idx + 4 && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor *hp = cgraph->nodes[j];
+    if (hp->op != GGML_OP_DSV4_HC_POST || (hp->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            hp->src[0] != mul || !hp->src[3] || !ggml_is_contiguous(hp) || hp->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    const ggml_tensor *res = hp->src[1], *post = hp->src[2], *comb = hp->src[3];
+    const int64_t n = mul->ne[0];
+    if (res->ne[0] != n || res->ne[1] != 4 || res->ne[2] != 1 || !ggml_is_contiguous(res) || res->type != GGML_TYPE_F32 ||
+            get_misalign_bytes(ctx, res) != 0 ||
+            post->type != GGML_TYPE_F32 || post->ne[0] != 4 || ggml_nelements(post) != 4 || post->nb[0] != sizeof(float) ||
+            comb->type != GGML_TYPE_F32 || ggml_nelements(comb) != 16 || comb->nb[0] != sizeof(float) || comb->nb[1] != 4*sizeof(float) ||
+            !post->buffer || post->buffer != comb->buffer) {
+        return -1;
+    }
+    return j;
+}
+
+// A mat-vec followed by a GLU that the mat-vec shader applies itself (MAT_VEC_FUSION_FLAGS_GLU / _GEGLU_MUL): a Q4_K
+// mat-vec of [gate | up] rows and the single-source swiglu (merged FFN up projection), or a mat-vec that is the gelu
+// input of a split GEGLU (Raon per-layer input gate). Nodes without computation (views) may sit between the two.
+// Returns the index of the GLU node, or -1. The shapes differ (2n rows -> n), so this is not ggml_can_fuse
+static int ggml_vk_fuse_mul_mat_glu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor *mul = cgraph->nodes[node_idx];
+    if (mul->op != GGML_OP_MUL_MAT || (mul->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+        return -1;
+    }
+    int j = node_idx + 1;
+    while (j < cgraph->n_nodes && j <= node_idx + 4 && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor *glu = cgraph->nodes[j];
+    if (glu->op != GGML_OP_GLU || (glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || glu->src[0] != mul ||
+            ggml_get_op_params_i32(glu, 1) != 0 || !ggml_is_contiguous(glu) || ggml_nrows(mul) != 1) {
+        return -1;
+    }
+    const ggml_tensor *a = mul->src[0], *b = mul->src[1];
+    if (b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b)) {
+        return -1;
+    }
+    if (ggml_get_glu_op(glu) == GGML_GLU_OP_GEGLU && glu->src[1] != nullptr) {
+        const ggml_tensor *other = glu->src[1];
+        const bool ok = ggml_is_contiguous(mul) && ggml_are_same_shape(mul, other) && other->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(other) && get_misalign_bytes(ctx, other) == 0;
+        return ok ? j : -1;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] != nullptr) {
+        return -1;
+    }
+    if (a->type != GGML_TYPE_Q4_K || !ggml_vk_dim01_contiguous(a) || a->ne[2] != 1 || a->ne[3] != 1 || mul->ne[0] % 2 != 0) {
+        return -1;
+    }
+    const vk_pipeline dmmv = ggml_vk_get_dequantize_mul_mat_vec(const_cast<ggml_backend_vk_context *>(ctx), a->type, GGML_TYPE_F32, 1, mul->ne[0], a->ne[0]);
+    if (!dmmv || dmmv->wg_denoms[0] % 2 != 0 || (mul->ne[0] / 2) % (dmmv->wg_denoms[0] / 2) != 0) {
+        return -1;
+    }
+    return j;
+}
+
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -15057,6 +15162,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_hc_select = false;
+        ctx->fused_mul_mat_vec_glu = 0;
+        ctx->fused_mul_mat_vec_hc_post = false;
         ctx->fused_mul_mat_cpy_f16 = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
@@ -15096,6 +15203,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_CPY_F16";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (const int i_hp = ggml_vk_fuse_mul_mat_hc_post(ctx, cgraph, i); i_hp > 0) {
+                ctx->num_additional_fused_ops = i_hp - i;
+                ctx->fused_mul_mat_vec_hc_post = true;
+                fusion_string = "MUL_MAT_HC_POST";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // each row reads its residual elements (one per stream) before it writes the same elements: the hc_post
+                // output may be the residual (in place)
+                op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = true;
+            } else if (const int i_glu = ggml_vk_fuse_mul_mat_glu(ctx, cgraph, i); i_glu > 0) {
+                ctx->num_additional_fused_ops = i_glu - i;
+                ctx->fused_mul_mat_vec_glu = cgraph->nodes[i_glu]->src[1] ? 2 : 1;
+                fusion_string = "MUL_MAT_GLU";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
@@ -15345,6 +15465,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_hc_select = false;
+                ctx->fused_mul_mat_vec_glu = 0;
+                ctx->fused_mul_mat_vec_hc_post = false;
                 ctx->fused_mul_mat_cpy_f16 = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
@@ -15592,6 +15714,16 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     std::vector<bool> used(graph->n_nodes, false);
     std::set<ggml_tensor *> used_node_set;
 
+    // a mat-vec and the single-input GLU of its output run as one dispatch at decode (ggml_vk_fuse_mul_mat_glu), which
+    // reads the mat-vec input while it writes the GLU output: keep that input alive through the GLU as well
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * glu = graph->nodes[i];
+        if (glu->op != GGML_OP_GLU || glu->src[1] != nullptr || glu->src[0]->op != GGML_OP_MUL_MAT || ggml_nrows(glu) != 1) {
+            continue;
+        }
+        params->add_alloc_dep(params->user_data, glu->src[0]->src[1], glu);
+    }
+
     int first_unused = 0;
 
     // scheduled or zero-compute nodes in [lo, hi)
@@ -15761,6 +15893,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
+                    // a mat-vec and the hc_post of its output: keep the pair together for the mat-vec epilogue
+                    !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_DSV4_HC_POST &&
+                      graph->nodes[j]->src[0] == graph->nodes[c] && empty_or_scheduled_between(c+1, j)) &&
+                    // a split GLU of a mat-vec and a view (Raon per-layer input gate): keep the pair together for the mat-vec epilogue
+                    !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_GLU &&
+                      graph->nodes[j]->src[1] != nullptr && empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
@@ -15946,6 +16084,50 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         }
         new_order.swap(order);
+    }
+    // A one-token mat-vec and the DSV4_HC_POST of its output side by side (ggml_vk_fuse_mul_mat_hc_post), when the hc_post's
+    // other sources are ready before the mat-vec: the hc_post moves up, its readers come after it anyway
+    if (!ctx->device->disable_fusion) {
+        for (size_t hi = 0; hi < new_order.size(); ++hi) {
+            ggml_tensor * hp = new_order[hi];
+            if (hp->op != GGML_OP_DSV4_HC_POST || hp->src[0]->op != GGML_OP_MUL_MAT || ggml_nrows(hp->src[0]) != 1) {
+                continue;
+            }
+            size_t mi = 0;
+            while (mi < hi && new_order[mi] != hp->src[0]) {
+                ++mi;
+            }
+            if (mi >= hi || mi + 1 == hi) {
+                continue;
+            }
+            // a source between the two must be a view (no computation) of a node before the mat-vec: it moves up with it
+            bool ready = true;
+            std::vector<ggml_tensor *> views;
+            for (int si = 1; si < GGML_MAX_SRC && ready; ++si) {
+                ggml_tensor * src = hp->src[si];
+                for (size_t k = mi + 1; src && k < hi && ready; ++k) {
+                    ggml_tensor * t = new_order[k];
+                    if (t == src && ggml_op_is_empty(t->op) && t->view_src) {
+                        for (size_t b = mi + 1; b < hi && ready; ++b) {
+                            ready = new_order[b] != t->view_src;
+                        }
+                        views.push_back(t);
+                    } else if (t == src || (src->view_src && t == src->view_src)) {
+                        ready = false;
+                    }
+                }
+            }
+            if (!ready) {
+                continue;
+            }
+            new_order.erase(new_order.begin() + hi);
+            for (ggml_tensor * v : views) {
+                new_order.erase(std::find(new_order.begin(), new_order.end(), v));
+            }
+            mi = std::find(new_order.begin(), new_order.end(), hp->src[0]) - new_order.begin();
+            new_order.insert(new_order.begin() + mi + 1, hp);
+            new_order.insert(new_order.begin() + mi + 1, views.begin(), views.end());
+        }
     }
     // Replace the graph with the new order.
     GGML_ASSERT((int) new_order.size() == graph->n_nodes);

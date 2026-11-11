@@ -1123,6 +1123,13 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// mul_mat_vec_iface.glsl: [gate | up] rows, the output is silu(gate) * up
+#define MAT_VEC_FUSION_FLAGS_GLU 0x10
+// mul_mat_vec_iface.glsl: the output is gelu_tanh(row) * fuse0[row]
+#define MAT_VEC_FUSION_FLAGS_GEGLU_MUL 0x20
+// mul_mat_vec_iface.glsl: the output feeds a 4-stream hc_post (and its stream sum)
+#define MAT_VEC_FUSION_FLAGS_HC_POST 0x40
+#define MAT_VEC_FUSION_FLAGS_HC_POST_SUM 0x80
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1311,6 +1318,8 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_gate {};
     bool fused_hc_select {};   // mHC selector: the run's node indices are in hc_select_run
     int  hc_select_run[16] {};
+    int  fused_mul_mat_vec_glu {};  // 1: [gate | up] swiglu, 2: geglu with an external second input
+    bool fused_mul_mat_vec_hc_post {};
     bool fused_mul_mat_cpy_f16 = false; // a MUL_MAT and the CPY of its result to f16 as one multiply writing f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 

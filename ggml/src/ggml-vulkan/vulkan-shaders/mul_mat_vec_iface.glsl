@@ -4,6 +4,16 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// rows [0, n) and [n, 2n) of the matrix are the gate and up halves of a swiglu: the workgroup computes row r of each
+// half and writes silu(gate) * up to output r (p.stride_d = n); the shader maps its rows with glu_row()
+#define MAT_VEC_FUSION_FLAGS_GLU 0x10
+// the output is geglu(row, fuse0) = gelu_tanh(row) * fuse0[row] (a split GEGLU with a second, external input)
+#define MAT_VEC_FUSION_FLAGS_GEGLU_MUL 0x20
+// the output feeds an mHC hc_post with 4 streams (dsv4_hc_post): fuse0 = the residual streams [n, 4] and fuse1 = the
+// selector row [pre (4) | post (4) | comb (16)]; row i writes stream d: v*post[d] + sum_s res[i, s]*comb[d + 4s]
+#define MAT_VEC_FUSION_FLAGS_HC_POST 0x40
+// ... and the stream sum after the 4 streams (raon_hc_post_sum)
+#define MAT_VEC_FUSION_FLAGS_HC_POST_SUM 0x80
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)

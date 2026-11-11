@@ -37,6 +37,8 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint fuse1_off0;   // MAT_VEC_FUSION_FLAGS_HC_POST: post and comb element offsets in fuse1
+    uint fuse1_off1;
 #endif
 } p;
 
@@ -90,6 +92,56 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
+// MAT_VEC_FUSION_FLAGS_GLU: rows n < num_rows/2 of the workgroup are gate rows, the rest the matching up rows
+uint glu_row(const uint first_row, const uint n, const uint num_rows) {
+#ifndef MUL_MAT_ID
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU) != 0) {
+        const uint h = num_rows / 2;
+        return n < h ? first_row + n : p.stride_d + first_row + n - h;
+    }
+#endif
+    return first_row + n;
+}
+
+#ifndef MUL_MAT_ID
+// MAT_VEC_FUSION_FLAGS_GEGLU_MUL, the same formula as geglu.comp
+FLOAT_TYPE geglu_mul(const FLOAT_TYPE a, const uint i) {
+    const float x = float(a);
+    const float val = 0.79788456080286535587989211986876f*x*(1.0f + 0.044715f*x*x);
+    return FLOAT_TYPE(0.5f*x*(2.0f - 2.0f / (exp(2 * val) + 1)) * float(data_fuse0[i]));
+}
+
+// MAT_VEC_FUSION_FLAGS_HC_POST(_SUM): the 4 (5) stream outputs of row i (p.stride_d = n rows); base = d_offset
+void store_hc_post(const uint base, const uint i, const FLOAT_TYPE v) {
+    const uint n = p.stride_d;
+    float r[4];
+    [[unroll]] for (uint s = 0; s < 4; ++s) {
+        r[s] = float(data_fuse0[i + s*n]);
+    }
+    float tot = 0.0f;
+    [[unroll]] for (uint d = 0; d < 4; ++d) {
+        float o = float(v) * float(data_fuse1[p.fuse1_off0 + d]);
+        [[unroll]] for (uint s = 0; s < 4; ++s) {
+            o = fma(r[s], float(data_fuse1[p.fuse1_off1 + d + 4*s]), o);
+        }
+        data_d[base + i + d*n] = D_TYPE(o);
+        tot += o;
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_HC_POST_SUM) != 0) {
+        data_d[base + i + 4*n] = D_TYPE(tot);
+    }
+}
+
+// writes silu(gate) * up for the num_rows/2 outputs of the workgroup; value(j, n) is the summed row n
+#define STORE_GLU(value) \
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) { \
+        [[unroll]] for (uint n = 0; n < num_rows / 2; ++n) { \
+            const FLOAT_TYPE g = value(j, n); \
+            data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(g / (FLOAT_TYPE(1) + exp(-g)) * value(j, n + num_rows / 2)); \
+        } \
+    }
+#endif
+
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -98,6 +150,14 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
         }
     }
 
+#ifndef MUL_MAT_ID
+#define TEMP_VALUE(j, n) temp[j][n]
+    if (tid == 0 && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU) != 0) {
+        STORE_GLU(TEMP_VALUE)
+        return;
+    }
+#undef TEMP_VALUE
+#endif
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -119,6 +179,13 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GEGLU_MUL) != 0) {
+                    temp[j][n] = geglu_mul(temp[j][n], j*p.batch_stride_d + d_offset + first_row + n);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_HC_POST) != 0) {
+                    store_hc_post(d_offset, first_row + n, temp[j][n]);
+                    continue;
                 }
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
@@ -149,6 +216,22 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
         }
     }
     barrier();
+#ifndef MUL_MAT_ID
+    if (tid == 0 && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU) != 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                temp[j][n] = FLOAT_TYPE(0);
+                [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
+                    temp[j][n] += tmpsh[j][n][s];
+                }
+            }
+        }
+#define TEMP_VALUE(j, n) temp[j][n]
+        STORE_GLU(TEMP_VALUE)
+#undef TEMP_VALUE
+        return;
+    }
+#endif
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -175,6 +258,13 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GEGLU_MUL) != 0) {
+                    temp[j][n] = geglu_mul(temp[j][n], j*p.batch_stride_d + d_offset + first_row + n);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_HC_POST) != 0) {
+                    store_hc_post(d_offset, first_row + n, temp[j][n]);
+                    continue;
+                }
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
@@ -198,6 +288,14 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
         }
         barrier();
     }
+#ifndef MUL_MAT_ID
+#define TMPSH_VALUE(j, n) tmpsh[j][n][0]
+    if (tid == 0 && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU) != 0) {
+        STORE_GLU(TMPSH_VALUE)
+        return;
+    }
+#undef TMPSH_VALUE
+#endif
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -219,6 +317,13 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GEGLU_MUL) != 0) {
+                    tmpsh[j][n][0] = geglu_mul(tmpsh[j][n][0], j*p.batch_stride_d + d_offset + first_row + n);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_HC_POST) != 0) {
+                    store_hc_post(d_offset, first_row + n, tmpsh[j][n][0]);
+                    continue;
                 }
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);

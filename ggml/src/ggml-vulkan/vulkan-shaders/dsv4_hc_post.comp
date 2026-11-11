@@ -11,9 +11,12 @@
 // HAS_COMB == 0: identity mixing, each stream keeps its own residual:
 //
 //   dst[i0, idst, it] = x[i0, it]*post[idst, it] + residual[i0, idst, it]
+//
+// WRITE_SUM == 1 (ggml_raon_hc_post_sum): dst has hc + 1 slots, slot hc holds the sum of the hc streams
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint HAS_COMB = 1;
+layout(constant_id = 2) const uint WRITE_SUM = 0;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -81,6 +84,7 @@ void main() {
         r[isrc] = data_r[rb + isrc * nbr1];
     }
 
+    float total = 0.0f;
     [[unroll]]
     for (uint idst = 0; idst < hc; ++idst) {
         float result = xv * post_s[idst];
@@ -93,5 +97,9 @@ void main() {
             result += r[idst];
         }
         data_d[d_offset + i0 * nbd0 + idst * nbd1 + it * nbd2] = result;
+        total += result;
+    }
+    if (WRITE_SUM == 1) {
+        data_d[d_offset + i0 * nbd0 + hc * nbd1 + it * nbd2] = total;
     }
 }
