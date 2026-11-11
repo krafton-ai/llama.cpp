@@ -12237,6 +12237,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4 - 1 + 17, 1000, 2, 1}, {4, 1000, 1, 1}));
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {8 - 1 + 16, 96, 1, 1}, {8, 96, 1, 1}));
 
+    // q8_0 GEMV with short rows
+    for (int64_t k : {32, 64, 128, 256}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 1, k, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 100, 1, k, {1, 1}, {1, 1}));
+    }
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));

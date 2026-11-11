@@ -971,7 +971,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q6_K_f32;
     cl_kernel kernel_mul_mv_q6_K_f32_flat;
     cl_kernel kernel_mul_mv_mxfp4_f32, kernel_mul_mv_mxfp4_f32_flat;
-    cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
+    cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat, kernel_mul_mv_q8_0_f32_flat_short;
     cl_kernel kernel_mul_mv_iq4_nl_f32;
     cl_kernel kernel_mul_mv_iq4_nl_f32_flat;
     cl_kernel kernel_solve_tri_f32;
@@ -2334,6 +2334,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat_short = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat_short", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -26057,6 +26058,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nth0 = 64;
                 nth1 = 2;
                 ndst = nth1*4;
+                // short rows (up to 8 blocks): 4 lanes per block instead of one row over the whole subgroup
+                const int nb = ne00 / 32;
+                if (ne00 % 32 == 0 && (nb == 1 || nb == 2 || nb == 4 || nb == 8)) {
+                    kernel = backend_ctx->kernel_mul_mv_q8_0_f32_flat_short;
+                    ndst   = nth1 * 16;
+                }
             } else {
                 GGML_ASSERT(false && "TODO: Unknown GPU");
             }

@@ -200,3 +200,78 @@ kernel void kernel_mul_mv_q8_0_f32_flat(
         }
     }
 }
+
+// Short rows (ne00/32 = nb blocks with 4*nb dividing the subgroup, e.g. 128 per row): the kernel
+// above spreads one row over 16 block slots, so with 4 blocks 3/4 of the lanes idle. Here a row takes 4*nb lanes
+// (4 per block, 8 quants each) and a subgroup works on 64/(4*nb) rows at a time, N_R_Q8_0_SHORT rows in all.
+// Same arguments and grid as kernel_mul_mv_q8_0_f32_flat with N_R_Q8_0_SHORT rows per subgroup
+#define N_R_Q8_0_SHORT 16
+
+#ifdef INTEL_GPU
+REQD_SUBGROUP_SIZE_16
+#elif defined(ADRENO_GPU)
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mv_q8_0_f32_flat_short(
+        global char * src0_q,
+        global half * src0_d,
+        global char * src1,
+        ulong offset1,
+        global char * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne12,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3) {
+    src1 = (global char *) ((global char *) src1 + offset1);
+    dst = (global char *) ((global char *) dst + offsetd);
+
+    const int nb = ne00 / QK8_0;
+    const int lpr = 4 * nb;             // lanes per row
+    const int rps = N_SIMDWIDTH / lpr;  // rows per pass
+    const int r0 = get_group_id(0);
+    const int r1 = get_group_id(1);
+    const int im = get_group_id(2);
+    const int first_row = (r0 * get_num_sub_groups() + get_sub_group_id()) * N_R_Q8_0_SHORT;
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+
+    global float * y = (global float *) (src1 + r1 * nb11 + i12 * nb12 + i13 * nb13);
+    const ulong offset_src0_base = (i12 / r2) * nb02 + (i13 / r3) * nb03;
+
+    const int lid = get_sub_group_local_id();
+    const int rr = lid / lpr;  // row within the pass
+    const int li = lid - rr * lpr;
+    const int ib = li / 4;     // block of the row
+    const int il = li % 4;     // 8 quants of the block
+
+    const float8 yl = vload8(0, y + ib * QK8_0 + il * 8);
+    global float * dst_f32 = (global float *) dst + (ulong) im * ne0 * ne1 + (ulong) r1 * ne0;
+
+    for (int p = 0; p < N_R_Q8_0_SHORT; p += rps) {
+        const int row = first_row + p + rr;
+        float sumf = 0.0f;
+        if (row < ne01) {
+            const ulong blk = (offset_src0_base + (ulong) row * nb01) / 34 + ib;
+            const float8 qv = convert_float8(vload8(0, src0_q + blk * QK8_0 + il * 8));
+            sumf = dot(qv.lo, yl.lo) + dot(qv.hi, yl.hi);
+            sumf *= src0_d[blk];
+        }
+        for (int s = lpr / 2; s > 0; s >>= 1) {
+            sumf += sub_group_shuffle_xor(sumf, (uint) s);
+        }
+        if (li == 0 && row < ne01) {
+            dst_f32[row] = sumf;
+        }
+    }
+}
