@@ -8573,6 +8573,48 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// GGML_OP_MUL_MAT with GGML_PREC_F32 accumulation and dot products above the F16 range (65504)
+struct test_mul_mat_prec_f32 : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_PREC_F32";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_prec_f32(ggml_type type_a = GGML_TYPE_Q4_K, int64_t m = 512, int64_t n = 16, int64_t k = 4096)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // positive weights and activations: the sums are about 24*k
+        init_tensor_uniform(ggml_get_tensor(ctx, "a"), 0.0f, 1.0f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "b"), 32.0f, 64.0f);
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12071,6 +12113,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // GGML_PREC_F32 matmuls with sums beyond the F16 range, GEMV and GEMM
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n : {1, 8, 16, 64}) {
+            test_cases.emplace_back(new test_mul_mat_prec_f32(type_a, 512, n, 4096));
+        }
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

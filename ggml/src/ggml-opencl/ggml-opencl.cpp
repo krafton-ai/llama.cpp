@@ -1259,6 +1259,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_convert_block_q4_k_tiled_ns;    // tiled-wide convert (opt-in)
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_mc3;  // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_acc32;  // F32 accumulator (GGML_PREC_F32)
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_32b_trans_ila_a8_bin;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_ila_a8_bin;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_32b_trans;
@@ -1279,6 +1280,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_convert_block_q6_k_tiled_ns;        // tiled-wide convert (opt-in)
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_mc3;        // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
+    cl_kernel kernel_gemm_noshuffle_q6_K_f32_acc32;      // F32 accumulator (GGML_PREC_F32)
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_cok;
     cl_kernel kernel_gemm_noshuffle_q6_k_f32_32b_trans_ila_a8_bin;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_ila_a8_bin;
@@ -4354,6 +4356,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_acc32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_acc32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_r1", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_kimg", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok", &err), err));
@@ -5468,6 +5471,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_acc32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_cok", &err), err));
         GGML_LOG_CONT(".");
     }
@@ -22452,10 +22456,13 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // Byte-identical greedy output; large-batch (ne1>8) untouched.
         static const char * q4k_cok_env = getenv("GGML_OPENCL_Q4K_GEMM_COK");
         static const bool q4k_gemm_cok  = (q4k_cok_env == nullptr) || (atoi(q4k_cok_env) != 0);
-        const bool use_cok  = q4k_gemm_cok && (ne1 <= 8);
-        const bool use_r1   = !use_cok && q4k_gemm_r1 && (ne1 <= 8);
+        // GGML_PREC_F32 (ggml_prec_set_acc): the half-accumulator GEMMs can overflow
+        // with large activations; use the F32-accumulator 4-row kernel instead
+        const bool          use_acc32     = ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
+        const bool          use_cok       = !use_acc32 && q4k_gemm_cok && (ne1 <= 8);
+        const bool          use_r1        = !use_acc32 && !use_cok && q4k_gemm_r1 && (ne1 <= 8);
         // Weights-as-image (L1/TPL1) for the small-batch weight-read-bound path.
-        const bool use_kimg = !use_cok && !use_r1 && q4k_gemm_kimg && (ne1 <= 8);
+        const bool          use_kimg      = !use_acc32 && !use_cok && !use_r1 && q4k_gemm_kimg && (ne1 <= 8);
 
         cl_mem q_img = nullptr;
         if (use_kimg) {
@@ -22467,7 +22474,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK((q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
         }
 
-        kernel = use_cok  ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok
+        kernel = use_acc32 ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_acc32
+               : use_cok  ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok
                : use_r1   ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1
                : use_kimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg
                           : backend_ctx->kernel_gemm_noshuffle_q4_k_f32;
@@ -23075,8 +23083,11 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // for batched serving until PPL-validated on a non-GDN q6_K model.
         static const char * q6k_cok_env = getenv("GGML_OPENCL_Q6K_GEMM_COK");
         static const bool q6k_gemm_cok  = (q6k_cok_env != nullptr) && (atoi(q6k_cok_env) != 0);
-        const bool use_q6k_cok = q6k_gemm_cok && (ne1 <= 8);
-        kernel = use_q6k_cok ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok
+        // GGML_PREC_F32 (ggml_prec_set_acc): F32-accumulator kernel, see the q4_K path
+        const bool use_q6k_acc32 = ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
+        const bool use_q6k_cok = !use_q6k_acc32 && q6k_gemm_cok && (ne1 <= 8);
+        kernel = use_q6k_acc32 ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32
+               : use_q6k_cok ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok
                              : backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
         int padded_N = ne1 + padding;
 
