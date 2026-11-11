@@ -6158,9 +6158,10 @@ static void ggml_vk_matmul_id(
 }
 
 bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
+    // a single row (ne[1] == 1, e.g. one row of a wider tensor as a mat-vec input) is contiguous whatever its row stride
     return
         tensor->nb[0] == ggml_type_size(tensor->type) &&
-        tensor->nb[1] == (tensor->nb[0]*tensor->ne[0])/ggml_blck_size(tensor->type) &&
+        (tensor->ne[1] == 1 || tensor->nb[1] == (tensor->nb[0]*tensor->ne[0])/ggml_blck_size(tensor->type)) &&
         (tensor->ne[3] == 1 || tensor->nb[3] == tensor->nb[2]*tensor->ne[2]);
 }
 
@@ -6457,8 +6458,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
-    const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
-                              !ggml_vk_dim01_contiguous(src0);
+    // f16 rows that are contiguous but spaced (a permuted view of a wider tensor, e.g. the K heads of the expanded MLA
+    // prefill block) are read in place with their row and batch strides instead of being copied first
+    const bool x_strided = !ctx->device->coopmat2 && src0->type == GGML_TYPE_F16 && !ggml_vk_dim01_contiguous(src0) &&
+                           src0->nb[0] == ggml_type_size(src0->type) && src0->ne[3] == 1 &&
+                           (src0->nb[1] / ggml_type_size(src0->type)) % 8 == 0 && (src0->nb[2] / ggml_type_size(src0->type)) % 8 == 0 &&
+                           src0->nb[1] >= src0->nb[0]*src0->ne[0] && (vk_tensor_offset(src0) + src0->view_offs) % 16 == 0;
+    const bool x_non_contig = ((ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
+                              !ggml_vk_dim01_contiguous(src0)) && !x_strided;
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
@@ -6655,9 +6662,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
     uint32_t stride_batch_y = (qy_needs_dequant || quantize_y) ? ne10*ne11 : ggml_vk_batch_stride(src1);
 
-    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
+    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant && !x_strided) {
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
     }
+    const uint32_t stride_x = x_strided ? (uint32_t)(src0->nb[1] / ggml_type_size(src0->type)) : (uint32_t)ne10;
 
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
@@ -6674,7 +6682,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
         ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
         ne01, ne11, ne10,
-        ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+        stride_x, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
         split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
         b_col_bytes, (uint64_t)dst->nb[1]
     );  // NOLINT
@@ -13400,7 +13408,8 @@ ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buff
 
 size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
-    return ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    // at least 16 bytes, so that tensors (and views at aligned offsets) can be read with 8-half vector loads in place
+    return std::max<size_t>(ctx->device->properties.limits.minStorageBufferOffsetAlignment, 16);
 }
 
 size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
