@@ -11285,6 +11285,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(1536, 7));
+    test_cases.emplace_back(new test_dsv4_hc_post(1536, 7, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(1536, 512));
     for (ggml_type type_fn : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
         for (bool ple : { false, true }) {
             for (int64_t nt : { 1, 2, 4, 7, 512 }) {
