@@ -4567,6 +4567,7 @@ struct test_hc_select : public test_case {
             xt = x;
         }
         ggml_tensor * fn    = ggml_new_tensor_2d(ctx_w, type_fn, n*hc, nmix);
+        ggml_set_name(fn, "fn");
         ggml_tensor * base  = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, nmix);
         ggml_tensor * chart = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, nmix*hc2 + 2*hc2);
         ggml_tensor * w     = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, n);
@@ -4599,8 +4600,12 @@ struct test_hc_select : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            // a small chart keeps rho = 1 + max(e * r) away from 0, like the folded chart (max(e * r) >= 0)
-            init_tensor_uniform(t, strcmp(t->name, "chart") == 0 ? -0.1f : -1.0f, strcmp(t->name, "chart") == 0 ? 0.1f : 1.0f);
+            // a small chart keeps rho = 1 + max(e * r) away from 0, like the folded chart (max(e * r) >= 0); the projection fn
+            // at the size of trained weights keeps the mixes in a realistic range (with weights of +-1 they reach +-45 and the
+            // f16 rounding of fn on the CPU reference dominates the error through the sigmoid)
+            const bool chart = strcmp(t->name, "chart") == 0, fn = strcmp(t->name, "fn") == 0;
+            const float a = chart ? 0.1f : fn ? 0.05f : 1.0f;
+            init_tensor_uniform(t, -a, a);
         }
     }
 };
@@ -5697,7 +5702,8 @@ struct test_mul_mat_hc_post : public test_case {
         : type_w(type_w), n(n), k(k), split(split), sum(sum) {}
 
     // quantized weights: the backends may quantize the activations differently (as test_mul_mat)
-    double max_nmse_err() override { return ggml_is_quantized(type_w) ? 5e-4 : 1e-7; }
+    // the same tolerance as test_mul_mat: backends accumulate the dot products in different orders
+    double max_nmse_err() override { return 5e-4; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
 
