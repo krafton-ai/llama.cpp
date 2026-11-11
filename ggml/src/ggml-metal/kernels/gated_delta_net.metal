@@ -72,61 +72,157 @@ kernel void kernel_gated_delta_net_impl(
     const device float * state_out = fused ? (device float *)dst_fuse : (device float *)dst + attn_size;
     const uint slot_stride = fused ? (uint)args.nb_out : state_size_per_snap;
 
-    for (short t = 0; t < args.ne22; t++) {
-        float s_k = 0.0f;
+    if (args.ne22 == 1) {
+        // decode: one step, nothing to load ahead
+        for (short t = 0; t < args.ne22; t++) {
+            float s_k = 0.0f;
 
-        if (G == 1) {
-            const float g_exp = exp(g_ptr[0]);
+            if (G == 1) {
+                const float g_exp = exp(g_ptr[0]);
 
-            FOR_UNROLL (short j = 0; j < NSG; j++) {
-                const short is = tx*NSG + j;
-                ls[j] *= g_exp;
-
-                s_k += ls[j]*k_ptr[is];
-            }
-        } else {
-            // KDA
-            FOR_UNROLL (short j = 0; j < NSG; j++) {
-                const short is = tx*NSG + j;
-                ls[j] *= exp(g_ptr[is]);
-
-                s_k += ls[j]*k_ptr[is];
-            }
-        }
-
-        s_k = simd_sum(s_k);
-
-        const float d = (v_ptr[i20] - s_k)*b_ptr[0];
-
-        float y = 0.0f;
-
-        FOR_UNROLL (short j = 0; j < NSG; j++) {
-            const short is = tx*NSG + j;
-            ls[j] += k_ptr[is]*d;
-
-            y += ls[j]*q_ptr[is];
-        }
-
-        y = simd_sum(y);
-
-        if (tx == 0) {
-            dst_attn[t*args.ne21*S_v] = y*scale;
-        }
-
-        q_ptr += args.ns02;
-        k_ptr += args.ns12;
-        v_ptr += args.ns22;
-
-        b_ptr += args.ne21;
-        g_ptr += args.ne21*G;
-
-        if (K > 1) {
-            const int target_slot = (int)args.ne22 - 1 - (int)t;
-            if (target_slot >= 0 && target_slot < (int)K) {
-                device float * dst_state = (device float *)state_out + (uint)target_slot * slot_stride + state_out_base;
                 FOR_UNROLL (short j = 0; j < NSG; j++) {
                     const short is = tx*NSG + j;
-                    dst_state[is] = ls[j];
+                    ls[j] *= g_exp;
+
+                    s_k += ls[j]*k_ptr[is];
+                }
+            } else {
+                // KDA
+                FOR_UNROLL (short j = 0; j < NSG; j++) {
+                    const short is = tx*NSG + j;
+                    ls[j] *= exp(g_ptr[is]);
+
+                    s_k += ls[j]*k_ptr[is];
+                }
+            }
+
+            s_k = simd_sum(s_k);
+
+            const float d = (v_ptr[i20] - s_k)*b_ptr[0];
+
+            float y = 0.0f;
+
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                const short is = tx*NSG + j;
+                ls[j] += k_ptr[is]*d;
+
+                y += ls[j]*q_ptr[is];
+            }
+
+            y = simd_sum(y);
+
+            if (tx == 0) {
+                dst_attn[t*args.ne21*S_v] = y*scale;
+            }
+
+            q_ptr += args.ns02;
+            k_ptr += args.ns12;
+            v_ptr += args.ns22;
+
+            b_ptr += args.ne21;
+            g_ptr += args.ne21*G;
+
+            if (K > 1) {
+                const int target_slot = (int)args.ne22 - 1 - (int)t;
+                if (target_slot >= 0 && target_slot < (int)K) {
+                    device float * dst_state = (device float *)state_out + (uint)target_slot * slot_stride + state_out_base;
+                    FOR_UNROLL (short j = 0; j < NSG; j++) {
+                        const short is = tx*NSG + j;
+                        dst_state[is] = ls[j];
+                    }
+                }
+            }
+        }
+    } else {
+        // the next token's q, k, gate, v and beta are loaded one step ahead, so the dependent chain of a token does not
+        // wait on device memory
+        float kc[NSG], qc[NSG], gc[NSG];
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            const short is = tx*NSG + j;
+            kc[j] = k_ptr[is];
+            qc[j] = q_ptr[is];
+            gc[j] = G == 1 ? 0.0f : g_ptr[is];
+        }
+        float vc = v_ptr[i20];
+        float bc = b_ptr[0];
+        float g1 = G == 1 ? g_ptr[0] : 0.0f;
+
+        for (short t = 0; t < args.ne22; t++) {
+            float kn[NSG], qn[NSG], gn[NSG];
+            float vn = 0.0f, bn = 0.0f, g1n = 0.0f;
+            if (t + 1 < args.ne22) {
+                FOR_UNROLL (short j = 0; j < NSG; j++) {
+                    const short is = tx*NSG + j;
+                    kn[j] = k_ptr[args.ns12 + is];
+                    qn[j] = q_ptr[args.ns02 + is];
+                    gn[j] = G == 1 ? 0.0f : g_ptr[args.ne21*G + is];
+                }
+                vn  = v_ptr[args.ns22 + i20];
+                bn  = b_ptr[args.ne21];
+                g1n = G == 1 ? g_ptr[args.ne21*G] : 0.0f;
+            }
+
+            float s_k = 0.0f;
+
+            if (G == 1) {
+                const float g_exp = exp(g1);
+
+                FOR_UNROLL (short j = 0; j < NSG; j++) {
+                    ls[j] *= g_exp;
+
+                    s_k += ls[j]*kc[j];
+                }
+            } else {
+                // KDA
+                FOR_UNROLL (short j = 0; j < NSG; j++) {
+                    ls[j] *= exp(gc[j]);
+
+                    s_k += ls[j]*kc[j];
+                }
+            }
+
+            s_k = simd_sum(s_k);
+
+            const float d = (vc - s_k)*bc;
+
+            float y = 0.0f;
+
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                ls[j] += kc[j]*d;
+
+                y += ls[j]*qc[j];
+            }
+
+            y = simd_sum(y);
+
+            if (tx == 0) {
+                dst_attn[t*args.ne21*S_v] = y*scale;
+            }
+
+            q_ptr += args.ns02;
+            k_ptr += args.ns12;
+            v_ptr += args.ns22;
+
+            b_ptr += args.ne21;
+            g_ptr += args.ne21*G;
+
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                kc[j] = kn[j];
+                qc[j] = qn[j];
+                gc[j] = gn[j];
+            }
+            vc = vn;
+            bc = bn;
+            g1 = g1n;
+
+            if (K > 1) {
+                const int target_slot = (int)args.ne22 - 1 - (int)t;
+                if (target_slot >= 0 && target_slot < (int)K) {
+                    device float * dst_state = (device float *)state_out + (uint)target_slot * slot_stride + state_out_base;
+                    FOR_UNROLL (short j = 0; j < NSG; j++) {
+                        const short is = tx*NSG + j;
+                        dst_state[is] = ls[j];
+                    }
                 }
             }
         }
