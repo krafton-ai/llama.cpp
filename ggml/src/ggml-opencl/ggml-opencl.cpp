@@ -854,6 +854,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_dsv4_hc_pre_f32 = nullptr, kernel_dsv4_hc_post_f32 = nullptr, kernel_dsv4_hc_comb_f32 = nullptr;
     cl_kernel kernel_tri;
     cl_kernel kernel_pool_1d_f32;
+    // decode attention of one KV head against 32 query heads without FA (kernels/mul_mat_f16_f32_ncol*.cl)
+    cl_kernel kernel_mul_mat_f16_f32_ncol                    = nullptr;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
@@ -1384,7 +1386,7 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
     cl_program p;
     char *program_log;
     size_t program_size;
-    size_t log_size;
+    size_t     log_size = 0;
     int err;
 
     program_size = strlen(program_buffer);
@@ -1412,11 +1414,19 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
             continue;
         }
 
-        clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
-        program_log = (char*) malloc(log_size + 1);
-        program_log[log_size] = '\0';
-        clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, log_size + 1, program_log, NULL);
-        GGML_LOG_ERROR("ggml_opencl: kernel compile error (err=%d)%s%s:\n\n%s\n", err, tag ? " building " : "", tag ? tag : "", program_log);
+        log_size                = 0;
+        const cl_int log_status = clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+        program_log =
+            log_status == CL_SUCCESS && log_size > 0 && log_size < SIZE_MAX ? (char *) malloc(log_size + 1) : nullptr;
+        if (program_log &&
+            clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, log_size, program_log, NULL) == CL_SUCCESS) {
+            program_log[log_size] = '\0';
+            GGML_LOG_ERROR("ggml_opencl: kernel compile error (err=%d)%s%s:\n\n%s\n", err, tag ? " building " : "",
+                           tag ? tag : "", program_log);
+        } else {
+            GGML_LOG_ERROR("ggml_opencl: kernel compile error (err=%d)%s%s (build log unavailable)\n", err,
+                           tag ? " building " : "", tag ? tag : "");
+        }
         free(program_log);
         clReleaseProgram(p);
         if (fatal) {
@@ -1693,6 +1703,28 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
 
         CL_CHECK(clReleaseProgram(prog));
+    }
+
+    // mul_mat_f16_f32_ncol
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mat_f16_f32_ncol.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mat_f16_f32_ncol.cl");
+#endif
+        // needs subgroup shuffles: when the program does not build the kernels stay null and the generic paths run
+        cl_program prog = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
+            kernel_src.c_str(), compile_opts, false, "mul_mat_f16_f32_ncol");
+        if (prog) {
+            CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_ncol        = clCreateKernel(prog, "kernel_mul_mat_f16_f32_ncol", &err), err));
+        }
+        GGML_LOG_CONT(".");
+
+        if (prog) {
+            CL_CHECK(clReleaseProgram(prog));
+        }
     }
 
     // fill
@@ -8813,6 +8845,14 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
     CL_CHECK(clSetKernelArg(kernel, 33, sizeof(float)*sgs, NULL));
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+// buffer and offset of a tensor as two kernel arguments
+static void ggml_opencl_arg_tensor(cl_kernel k, cl_uint & idx, const ggml_tensor * t) {
+    const ggml_tensor_extra_cl * e   = (const ggml_tensor_extra_cl *) t->extra;
+    const cl_ulong               off = e->offset + t->view_offs;
+    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_mem), &e->data_device));
+    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_ulong), &off));
 }
 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -24358,6 +24398,42 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         fake_dst.nb[2]        = fake_dst.nb[1] * fake_dst.ne[1];
         fake_dst.nb[3]        = fake_dst.nb[2];
         ggml_cl_mul_mat(backend, src0, &fake_src1, &fake_dst);
+        return;
+    }
+
+    // an F16 src0 that is not a weight (the KV cache) against 32 query heads (absorbed-MLA decode KQ after the batch
+    // fold above): stream the cache rows once with the 32 columns in local memory instead of the xmem GEMM, which
+    // repacks src0 as a weight on every call
+    if (backend_ctx->kernel_mul_mat_f16_f32_ncol != nullptr && src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 && src1->ne[1] == 32 && src0->ne[0] % 4 == 0 && src0->ne[0] <= 4096 &&
+        // many rows (the cache against q); a copied V (512 rows of n_kv) keeps the xmem GEMM
+        (src0->ne[1] >= 1024 || src0->ne[1] >= src0->ne[0]) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->ne[2] == 1 && src1->ne[3] == 1 && src0->nb[0] == sizeof(ggml_fp16_t) && src1->nb[0] == sizeof(float) &&
+        dst->nb[0] == sizeof(float) && src0->buffer &&
+        ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS && (src0->nb[1] % 8) == 0 &&
+        ((((ggml_tensor_extra_cl *) src0->extra)->offset + src0->view_offs) % 8) == 0) {
+        cl_kernel kernel = backend_ctx->kernel_mul_mat_f16_f32_ncol;
+
+        const int      K    = (int) src0->ne[0];
+        const int      M    = (int) src0->ne[1];
+        const cl_ulong nba1 = src0->nb[1];
+        const cl_ulong nbb1 = src1->nb[1];
+        const cl_ulong nbd1 = dst->nb[1];
+
+        cl_uint idx = 0;
+        ggml_opencl_arg_tensor(kernel, idx, src0);
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nba1));
+        ggml_opencl_arg_tensor(kernel, idx, src1);
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbb1));
+        ggml_opencl_arg_tensor(kernel, idx, dst);
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbd1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &K));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &M));
+
+        // NCOL_ROWS_WG rows per group
+        size_t lws[1] = { 256 };
+        size_t gws[1] = { (size_t) CEIL_DIV(M, 64) * 256 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, dst);
         return;
     }
 

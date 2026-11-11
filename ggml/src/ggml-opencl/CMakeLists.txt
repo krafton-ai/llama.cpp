@@ -69,6 +69,7 @@ set(GGML_OPENCL_KERNELS
     tri
     dsv4_hc
     pool_1d
+    mul_mat_f16_f32_ncol
     fill
     clamp
     cpy
