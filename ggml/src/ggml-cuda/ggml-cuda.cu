@@ -63,6 +63,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/hc-fusion.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -3465,6 +3466,293 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+// Hyper-connection (mHC) subgraphs of standard ops, matched in the node order that ggml_build_forward_expand gives
+// them. The matchers check only batch-size independent properties, so graph_optimize gets the same alloc deps for
+// every ubatch; the kernels in hc-fusion.cu handle any number of rows.
+
+struct ggml_cuda_hc_match {
+    int n_nodes = 0;
+    int outputs[2];
+    int n_outputs = 0;
+};
+
+static bool ggml_cuda_hc_is_f32_rows(const ggml_tensor * t) {
+    return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float);
+}
+
+static bool ggml_cuda_hc_is_vec(const ggml_tensor * t, int64_t n) {
+    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == n && ggml_nrows(t) == 1;
+}
+
+// RMS_NORM(x) -> MUL_MAT(w, .) -> ADD(., bias) [-> VIEW(first columns) -> SIGMOID], w with at most 64 rows
+static bool ggml_cuda_match_rms_norm_mat_vec(const ggml_cgraph * cgraph, int i, ggml_cuda_hc_match & m) {
+    if (i + 3 > cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * rn  = cgraph->nodes[i];
+    const ggml_tensor * mm  = cgraph->nodes[i + 1];
+    const ggml_tensor * add = cgraph->nodes[i + 2];
+    if (rn->op != GGML_OP_RMS_NORM || mm->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD ||
+            mm->src[1] != rn || (add->src[0] != mm && add->src[1] != mm)) {
+        return false;
+    }
+    const ggml_tensor * x    = rn->src[0];
+    const ggml_tensor * w    = mm->src[0];
+    const ggml_tensor * bias = add->src[0] == mm ? add->src[1] : add->src[0];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || rn->type != GGML_TYPE_F32 ||
+            (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) || !ggml_is_contiguous(w) || !ggml_is_matrix(w) ||
+            w->ne[0] != x->ne[0] || w->ne[1] > 64 ||
+            mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) ||
+            !ggml_cuda_hc_is_vec(bias, w->ne[1]) ||
+            add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || !ggml_are_same_shape(add, mm)) {
+        return false;
+    }
+
+    if (i + 5 <= cgraph->n_nodes) {
+        const ggml_tensor * view = cgraph->nodes[i + 3];
+        const ggml_tensor * sig  = cgraph->nodes[i + 4];
+        if (view->op == GGML_OP_VIEW && view->src[0] == add && view->view_offs == 0 &&
+                view->nb[0] == sizeof(float) && view->nb[1] == add->nb[1] && view->ne[0] <= add->ne[0] &&
+                view->ne[1] == add->ne[1] && view->ne[2] == add->ne[2] && view->ne[3] == add->ne[3] &&
+                sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->src[0] == view &&
+                sig->type == GGML_TYPE_F32 && ggml_is_contiguous(sig) && sig->ne[2] == 1 && sig->ne[3] == 1) {
+            const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_UNARY };
+            const int outputs[] = { i + 2, i + 4 };
+            if (ggml_can_fuse_subgraph(cgraph, i, 5, ops, outputs, 2)) {
+                m = {};
+                m.n_nodes = 5;
+                m.outputs[0] = i + 2;
+                m.outputs[1] = i + 4;
+                m.n_outputs = 2;
+                return true;
+            }
+        }
+    }
+
+    const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_ADD };
+    const int outputs[] = { i + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1)) {
+        return false;
+    }
+    m = {};
+    m.n_nodes = 3;
+    m.outputs[0] = i + 2;
+    m.n_outputs = 1;
+    return true;
+}
+
+// DSV4_HC_PRE(x, pre) -> RMS_NORM -> MUL(w)
+static bool ggml_cuda_match_hc_pre_norm(const ggml_cgraph * cgraph, int i, ggml_cuda_hc_match & m) {
+    if (i + 3 > cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * pre = cgraph->nodes[i];
+    const ggml_tensor * rn  = cgraph->nodes[i + 1];
+    const ggml_tensor * mul = cgraph->nodes[i + 2];
+    if (pre->op != GGML_OP_DSV4_HC_PRE || rn->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            rn->src[0] != pre || (mul->src[0] != rn && mul->src[1] != rn)) {
+        return false;
+    }
+    const ggml_tensor * x = pre->src[0];
+    const ggml_tensor * w = mul->src[0] == rn ? mul->src[1] : mul->src[0];
+    if (ggml_get_op_params_i32(pre, 1) != 0 || !ggml_cuda_hc_is_f32_rows(x) || x->ne[1] > 8 ||
+            pre->src[1]->type != GGML_TYPE_F32 || !ggml_cuda_hc_is_vec(w, x->ne[0]) ||
+            rn->type != GGML_TYPE_F32 || !ggml_cuda_hc_is_f32_rows(mul) || !ggml_are_same_shape(mul, rn)) {
+        return false;
+    }
+    const ggml_op ops[] = { GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL };
+    const int outputs[] = { i + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1)) {
+        return false;
+    }
+    m = {};
+    m.n_nodes = 3;
+    m.outputs[0] = i + 2;
+    m.n_outputs = 1;
+    return true;
+}
+
+// comb selector -> DSV4_HC_POST [-> stream sum], where
+//   comb selector: MUL_MAT(K, mixes) = e -> RESHAPE(e, hc, hc) -> VIEW r -> MUL(e, r) -> POOL_1D(MAX, hc*hc) ->
+//                  SCALE(s, b) -> RESHAPE(1, 1) -> DIV(RESHAPE(e), .) -> VIEW c0 -> ADD(., c0) = comb
+//   stream sum:    VIEW stream 0, VIEW stream 1, ADD, VIEW stream 2, ADD, ... (hc VIEWs, hc - 1 ADDs)
+// outputs: DSV4_HC_POST [and the last ADD of the sum]
+struct ggml_cuda_hc_post_match : ggml_cuda_hc_match {
+    int post_idx = -1;
+};
+
+static bool ggml_cuda_match_hc_select(const ggml_cgraph * cgraph, int i) {
+    if (i + 11 > cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_POOL_1D, GGML_OP_SCALE,
+                            GGML_OP_RESHAPE, GGML_OP_DIV, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_DSV4_HC_POST };
+    for (int k = 0; k < 11; ++k) {
+        if (cgraph->nodes[i + k]->op != ops[k]) {
+            return false;
+        }
+    }
+    ggml_tensor * const * n = cgraph->nodes + i;
+    const ggml_tensor * e     = n[0];
+    const ggml_tensor * K     = e->src[0];
+    const ggml_tensor * mixes = e->src[1];
+    const int64_t hc2 = K->ne[1];
+    const int64_t hc  = n[10]->src[1]->ne[1];
+    if (!ggml_cuda_hc_is_f32_rows(K) || !ggml_is_matrix(K) || K->ne[0] > 64 || hc*hc != hc2 || hc2 > WARP_SIZE ||
+            !ggml_cuda_hc_is_f32_rows(mixes) || mixes->ne[0] != K->ne[0] || mixes->ne[2] != 1 || mixes->ne[3] != 1 ||
+            e->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * re = n[1];
+    const ggml_tensor * r  = n[2];
+    const ggml_tensor * mr = n[3];
+    const ggml_tensor * mp = n[4];
+    const ggml_tensor * sc = n[5];
+    const ggml_tensor * rr = n[6];
+    const ggml_tensor * dv = n[7];
+    const ggml_tensor * c0 = n[8];
+    const ggml_tensor * cb = n[9];
+    const int32_t * pool = (const int32_t *) mp->op_params;
+    return re->src[0] == e && re->ne[0] == hc && re->ne[1] == hc && re->ne[2] == e->ne[1] &&
+        r->type == GGML_TYPE_F32 && r->ne[0] == hc2 && ggml_nrows(r) == 1 &&
+        ((mr->src[0] == e && mr->src[1] == r) || (mr->src[0] == r && mr->src[1] == e)) &&
+        mp->src[0] == mr && pool[0] == GGML_OP_POOL_MAX && pool[1] == hc2 && pool[2] == hc2 && pool[3] == 0 &&
+        mp->ne[0] == 1 && sc->src[0] == mp && sc->type == GGML_TYPE_F32 &&
+        rr->src[0] == sc && rr->ne[0] == 1 && rr->ne[1] == 1 && rr->ne[2] == e->ne[1] &&
+        dv->src[0] == re && dv->src[1] == rr && dv->type == GGML_TYPE_F32 &&
+        c0->type == GGML_TYPE_F32 && c0->ne[0] == hc && c0->ne[1] == hc && c0->ne[2] == 1 && c0->ne[3] == 1 &&
+        ((cb->src[0] == dv && cb->src[1] == c0) || (cb->src[0] == c0 && cb->src[1] == dv)) &&
+        ggml_are_same_shape(cb, dv) && n[10]->src[3] == cb;
+}
+
+static bool ggml_cuda_match_hc_post(const ggml_cgraph * cgraph, int i, ggml_cuda_hc_post_match & m) {
+    if (!ggml_cuda_match_hc_select(cgraph, i)) {
+        return false;
+    }
+    const int post_idx = i + 10;
+
+    const ggml_tensor * post = cgraph->nodes[post_idx];
+    const ggml_tensor * x    = post->src[0];
+    const ggml_tensor * res  = post->src[1];
+    const int64_t n  = x->ne[0];
+    const int64_t nt = x->ne[1];
+    const int64_t hc = res->ne[1];
+    if (!ggml_cuda_hc_is_f32_rows(x) || !ggml_cuda_hc_is_f32_rows(res) || post->src[2]->type != GGML_TYPE_F32 ||
+            (post->src[3] && post->src[3]->type != GGML_TYPE_F32) || !ggml_cuda_hc_is_f32_rows(post) || hc > 8) {
+        return false;
+    }
+
+    // stream sum: VIEW 0, VIEW 1, ADD, VIEW 2, ADD, ...
+    int n_sum = 0;
+    if (post_idx + 2*hc <= cgraph->n_nodes) {
+        const ggml_tensor * prev = nullptr;
+        bool ok = true;
+        for (int64_t s = 0; s < hc && ok; ++s) {
+            const int vi = post_idx + 1 + (s == 0 ? 0 : 2*s - 1);
+            const ggml_tensor * v = cgraph->nodes[vi];
+            ok = v->op == GGML_OP_VIEW && v->src[0] == post && v->type == GGML_TYPE_F32 &&
+                v->ne[0] == n && v->ne[1] == nt && v->ne[2] == 1 && v->ne[3] == 1 &&
+                v->nb[0] == post->nb[0] && v->nb[1] == post->nb[2] && v->view_offs == (size_t) s*post->nb[1];
+            if (ok && s > 0) {
+                const ggml_tensor * a = cgraph->nodes[vi + 1];
+                const ggml_tensor * lhs = s == 1 ? cgraph->nodes[post_idx + 1] : prev;
+                ok = a->op == GGML_OP_ADD && a->src[0] == lhs && a->src[1] == v && a->type == GGML_TYPE_F32 &&
+                    a->ne[0] == n && a->ne[1] == nt && a->nb[0] == sizeof(float);
+                prev = a;
+            }
+        }
+        if (ok && prev) {
+            n_sum = 2*hc - 1;
+        }
+    }
+
+    const int n_nodes = 11 + n_sum;
+    ggml_op ops[32];
+    for (int k = 0; k < n_nodes; ++k) {
+        ops[k] = cgraph->nodes[i + k]->op;
+    }
+    const int outputs[] = { post_idx, post_idx + n_sum };
+    const int n_outputs = n_sum ? 2 : 1;
+    if (!ggml_can_fuse_subgraph(cgraph, i, n_nodes, ops, outputs, n_outputs)) {
+        return false;
+    }
+    m = {};
+    m.n_nodes = n_nodes;
+    m.outputs[0] = outputs[0];
+    m.outputs[1] = outputs[1];
+    m.n_outputs = n_outputs;
+    m.post_idx = post_idx;
+    return true;
+}
+
+// RMS_NORM(g) -> MUL(w) -> RESHAPE(n, 1, rows) -> ADD(streams [n, hc, rows], .)
+static bool ggml_cuda_match_rms_norm_mul_add_streams(const ggml_cgraph * cgraph, int i, ggml_cuda_hc_match & m) {
+    if (i + 4 > cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * rn  = cgraph->nodes[i];
+    const ggml_tensor * mul = cgraph->nodes[i + 1];
+    const ggml_tensor * rs  = cgraph->nodes[i + 2];
+    const ggml_tensor * add = cgraph->nodes[i + 3];
+    if (rn->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rs->op != GGML_OP_RESHAPE || add->op != GGML_OP_ADD ||
+            (mul->src[0] != rn && mul->src[1] != rn) || rs->src[0] != mul || (add->src[0] != rs && add->src[1] != rs)) {
+        return false;
+    }
+    const ggml_tensor * g       = rn->src[0];
+    const ggml_tensor * w       = mul->src[0] == rn ? mul->src[1] : mul->src[0];
+    const ggml_tensor * streams = add->src[0] == rs ? add->src[1] : add->src[0];
+    if (!ggml_cuda_hc_is_f32_rows(g) || !ggml_is_matrix(g) || rn->type != GGML_TYPE_F32 ||
+            !ggml_cuda_hc_is_vec(w, g->ne[0]) || !ggml_are_same_shape(mul, rn) ||
+            rs->ne[0] != g->ne[0] || rs->ne[1] != 1 || rs->ne[2] != g->ne[1] || rs->ne[3] != 1 ||
+            !ggml_cuda_hc_is_f32_rows(streams) || !ggml_are_same_shape(streams, add) ||
+            streams->ne[0] != g->ne[0] || streams->ne[2] != g->ne[1] || streams->ne[3] != 1 ||
+            !ggml_cuda_hc_is_f32_rows(add)) {
+        return false;
+    }
+    const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD };
+    const int outputs[] = { i + 3 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 4, ops, outputs, 1)) {
+        return false;
+    }
+    m = {};
+    m.n_nodes = 4;
+    m.outputs[0] = i + 3;
+    m.n_outputs = 1;
+    return true;
+}
+
+// the fused kernels read only the inputs of the subgraph and write only its outputs: no output may overlap an input,
+// except `inplace`, an input that an output may alias exactly (the kernel reads each element before writing it)
+static bool ggml_cuda_hc_io_ok(std::initializer_list<const ggml_tensor *> reads,
+                               std::initializer_list<const ggml_tensor *> writes,
+                               const ggml_tensor * inplace = nullptr) {
+    auto range = [](const ggml_tensor * t, int64_t & b, int64_t & e) {
+        b = (int64_t) t->data;
+        e = b + (int64_t) ggml_nbytes(t);
+    };
+    for (const ggml_tensor * w : writes) {
+        if (!w) {
+            continue;
+        }
+        int64_t wb, we;
+        range(w, wb, we);
+        for (const ggml_tensor * r : reads) {
+            if (!r) {
+                continue;
+            }
+            int64_t rb, re;
+            range(r, rb, re);
+            if (wb < re && rb < we) {
+                if (r == inplace && r->data == w->data && ggml_are_same_layout(r, w)) {
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3759,6 +4047,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // hyper-connection (mHC) subgraphs
+    {
+        ggml_cuda_hc_match m;
+        ggml_cuda_hc_post_match pm;
+        if (node->op == GGML_OP_RMS_NORM && ggml_cuda_match_rms_norm_mat_vec(cgraph, i, m)) {
+            ggml_tensor * add = cgraph->nodes[m.outputs[0]];
+            ggml_tensor * sig = m.n_outputs > 1 ? cgraph->nodes[m.outputs[1]] : nullptr;
+            const ggml_tensor * mm = cgraph->nodes[i + 1];
+            if (ggml_cuda_hc_io_ok({ node->src[0], mm->src[0], add->src[0] == mm ? add->src[1] : add->src[0] }, { add, sig })) {
+                ggml_cuda_op_rms_norm_mat_vec_add(*cuda_ctx, node, mm, add, sig);
+                return m.n_nodes - 1;
+            }
+        }
+        if (node->op == GGML_OP_DSV4_HC_PRE && ggml_cuda_match_hc_pre_norm(cgraph, i, m)) {
+            ggml_tensor * mul = cgraph->nodes[i + 2];
+            const ggml_tensor * rn = cgraph->nodes[i + 1];
+            if (ggml_cuda_hc_io_ok({ node->src[0], node->src[1], mul->src[0] == rn ? mul->src[1] : mul->src[0] }, { mul })) {
+                ggml_cuda_op_hc_pre_rms_norm_mul(*cuda_ctx, node, rn, mul);
+                return m.n_nodes - 1;
+            }
+        }
+        if (node->op == GGML_OP_MUL_MAT && ggml_cuda_match_hc_post(cgraph, i, pm)) {
+            ggml_tensor * post = cgraph->nodes[pm.post_idx];
+            ggml_tensor * sum  = pm.n_outputs > 1 ? cgraph->nodes[pm.outputs[1]] : nullptr;
+            const ggml_tensor * mr = cgraph->nodes[i + 3];
+            const ggml_tensor * sc = cgraph->nodes[i + 5];
+            const ggml_tensor * cb = cgraph->nodes[i + 9];
+            ggml_cuda_hc_select_args sel;
+            sel.K     = node->src[0];
+            sel.mixes = node->src[1];
+            sel.r     = mr->src[0] == node ? mr->src[1] : mr->src[0];
+            sel.c0    = cb->src[0] == cgraph->nodes[i + 7] ? cb->src[1] : cb->src[0];
+            sel.scale = ggml_get_op_params_f32(sc, 0);
+            sel.bias  = ggml_get_op_params_f32(sc, 1);
+            if (ggml_cuda_hc_io_ok({ post->src[0], post->src[1], post->src[2], sel.K, sel.mixes, sel.r, sel.c0 }, { post, sum })) {
+                ggml_cuda_op_hc_post_fused(*cuda_ctx, post, sel, sum);
+                return pm.n_nodes - 1;
+            }
+        }
+        if (node->op == GGML_OP_RMS_NORM && ggml_cuda_match_rms_norm_mul_add_streams(cgraph, i, m)) {
+            ggml_tensor * add = cgraph->nodes[i + 3];
+            const ggml_tensor * mul = cgraph->nodes[i + 1];
+            const ggml_tensor * streams = add->src[0] == cgraph->nodes[i + 2] ? add->src[1] : add->src[0];
+            if (ggml_cuda_hc_io_ok({ node->src[0], mul->src[0] == node ? mul->src[1] : mul->src[0], streams }, { add }, streams)) {
+                ggml_cuda_op_rms_norm_mul_add_streams(*cuda_ctx, node, mul, add);
+                return m.n_nodes - 1;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -4913,6 +5251,27 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 params->add_alloc_dep(params->user_data, up->src[2], cgraph->nodes[i + 5]);
                 i += 5;
                 break;
+            }
+        }
+        // hyper-connection subgraphs: keep their inputs alive until the last fused node, since the fused kernels read
+        // them after the allocator would have released them (e.g. the mix vector of the comb selector)
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_op op = cgraph->nodes[i]->op;
+            ggml_cuda_hc_match m;
+            ggml_cuda_hc_post_match pm;
+            int n_nodes = 0;
+            if (op == GGML_OP_RMS_NORM && ggml_cuda_match_rms_norm_mat_vec(cgraph, i, m)) {
+                n_nodes = m.n_nodes;
+            } else if (op == GGML_OP_DSV4_HC_PRE && ggml_cuda_match_hc_pre_norm(cgraph, i, m)) {
+                n_nodes = m.n_nodes;
+            } else if (op == GGML_OP_MUL_MAT && ggml_cuda_match_hc_post(cgraph, i, pm)) {
+                n_nodes = pm.n_nodes;
+            } else if (op == GGML_OP_RMS_NORM && ggml_cuda_match_rms_norm_mul_add_streams(cgraph, i, m)) {
+                n_nodes = m.n_nodes;
+            }
+            if (n_nodes > 0) {
+                add_alloc_deps(i, i + n_nodes - 1);
+                i += n_nodes - 1;
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {

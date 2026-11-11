@@ -4570,6 +4570,140 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// One hyper-connection (mHC) site built from standard ops in the node order of src/models/raon1nano.cpp
+// (build_hc_pre, a matmul as the branch, build_hc_post with DSV4_HC_POST), optionally followed by the per-layer-input
+// tail of that model (stream sum -> gate -> GEGLU -> proj -> RMS_NORM -> MUL -> broadcast ADD to the streams), so that
+// backends can fuse the mix, selector, pre-norm, post + stream sum and norm + broadcast add subgraphs
+struct test_hc_site_ple : public test_case {
+    const int64_t   n_embd;
+    const int64_t   hc;
+    const int64_t   nt;
+    const ggml_type type_fn;
+    const bool      ple;
+
+    std::vector<ggml_tensor *> checked;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_SITE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, hc, nt, type_fn, ple);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+
+    double max_nmse_err() override {
+        return type_fn == GGML_TYPE_F16 ? 5e-4 : 1e-5;
+    }
+
+    test_hc_site_ple(int64_t n_embd = 1536, int64_t hc = 4, int64_t nt = 1, ggml_type type_fn = GGML_TYPE_F16, bool ple = true)
+        : n_embd(n_embd), hc(hc), nt(nt), type_fn(type_fn), ple(ple) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_w) override {
+        const int64_t hc2   = hc*hc;
+        const int64_t nmix  = 2*hc + (hc - 1)*(hc - 1);
+        const int64_t n_ple = 64;
+        const float   eps   = 1e-6f;
+
+        auto weight = [&](const char * name, ggml_type type, int64_t ne0, int64_t ne1 = 1) {
+            ggml_tensor * t = ne1 == 1 ? ggml_new_tensor_1d(ctx_w, type, ne0) : ggml_new_tensor_2d(ctx_w, type, ne0, ne1);
+            ggml_set_name(t, name);
+            return t;
+        };
+        ggml_tensor * fn     = weight("fn", type_fn, n_embd*hc, nmix);
+        ggml_tensor * base   = weight("base", GGML_TYPE_F32, nmix);
+        ggml_tensor * chart  = weight("chart", GGML_TYPE_F32, nmix*hc2 + hc2 + hc2);
+        ggml_tensor * norm_w = weight("norm_w", GGML_TYPE_F32, n_embd);
+        ggml_tensor * wb     = weight("wb", GGML_TYPE_F32, n_embd, n_embd);
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(x, "x");
+
+        // build_hc_pre
+        ggml_tensor * flat  = ggml_reshape_2d(ctx, x, n_embd*hc, nt);
+        ggml_tensor * mixes = ggml_mul_mat(ctx, fn, ggml_rms_norm(ctx, flat, eps));
+        mixes = ggml_add(ctx, mixes, base);
+
+        ggml_tensor * sg   = ggml_sigmoid(ctx, ggml_view_2d(ctx, mixes, 2*hc, nt, mixes->nb[1], 0));
+        ggml_tensor * pre  = ggml_view_2d(ctx, sg, hc, nt, sg->nb[1], 0);
+        ggml_tensor * post = ggml_view_2d(ctx, sg, hc, nt, sg->nb[1], hc*sg->nb[0]);
+
+        ggml_tensor * K  = ggml_view_2d(ctx, chart, nmix, hc2, nmix*chart->nb[0], 0);
+        ggml_tensor * r  = ggml_view_1d(ctx, chart, hc2, nmix*hc2*chart->nb[0]);
+        ggml_tensor * c0 = ggml_view_2d(ctx, chart, hc, hc, hc*chart->nb[0], (nmix*hc2 + hc2)*chart->nb[0]);
+
+        ggml_tensor * e   = ggml_mul_mat(ctx, K, mixes);
+        ggml_tensor * rho = ggml_pool_1d(ctx, ggml_mul(ctx, e, r), GGML_OP_POOL_MAX, hc2, hc2, 0);
+        rho = ggml_reshape_3d(ctx, ggml_scale_bias(ctx, rho, 1.0f, 1.0f), 1, 1, nt);
+        ggml_tensor * comb = ggml_add(ctx, ggml_div(ctx, ggml_reshape_3d(ctx, e, hc, hc, nt), rho), c0);
+
+        ggml_tensor * cur = ggml_dsv4_hc_pre(ctx, x, pre);
+        cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), norm_w);
+
+        // branch, then build_hc_post
+        ggml_tensor * branch = ggml_mul_mat(ctx, wb, cur);
+        ggml_tensor * out = ggml_dsv4_hc_post(ctx, branch, x, post, comb);
+        checked = { mixes, sg, cur, out };
+
+        if (ple) {
+            ggml_tensor * gate      = weight("gate", GGML_TYPE_F32, n_embd, n_ple);
+            ggml_tensor * proj      = weight("proj", GGML_TYPE_F32, n_ple, n_embd);
+            ggml_tensor * post_norm = weight("post_norm", GGML_TYPE_F32, n_embd);
+            ggml_tensor * inp_ple   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ple, nt, 2);
+            ggml_set_name(inp_ple, "inp_ple");
+
+            ggml_tensor * sum = nullptr;
+            for (int64_t i = 0; i < hc; ++i) {
+                ggml_tensor * xi = ggml_view_2d(ctx, out, n_embd, nt, out->nb[2], i*out->nb[1]);
+                sum = sum ? ggml_add(ctx, sum, xi) : xi;
+            }
+            ggml_tensor * ple_il = ggml_view_2d(ctx, inp_ple, n_ple, nt, inp_ple->nb[1], inp_ple->nb[2]);
+            ggml_tensor * g = ggml_geglu_split(ctx, ggml_mul_mat(ctx, gate, sum), ple_il);
+            g = ggml_mul_mat(ctx, proj, g);
+            g = ggml_mul(ctx, ggml_rms_norm(ctx, g, eps), post_norm);
+            out = ggml_add(ctx, out, ggml_reshape_3d(ctx, g, n_embd, 1, nt));
+            checked.push_back(sum);
+            checked.push_back(out);
+        }
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t hc2  = hc*hc;
+        const int64_t nmix = 2*hc + (hc - 1)*(hc - 1);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "fn") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else if (strcmp(t->name, "chart") == 0) {
+                // a small r keeps rho = 1 + max(e*r) away from 0
+                init_tensor_uniform(t);
+                std::vector<float> rv(hc2);
+                std::uniform_real_distribution<float> dist(-1e-2f, 1e-2f);
+                std::default_random_engine gen(1234);
+                for (float & v : rv) {
+                    v = dist(gen);
+                }
+                ggml_backend_tensor_set(t, rv.data(), nmix*hc2*sizeof(float), hc2*sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -10709,6 +10843,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    for (ggml_type type_fn : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (bool ple : { false, true }) {
+            for (int64_t nt : { 1, 2, 4, 7, 512 }) {
+                test_cases.emplace_back(new test_hc_site_ple(1536, 4, nt, type_fn, ple));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_hc_site_ple(96, 3, 5, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_hc_site_ple(64, 2, 33, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_hc_site_ple(80, 5, 3, GGML_TYPE_F32, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

@@ -1,0 +1,511 @@
+#include "hc-fusion.cuh"
+#include "convert.cuh"
+
+static constexpr int HC_MAX = 8;
+
+static __device__ __forceinline__ float hc_sigmoid(const float x) {
+    return 1.0f/(1.0f + expf(-x));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// RMS_NORM -> MUL_MAT (few rows) -> ADD [-> SIGMOID]: rms_norm(x) w = (x w) / rms(x), so the partial dot products and
+// the partial sums of squares of each input chunk are computed in one pass, then reduced per token.
+// part layout: [token][split][nrows_w + 1], the last entry is the sum of squares of the chunk.
+
+static constexpr int RMS_MV_WARPS   = 4;
+static constexpr int RMS_MV_TILE    = 1024;
+static constexpr int RMS_MV_PP_WARPS = 8;
+static constexpr int RMS_MV_PP_ROWS  = 3;   // up to RMS_MV_PP_WARPS*RMS_MV_PP_ROWS - 1 weight rows
+static constexpr int RMS_MV_PP_TILE  = 128;
+
+// one block per (split, group of RMS_MV_WARPS rows, group of n_tok tokens), one warp per row (the row after the last
+// weight row is the sum of squares). The x tile goes through shared memory once for all rows of the block
+template <int n_tok, typename T>
+static __global__ void rms_norm_mat_vec_part_f32(
+        const float * x, const T * w, float * part, const int nrows_w, const int chunk, const int nt,
+        const int64_t sx1, const int64_t sw1) {
+    const int s     = blockIdx.x;
+    const int k     = blockIdx.y*RMS_MV_WARPS + threadIdx.y;
+    const int t0    = blockIdx.z*n_tok;
+    const int lane  = threadIdx.x;
+    const int tid   = threadIdx.y*WARP_SIZE + lane;
+    const int nsplit = gridDim.x;
+
+    __shared__ float xs[n_tok][RMS_MV_TILE];
+
+    ggml_cuda_pdl_sync();
+
+    const T * wr = w + (int64_t) min(k, nrows_w - 1)*sw1 + (int64_t) s*chunk;
+
+    if constexpr (n_tok == 1) {
+        // one token: every warp reads x from global memory (cached), two inputs per lane and step
+        if (chunk % 2 == 0 && sw1 % 2 == 0) {
+            if (k > nrows_w) {
+                return;
+            }
+            const float * xr = x + (int64_t) s*chunk;
+            float a = 0.0f;
+            for (int i = 2*lane; i < chunk; i += 2*WARP_SIZE) {
+                const float2 xv = *(const float2 *) (xr + i);
+                float2 wv = xv;
+                if (k < nrows_w) {
+                    if constexpr (std::is_same_v<T, half>) {
+                        wv = __half22float2(*(const half2 *) (wr + i));
+                    } else {
+                        wv = *(const float2 *) (wr + i);
+                    }
+                }
+                a = fmaf(wv.x, xv.x, a);
+                a = fmaf(wv.y, xv.y, a);
+            }
+            a = warp_reduce_sum(a);
+            if (lane == 0) {
+                part[(int64_t) s*(nrows_w + 1) + k] = a;
+            }
+            return;
+        }
+    }
+
+    float acc[n_tok] = {0.0f};
+    for (int i0 = 0; i0 < chunk; i0 += RMS_MV_TILE) {
+        const int len = min(RMS_MV_TILE, chunk - i0);
+        for (int j = tid; j < n_tok*len; j += RMS_MV_WARPS*WARP_SIZE) {
+            const int t = j/len;
+            const int i = j - t*len;
+            xs[t][i] = t0 + t < nt ? x[(int64_t) (t0 + t)*sx1 + (int64_t) s*chunk + i0 + i] : 0.0f;
+        }
+        __syncthreads();
+        if (k < nrows_w) {
+            for (int i = lane; i < len; i += WARP_SIZE) {
+                const float wv = ggml_cuda_cast<float>(wr[i0 + i]);
+#pragma unroll
+                for (int t = 0; t < n_tok; ++t) {
+                    acc[t] = fmaf(wv, xs[t][i], acc[t]);
+                }
+            }
+        } else if (k == nrows_w) {
+            for (int i = lane; i < len; i += WARP_SIZE) {
+#pragma unroll
+                for (int t = 0; t < n_tok; ++t) {
+                    acc[t] = fmaf(xs[t][i], xs[t][i], acc[t]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (k > nrows_w) {
+        return;
+    }
+#pragma unroll
+    for (int t = 0; t < n_tok; ++t) {
+        acc[t] = warp_reduce_sum(acc[t]);
+        if (lane == 0 && t0 + t < nt) {
+            part[((int64_t) (t0 + t)*nsplit + s)*(nrows_w + 1) + k] = acc[t];
+        }
+    }
+}
+
+// many tokens: one block per (split, 32 tokens) covers every row, one lane per token, so x is read once and no
+// cross-lane sums are needed. Tiles of x (padded rows: lane t reads row t) and of w go through shared memory
+template <typename T>
+static __global__ void rms_norm_mat_vec_part_pp_f32(
+        const float * x, const T * w, float * part, const int nrows_w, const int chunk, const int nt,
+        const int64_t sx1, const int64_t sw1) {
+    constexpr int n_rows = RMS_MV_PP_WARPS*RMS_MV_PP_ROWS;
+    const int s      = blockIdx.x;
+    const int t0     = blockIdx.z*WARP_SIZE;
+    const int lane   = threadIdx.x;
+    const int tid    = threadIdx.y*WARP_SIZE + lane;
+    const int nsplit = gridDim.x;
+
+    // rows padded by 4 floats: lanes read float4 at a stride of 4 banks, no conflicts per quarter warp
+    __shared__ __align__(16) float xs[WARP_SIZE][RMS_MV_PP_TILE + 4];
+    __shared__ __align__(16) float ws[n_rows][RMS_MV_PP_TILE];
+
+    ggml_cuda_pdl_sync();
+
+    float acc[RMS_MV_PP_ROWS] = {0.0f};
+    for (int i0 = 0; i0 < chunk; i0 += RMS_MV_PP_TILE) {
+        const int len = min(RMS_MV_PP_TILE, chunk - i0);
+        for (int j = tid; j < WARP_SIZE*len; j += RMS_MV_PP_WARPS*WARP_SIZE) {
+            const int t = j/len;
+            const int i = j - t*len;
+            xs[t][i] = t0 + t < nt ? x[(int64_t) (t0 + t)*sx1 + (int64_t) s*chunk + i0 + i] : 0.0f;
+        }
+        for (int j = tid; j < nrows_w*len; j += RMS_MV_PP_WARPS*WARP_SIZE) {
+            const int k = j/len;
+            const int i = j - k*len;
+            ws[k][i] = ggml_cuda_cast<float>(w[(int64_t) k*sw1 + (int64_t) s*chunk + i0 + i]);
+        }
+        __syncthreads();
+        for (int i = 0; i < len; i += 4) {
+            const float4 xv = *(const float4 *) &xs[lane][i];
+#pragma unroll
+            for (int r = 0; r < RMS_MV_PP_ROWS; ++r) {
+                const int k = threadIdx.y + r*RMS_MV_PP_WARPS;
+                const float4 wv = k < nrows_w ? *(const float4 *) &ws[k][i] : xv;
+                if (k <= nrows_w) {
+                    acc[r] = fmaf(wv.x, xv.x, acc[r]);
+                    acc[r] = fmaf(wv.y, xv.y, acc[r]);
+                    acc[r] = fmaf(wv.z, xv.z, acc[r]);
+                    acc[r] = fmaf(wv.w, xv.w, acc[r]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (t0 + lane < nt) {
+#pragma unroll
+        for (int r = 0; r < RMS_MV_PP_ROWS; ++r) {
+            const int k = threadIdx.y + r*RMS_MV_PP_WARPS;
+            if (k <= nrows_w) {
+                part[((int64_t) (t0 + lane)*nsplit + s)*(nrows_w + 1) + k] = acc[r];
+            }
+        }
+    }
+}
+
+// one warp per token: sum the splits, scale by 1/rms, add the bias [and write sigmoid of the first n_sig columns]
+template <bool has_sig>
+static __global__ void rms_norm_mat_vec_reduce_f32(
+        const float * part, const float * bias, float * dst, float * sig,
+        const int nrows_w, const int nsplit, const int n, const float eps, const int nt,
+        const int64_t sb1, const int64_t sd1, const int64_t ss1, const int n_sig) {
+    const int t    = blockIdx.x*RMS_MV_WARPS + threadIdx.y;
+    const int lane = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    if (t >= nt) {
+        return;
+    }
+
+    const float * p = part + (int64_t) t*nsplit*(nrows_w + 1);
+    float ss = 0.0f;
+    for (int s = 0; s < nsplit; ++s) {
+        ss += p[s*(nrows_w + 1) + nrows_w];
+    }
+    const float scale = rsqrtf(ss/n + eps);
+
+    for (int k = lane; k < nrows_w; k += WARP_SIZE) {
+        float v = 0.0f;
+        for (int s = 0; s < nsplit; ++s) {
+            v += p[s*(nrows_w + 1) + k];
+        }
+        const float y = v*scale + bias[k + t*sb1];
+        dst[k + t*sd1] = y;
+        if constexpr (has_sig) {
+            if (k < n_sig) {
+                sig[k + t*ss1] = hc_sigmoid(y);
+            }
+        }
+    }
+}
+
+template <typename T>
+static void rms_norm_mat_vec_part_launch(
+        const float * x, const T * w, float * part, const int nrows_w, const int nsplit, const int chunk, const int nt,
+        const int64_t sx1, const int64_t sw1, cudaStream_t stream) {
+    if (nt > 1 && nrows_w + 1 <= RMS_MV_PP_WARPS*RMS_MV_PP_ROWS && chunk % 4 == 0) {
+        const dim3 grid(nsplit, 1, (nt + WARP_SIZE - 1)/WARP_SIZE);
+        const ggml_cuda_kernel_launch_params lp(grid, dim3(WARP_SIZE, RMS_MV_PP_WARPS), 0, stream);
+        ggml_cuda_kernel_launch(rms_norm_mat_vec_part_pp_f32<T>, lp, x, w, part, nrows_w, chunk, nt, sx1, sw1);
+        return;
+    }
+    const int n_row_groups = (nrows_w + 1 + RMS_MV_WARPS - 1)/RMS_MV_WARPS;
+    if (nt == 1) {
+        const ggml_cuda_kernel_launch_params lp(dim3(nsplit, n_row_groups, 1), dim3(WARP_SIZE, RMS_MV_WARPS), 0, stream);
+        ggml_cuda_kernel_launch(rms_norm_mat_vec_part_f32<1, T>, lp, x, w, part, nrows_w, chunk, nt, sx1, sw1);
+    } else {
+        const ggml_cuda_kernel_launch_params lp(dim3(nsplit, n_row_groups, (nt + 7)/8), dim3(WARP_SIZE, RMS_MV_WARPS), 0, stream);
+        ggml_cuda_kernel_launch(rms_norm_mat_vec_part_f32<8, T>, lp, x, w, part, nrows_w, chunk, nt, sx1, sw1);
+    }
+}
+
+void ggml_cuda_op_rms_norm_mat_vec_add(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
+        const ggml_tensor * mul_mat, ggml_tensor * add, ggml_tensor * sig) {
+    const ggml_tensor * x    = rms_norm->src[0];
+    const ggml_tensor * w    = mul_mat->src[0];
+    const ggml_tensor * bias = add->src[0] == mul_mat ? add->src[1] : add->src[0];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32 && bias->nb[0] == sizeof(float));
+    GGML_ASSERT(add->type == GGML_TYPE_F32 && ggml_is_contiguous(add));
+
+    const int     n       = x->ne[0];
+    const int     nt      = ggml_nrows(x);
+    const int     nrows_w = w->ne[1];
+    const float   eps     = ggml_get_op_params_f32(rms_norm, 0);
+    const int64_t sw1     = w->nb[1]/ggml_element_size(w);
+
+    // split the input so that a few tokens still fill the GPU; every chunk keeps a multiple of 4 inputs
+    int nsplit = nt <= 8 ? 16 : nt <= 64 ? 4 : nt <= 256 ? 2 : 1;
+    while (nsplit > 1 && (n % (4*nsplit) != 0 || n/nsplit < 256)) {
+        nsplit /= 2;
+    }
+    const int chunk = n/nsplit;
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) nt*nsplit*(nrows_w + 1));
+
+    if (w->type == GGML_TYPE_F16) {
+        rms_norm_mat_vec_part_launch(
+                (const float *) x->data, (const half *) w->data, part.get(), nrows_w, nsplit, chunk, nt, n, sw1, stream);
+    } else {
+        rms_norm_mat_vec_part_launch(
+                (const float *) x->data, (const float *) w->data, part.get(), nrows_w, nsplit, chunk, nt, n, sw1, stream);
+    }
+
+    const int64_t sb1 = ggml_nrows(bias) == 1 ? 0 : bias->nb[1]/sizeof(float);
+    const int64_t sd1 = add->nb[1]/sizeof(float);
+    const ggml_cuda_kernel_launch_params lp(dim3((nt + RMS_MV_WARPS - 1)/RMS_MV_WARPS), dim3(WARP_SIZE, RMS_MV_WARPS), 0, stream);
+    if (sig) {
+        ggml_cuda_kernel_launch(rms_norm_mat_vec_reduce_f32<true>, lp, (const float *) part.get(), (const float *) bias->data,
+                (float *) add->data, (float *) sig->data, nrows_w, nsplit, n, eps, nt, sb1, sd1,
+                (int64_t) (sig->nb[1]/sizeof(float)), (int) sig->ne[0]);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_mat_vec_reduce_f32<false>, lp, (const float *) part.get(), (const float *) bias->data,
+                (float *) add->data, (float *) nullptr, nrows_w, nsplit, n, eps, nt, sb1, sd1, (int64_t) 0, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DSV4_HC_PRE -> RMS_NORM -> MUL: one block per token
+
+template <int block_size>
+static __global__ void hc_pre_rms_norm_mul_f32(
+        const float * x, const float * pre, const float * w, float * dst,
+        const int n, const int hc, const float scale_pre, const float eps,
+        const int64_t sx1, const int64_t sx2, const int64_t sp0, const int64_t sp1, const int64_t sd1) {
+    const int t = blockIdx.x;
+
+    __shared__ float s_pre[HC_MAX];
+    __shared__ float s_sum[32];
+
+    ggml_cuda_pdl_sync();
+
+    if ((int) threadIdx.x < hc) {
+        s_pre[threadIdx.x] = pre[threadIdx.x*sp0 + t*sp1];
+    }
+    __syncthreads();
+
+    const float * xt = x + t*sx2;
+    float * y = dst + t*sd1;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += block_size) {
+        float h = 0.0f;
+        for (int s = 0; s < hc; ++s) {
+            h += xt[i + s*sx1]*s_pre[s];
+        }
+        h *= scale_pre;
+        y[i] = h;
+        ss += h*h;
+    }
+    ss = block_reduce<block_reduce_method::SUM, block_size>(ss, s_sum);
+    const float scale = rsqrtf(ss/n + eps);
+    // every thread rereads only the elements it wrote
+    for (int i = threadIdx.x; i < n; i += block_size) {
+        y[i] = y[i]*scale*w[i];
+    }
+}
+
+void ggml_cuda_op_hc_pre_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * hc_pre,
+        const ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * x   = hc_pre->src[0];
+    const ggml_tensor * pre = hc_pre->src[1];
+    const ggml_tensor * w   = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
+    GGML_ASSERT(pre->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w));
+    GGML_ASSERT(mul->type == GGML_TYPE_F32 && mul->nb[0] == sizeof(float));
+    GGML_ASSERT(x->ne[1] <= HC_MAX);
+
+    const int n  = x->ne[0];
+    const int hc = x->ne[1];
+    const int nt = x->ne[2];
+
+    constexpr int block_size = 256;
+    const ggml_cuda_kernel_launch_params lp(dim3(nt), dim3(block_size), 0, ctx.stream());
+    ggml_cuda_kernel_launch(hc_pre_rms_norm_mul_f32<block_size>, lp,
+            (const float *) x->data, (const float *) pre->data, (const float *) w->data, (float *) mul->data,
+            n, hc, ggml_get_op_params_f32(hc_pre, 0), ggml_get_op_params_f32(rms_norm, 0),
+            (int64_t) (x->nb[1]/sizeof(float)), (int64_t) (x->nb[2]/sizeof(float)),
+            (int64_t) (pre->nb[0]/sizeof(float)), (int64_t) (pre->nb[1]/sizeof(float)),
+            (int64_t) (mul->nb[1]/sizeof(float)));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// comb selector -> DSV4_HC_POST [-> stream sum]: one thread per (channel, token); the first warp of every block
+// computes the comb weights of its token: e = K^T mixes, rho = scale*max(e*r) + bias, comb(d, s) = e[d + hc*s]/rho + c0(d, s)
+
+struct hc_select_kparams {
+    const float * mixes;
+    const float * K;
+    const float * r;
+    const float * c0;
+    int     nmix;
+    int64_t sm0, sm1;
+    int64_t sk0, sk1;
+    int64_t sr0;
+    int64_t sc00, sc01;
+    float   scale;
+    float   bias;
+};
+
+template <bool with_sum>
+static __global__ void hc_select_post_f32(
+        const float * x, const float * res, const float * post, float * dst, float * sum,
+        const hc_select_kparams sel, const int n, const int hc,
+        const int64_t sx0, const int64_t sx1, const int64_t sr0, const int64_t sr1, const int64_t sr2,
+        const int64_t sp0, const int64_t sp1,
+        const int64_t sd0, const int64_t sd1, const int64_t sd2, const int64_t ss0, const int64_t ss1) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+
+    __shared__ float s_post[HC_MAX];
+    __shared__ float s_comb[WARP_SIZE];
+
+    ggml_cuda_pdl_sync();
+
+    if (threadIdx.x < WARP_SIZE) {
+        const int lane = threadIdx.x;
+        const int hc2  = hc*hc;
+        float e  = 0.0f;
+        float mx = -FLT_MAX;
+        if (lane < hc2) {
+            for (int k = 0; k < sel.nmix; ++k) {
+                e += sel.K[k*sel.sk0 + lane*sel.sk1]*sel.mixes[k*sel.sm0 + t*sel.sm1];
+            }
+            mx = e*sel.r[lane*sel.sr0];
+        }
+        mx = warp_reduce_max(mx);
+        if (lane < hc2) {
+            const float rho = mx*sel.scale + sel.bias;
+            s_comb[lane] = e/rho + sel.c0[(lane % hc)*sel.sc00 + (lane / hc)*sel.sc01];
+        }
+        if (lane < hc) {
+            s_post[lane] = post[lane*sp0 + t*sp1];
+        }
+    }
+    __syncthreads();
+
+    if (i >= n) {
+        return;
+    }
+
+    float r[HC_MAX];
+    for (int s = 0; s < hc; ++s) {
+        r[s] = res[i*sr0 + s*sr1 + t*sr2];
+    }
+    const float xv = x[i*sx0 + t*sx1];
+    float tot = 0.0f;
+    for (int d = 0; d < hc; ++d) {
+        float v = xv*s_post[d];
+        for (int s = 0; s < hc; ++s) {
+            v += r[s]*s_comb[d + hc*s];
+        }
+        dst[i*sd0 + d*sd1 + t*sd2] = v;
+        tot = d == 0 ? v : tot + v;
+    }
+    if constexpr (with_sum) {
+        sum[i*ss0 + t*ss1] = tot;
+    }
+}
+
+void ggml_cuda_op_hc_post_fused(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post,
+        const ggml_cuda_hc_select_args & sel, ggml_tensor * sum) {
+    const ggml_tensor * x    = hc_post->src[0];
+    const ggml_tensor * res  = hc_post->src[1];
+    const ggml_tensor * post = hc_post->src[2];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 && post->type == GGML_TYPE_F32);
+    GGML_ASSERT(hc_post->type == GGML_TYPE_F32);
+    GGML_ASSERT(sum == nullptr || sum->type == GGML_TYPE_F32);
+
+    const int n  = x->ne[0];
+    const int nt = x->ne[1];
+    const int hc = res->ne[1];
+    GGML_ASSERT(hc*hc <= WARP_SIZE);
+
+    constexpr size_t f = sizeof(float);
+    hc_select_kparams kp;
+    kp.mixes = (const float *) sel.mixes->data;
+    kp.K     = (const float *) sel.K->data;
+    kp.r     = (const float *) sel.r->data;
+    kp.c0    = (const float *) sel.c0->data;
+    kp.nmix  = sel.K->ne[0];
+    kp.sm0   = sel.mixes->nb[0]/f;
+    kp.sm1   = sel.mixes->nb[1]/f;
+    kp.sk0   = sel.K->nb[0]/f;
+    kp.sk1   = sel.K->nb[1]/f;
+    kp.sr0   = sel.r->nb[0]/f;
+    kp.sc00  = sel.c0->nb[0]/f;
+    kp.sc01  = sel.c0->nb[1]/f;
+    kp.scale = sel.scale;
+    kp.bias  = sel.bias;
+
+    const int block_size = 256;
+    const ggml_cuda_kernel_launch_params lp(dim3((n + block_size - 1)/block_size, nt), dim3(block_size), 0, ctx.stream());
+    ggml_cuda_kernel_launch(sum ? hc_select_post_f32<true> : hc_select_post_f32<false>, lp,
+            (const float *) x->data, (const float *) res->data, (const float *) post->data,
+            (float *) hc_post->data, sum ? (float *) sum->data : nullptr, kp, n, hc,
+            (int64_t) (x->nb[0]/f), (int64_t) (x->nb[1]/f),
+            (int64_t) (res->nb[0]/f), (int64_t) (res->nb[1]/f), (int64_t) (res->nb[2]/f),
+            (int64_t) (post->nb[0]/f), (int64_t) (post->nb[1]/f),
+            (int64_t) (hc_post->nb[0]/f), (int64_t) (hc_post->nb[1]/f), (int64_t) (hc_post->nb[2]/f),
+            sum ? (int64_t) (sum->nb[0]/f) : (int64_t) 0, sum ? (int64_t) (sum->nb[1]/f) : (int64_t) 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// RMS_NORM -> MUL -> RESHAPE -> ADD(streams, broadcast): one block per token. Every thread reads a stream element
+// before it writes the same element, so dst may alias the streams
+
+template <int block_size>
+static __global__ void rms_norm_mul_add_streams_f32(
+        const float * g, const float * w, const float * streams, float * dst, const int n, const int hc, const float eps,
+        const int64_t sg1, const int64_t sx1, const int64_t sx2, const int64_t sd1, const int64_t sd2) {
+    const int t = blockIdx.x;
+
+    __shared__ float s_sum[32];
+
+    ggml_cuda_pdl_sync();
+
+    const float * gr = g + t*sg1;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += block_size) {
+        ss += gr[i]*gr[i];
+    }
+    ss = block_reduce<block_reduce_method::SUM, block_size>(ss, s_sum);
+    const float scale = rsqrtf(ss/n + eps);
+    for (int i = threadIdx.x; i < n; i += block_size) {
+        const float a = gr[i]*scale*w[i];
+        for (int s = 0; s < hc; ++s) {
+            dst[i + s*sd1 + t*sd2] = streams[i + s*sx1 + t*sx2] + a;
+        }
+    }
+}
+
+void ggml_cuda_op_rms_norm_mul_add_streams(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
+        const ggml_tensor * mul, ggml_tensor * add) {
+    const ggml_tensor * g       = rms_norm->src[0];
+    const ggml_tensor * w       = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * streams = add->src[0]->op == GGML_OP_RESHAPE && add->src[0]->src[0] == mul ? add->src[1] : add->src[0];
+
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && g->nb[0] == sizeof(float));
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w));
+    GGML_ASSERT(streams->type == GGML_TYPE_F32 && streams->nb[0] == sizeof(float));
+    GGML_ASSERT(add->type == GGML_TYPE_F32 && add->nb[0] == sizeof(float));
+
+    constexpr size_t f = sizeof(float);
+    constexpr int block_size = 256;
+    const ggml_cuda_kernel_launch_params lp(dim3(add->ne[2]), dim3(block_size), 0, ctx.stream());
+    ggml_cuda_kernel_launch(rms_norm_mul_add_streams_f32<block_size>, lp,
+            (const float *) g->data, (const float *) w->data, (const float *) streams->data, (float *) add->data,
+            (int) add->ne[0], (int) add->ne[1], ggml_get_op_params_f32(rms_norm, 0),
+            (int64_t) (g->nb[1]/f), (int64_t) (streams->nb[1]/f), (int64_t) (streams->nb[2]/f),
+            (int64_t) (add->nb[1]/f), (int64_t) (add->nb[2]/f));
+}
