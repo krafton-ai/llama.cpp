@@ -14,8 +14,9 @@
 #include "mul_mat_vec_iface.glsl"
 
 #ifndef MUL_MAT_ID
-// MAT_VEC_FUSION_FLAGS_HC_POST: comb (post is fuse1)
+// MAT_VEC_FUSION_FLAGS_HC_POST: comb (post is fuse1); _SUM: the stream sum, the hc_post's second output
 layout (binding = 5) readonly buffer Fuse2 {D_TYPE data_fuse2[];};
+layout (binding = 6) writeonly buffer DSum {D_TYPE data_sum[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -116,7 +117,7 @@ FLOAT_TYPE geglu_mul(const FLOAT_TYPE a, const uint i) {
     return FLOAT_TYPE(0.5f*x*(2.0f - 2.0f / (exp(2 * val) + 1)) * float(data_fuse0[i]));
 }
 
-// MAT_VEC_FUSION_FLAGS_HC_POST(_SUM): the 4 (5) stream outputs of row i (p.stride_d = n rows); base = d_offset
+// MAT_VEC_FUSION_FLAGS_HC_POST(_SUM): the 4 stream outputs of row i (p.stride_d = n rows; base = d_offset) and their sum
 void store_hc_post(const uint base, const uint i, const FLOAT_TYPE v) {
     const uint n = p.stride_d;
     float r[4];
@@ -133,7 +134,7 @@ void store_hc_post(const uint base, const uint i, const FLOAT_TYPE v) {
         tot += o;
     }
     if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_HC_POST_SUM) != 0) {
-        data_d[base + i + 4*n] = D_TYPE(tot);
+        data_sum[i] = D_TYPE(tot);
     }
 }
 

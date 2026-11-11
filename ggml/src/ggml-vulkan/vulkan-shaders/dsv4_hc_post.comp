@@ -12,11 +12,11 @@
 //
 //   dst[i0, idst, it] = x[i0, it]*post[idst, it] + residual[i0, idst, it]
 //
-// WRITE_SUM == 1 (ggml_raon_hc_post_sum): dst has hc + 1 slots, slot hc holds the sum of the hc streams
+// WRITE_SUM (dsv4_hc_post_sum_f32): also writes the sum of the hc streams to its own tensor (binding 5), the
+// stream sum the graph builds after the hc_post (VIEW x4, ADD x3, in stream order)
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint HAS_COMB = 1;
-layout(constant_id = 2) const uint WRITE_SUM = 0;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -40,6 +40,9 @@ layout(push_constant) uniform parameter
     uint gate;               // post = gate_scale_out*sigmoid(gate_scale_in*p)
     float gate_scale_in;
     float gate_scale_out;
+
+    uint s_offset;           // WRITE_SUM: the sum [n_embd, n_tokens]
+    uint nbs0; uint nbs1;
 };
 
 layout(binding = 0, std430) readonly buffer X { float data_x[]; };
@@ -47,6 +50,9 @@ layout(binding = 1, std430) readonly buffer R { float data_r[]; };
 layout(binding = 2, std430) readonly buffer P { float data_p[]; };
 layout(binding = 3, std430) readonly buffer C { float data_c[]; };
 layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
+#ifdef WRITE_SUM
+layout(binding = 5, std430) writeonly buffer S { float data_s[]; };
+#endif
 
 const uint hc = 4;
 
@@ -99,7 +105,7 @@ void main() {
         data_d[d_offset + i0 * nbd0 + idst * nbd1 + it * nbd2] = result;
         total += result;
     }
-    if (WRITE_SUM == 1) {
-        data_d[d_offset + i0 * nbd0 + hc * nbd1 + it * nbd2] = total;
-    }
+#ifdef WRITE_SUM
+    data_s[s_offset + i0 * nbs0 + it * nbs1] = total;
+#endif
 }

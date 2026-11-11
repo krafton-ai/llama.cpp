@@ -951,6 +951,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+    vk_pipeline pipeline_dsv4_hc_post_sum_f32;          // + the stream sum after it (ggml_vk_fuse_hc_post_sum)
+    vk_pipeline pipeline_dsv4_hc_post_sum_nocomb_f32;
     vk_pipeline pipeline_ssm_conv_state_f32;
     vk_pipeline pipeline_ssm_conv_state_l2_f32;
     vk_pipeline pipeline_ssm_conv_state_mt_f32, pipeline_ssm_conv_state_mt_l2_f32;
@@ -1338,6 +1340,8 @@ struct ggml_backend_vk_context {
     int  hc_select_run[16] {};
     int  fused_mul_mat_vec_glu {};  // 1: [gate | up] swiglu, 2: geglu with an external second input
     bool fused_mul_mat_vec_hc_post {};
+    bool fused_hc_post_sum {};    // the stream sum after a DSV4_HC_POST (the last fused node) written by it
+    int  hc_post_idx {};          // fused_mul_mat_vec_hc_post / fused_hc_post_sum: the DSV4_HC_POST node index
     bool fused_ssm_conv_state {};
     bool fused_gdn_state_cpy {};
     bool fused_gdn_gates {};

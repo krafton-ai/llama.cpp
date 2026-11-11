@@ -2905,8 +2905,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     const uint32_t force_subgroup_size = use_subgroups ? subgroup_size : 0;
     const uint32_t force_subgroup_size16 = use_subgroups16 ? subgroup_size16 : 0;
-    // A, B, D, fuse0, fuse1 and fuse2 (comb of MAT_VEC_FUSION_FLAGS_HC_POST)
-    static constexpr uint32_t mul_mat_vec_num_bindings = 6;
+    // A, B, D, fuse0, fuse1, fuse2 (comb of MAT_VEC_FUSION_FLAGS_HC_POST) and the stream sum of _HC_POST_SUM
+    static constexpr uint32_t mul_mat_vec_num_bindings = 7;
     static constexpr uint32_t mul_mat_vec_id_num_bindings = 6;
     static constexpr uint32_t mul_mat_vec_p021_nc_num_bindings = 5;
 
@@ -3658,6 +3658,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_sum_f32,        "dsv4_hc_post_sum_f32",        dsv4_hc_post_sum_f32_len, dsv4_hc_post_sum_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_sum_nocomb_f32, "dsv4_hc_post_sum_nocomb_f32", dsv4_hc_post_sum_f32_len, dsv4_hc_post_sum_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_state_f32,  "ssm_conv_state_f32",  ssm_conv_state_f32_len,  ssm_conv_state_f32_data,  "main", 5, sizeof(vk_op_fused_push_constants), {256, 1, 1}, { 256 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_state_l2_f32, "ssm_conv_state_l2_f32", ssm_conv_state_l2_f32_len, ssm_conv_state_l2_f32_data, "main", 6, sizeof(vk_op_fused_push_constants), {256, 1, 1}, { 256 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_state_mt_f32, "ssm_conv_state_mt_f32", ssm_conv_state_mt_f32_len, ssm_conv_state_mt_f32_data, "main", 5, sizeof(vk_op_fused_push_constants), {256, 1, 1}, { 256 }, 1);
@@ -6929,7 +6931,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         }
     }
 
-    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+    // with the hc_post (and its stream sum, the last fused node) the mat-vec writes the hc_post streams
+    const ggml_tensor * hp = fuse_hc_post ? cgraph->nodes[ctx->hc_post_idx] : nullptr;
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, hp ? hp : cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
     vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
     vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
     vk_subbuffer d_X, d_Y;
@@ -7014,7 +7018,6 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         d_F0 = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]->src[1]);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_GEGLU_MUL;
     } else if (fuse_hc_post) {
-        const ggml_tensor * hp = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
         d_F0 = ggml_vk_tensor_subbuffer(ctx, hp->src[1]);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_HC_POST;
     } else if (ctx->num_additional_fused_ops > 0) {
@@ -7027,14 +7030,18 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     vk_subbuffer d_F1 = d_D;
     vk_subbuffer d_F2 = d_D;
+    vk_subbuffer d_S = d_D;
     uint32_t fuse1_off0 = 0, fuse1_off1 = 0;
     if (fuse_hc_post) {
         // post and comb in their own bindings (they may sit in different buffers), aligned down
-        const ggml_tensor * hp = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
         d_F1 = ggml_vk_tensor_subbuffer(ctx, hp->src[2], true);
         d_F2 = ggml_vk_tensor_subbuffer(ctx, hp->src[3], true);
         fuse1_off0 = (uint32_t) (get_misalign_bytes(ctx, hp->src[2]) / sizeof(float));
         fuse1_off1 = (uint32_t) (get_misalign_bytes(ctx, hp->src[3]) / sizeof(float));
+        if (ctx->fused_hc_post_sum) {
+            d_S = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+            fusion_flags |= MAT_VEC_FUSION_FLAGS_HC_POST_SUM;
+        }
     } else if (!fuse_glu && !fuse_geglu && ctx->num_additional_fused_ops == 2) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 2];
         const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
@@ -7064,6 +7071,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
                                     d_F0,
                                     d_F1,
                                     d_F2,
+                                    d_S,
                                   },
                                   pc, { groups_x, groups_y, groups_z });
         base_work_group_y += groups_y;
@@ -7390,10 +7398,11 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
-void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst, const ggml_tensor * gate_scale_in) {
-    VK_LOG_DEBUG("ggml_vk_dsv4_hc_post(" << x << ", " << residual << ", " << post << ", " << comb << ", " << dst << ")");
+void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst, const ggml_tensor * gate_scale_in, ggml_tensor * sum) {
+    VK_LOG_DEBUG("ggml_vk_dsv4_hc_post(" << x << ", " << residual << ", " << post << ", " << comb << ", " << dst << ", " << sum << ")");
 
-    vk_pipeline pipeline = comb ? ctx->device->pipeline_dsv4_hc_post_f32 : ctx->device->pipeline_dsv4_hc_post_nocomb_f32;
+    vk_pipeline pipeline = sum ? (comb ? ctx->device->pipeline_dsv4_hc_post_sum_f32 : ctx->device->pipeline_dsv4_hc_post_sum_nocomb_f32)
+                               : (comb ? ctx->device->pipeline_dsv4_hc_post_f32 : ctx->device->pipeline_dsv4_hc_post_nocomb_f32);
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
@@ -7423,7 +7432,16 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     };
     init_pushconst_tensor_offsets(ctx, pc, x, residual, p_src, comb, dst);
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+    if (!sum) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+        return;
+    }
+    // the stream sum [n_embd, n_tokens] (ggml_vk_fuse_hc_post_sum)
+    pc.s_offset = get_misalign_bytes(ctx, sum) / sizeof(float);
+    pc.nbs0 = ggml_vk_nb_elem(sum, 0);
+    pc.nbs1 = ggml_vk_nb_elem(sum, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf, ggml_vk_tensor_subbuffer(ctx, sum, true) },
+                              pc, { n_embd, n_tokens, 1 });
 }
 
 // fused ops: the sources are bound in order, then dst; wg = workgroup counts
@@ -13216,7 +13234,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_DSV4_HC_POST:
-        ggml_vk_dsv4_hc_post(ctx, compute_ctx, src0, src1, src2, src3, node);
+        ggml_vk_dsv4_hc_post(ctx, compute_ctx, src0, src1, src2, src3, node, nullptr,
+                             ctx->fused_hc_post_sum ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr);
 
         break;
     case GGML_OP_MLA_EXPAND_KV:
@@ -14878,6 +14897,43 @@ static int ggml_vk_fuse_mul_mat_hc_post(const ggml_backend_vk_context * ctx, con
     return j;
 }
 
+// The stream sum after a 4-stream DSV4_HC_POST (Raon-1 nano stream_sum): VIEW x4 of the streams and ADD x3, in the order
+// ((s0 + s1) + s2) + s3, right after the hc_post (ggml_vk_graph_optimize gathers them there). The hc_post writes the sum
+// (the last ADD) as well; the streams stay its output. Returns the index of the last ADD, or -1
+static constexpr std::initializer_list<ggml_op> hc_post_sum_pattern { GGML_OP_DSV4_HC_POST,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_ADD };
+static constexpr std::initializer_list<std::array<int, 3>> hc_post_sum_edges {
+    {1, 0, 0}, {2, 0, 0}, {3, 0, 1}, {3, 1, 2}, {4, 0, 0}, {5, 0, 3}, {5, 1, 4}, {6, 0, 0}, {7, 0, 5}, {7, 1, 6} };
+static constexpr int hc_post_sum_views[4] = { 1, 2, 4, 6 };   // stream s is viewed by node hc_post_sum_views[s]
+
+static int ggml_vk_fuse_hc_post_sum(const struct ggml_cgraph * cgraph, int hp_idx) {
+    const int last = hp_idx + (int) hc_post_sum_pattern.size() - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, hp_idx, hc_post_sum_pattern, { hp_idx, last }) ||
+        !ggml_check_edges(cgraph, hp_idx, hc_post_sum_edges)) {
+        return -1;
+    }
+    const ggml_tensor * hp  = cgraph->nodes[hp_idx];
+    const ggml_tensor * sum = cgraph->nodes[last];
+    if (hp->type != GGML_TYPE_F32 || hp->ne[1] != 4 || hp->ne[3] != 1 || sum->type != GGML_TYPE_F32 ||
+        sum->ne[0] != hp->ne[0] || sum->ne[1] != hp->ne[2] || sum->ne[2] != 1 || sum->ne[3] != 1) {
+        return -1;
+    }
+    for (int s = 0; s < 4; ++s) {
+        const ggml_tensor * v = cgraph->nodes[hp_idx + hc_post_sum_views[s]];
+        if (v->view_src != hp || v->view_offs != (size_t) s*hp->nb[1] || !ggml_are_same_shape(v, sum) ||
+            v->nb[0] != hp->nb[0] || v->nb[1] != hp->nb[2]) {
+            return -1;
+        }
+    }
+    for (int k : { 3, 5, 7 }) {
+        const ggml_tensor * add = cgraph->nodes[hp_idx + k];
+        if (add->type != GGML_TYPE_F32 || !ggml_are_same_shape(add, sum)) {
+            return -1;
+        }
+    }
+    return last;
+}
+
 // A mat-vec followed by a GLU that the mat-vec shader applies itself (MAT_VEC_FUSION_FLAGS_GLU / _GEGLU_MUL): a Q4_K
 // mat-vec of [gate | up] rows and the single-source swiglu (merged FFN up projection), or a mat-vec that is the gelu
 // input of a split GEGLU (Raon per-layer input gate). Nodes without computation (views) may sit between the two.
@@ -15827,6 +15883,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_select = false;
         ctx->fused_mul_mat_vec_glu = 0;
         ctx->fused_mul_mat_vec_hc_post = false;
+        ctx->fused_hc_post_sum = false;
         ctx->fused_ssm_conv_state = false;
         ctx->fused_gdn_state_cpy = false;
         ctx->fused_gdn_gates = false;
@@ -15936,11 +15993,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (const int i_hp = ggml_vk_fuse_mul_mat_hc_post(ctx, cgraph, i); i_hp > 0) {
                 ctx->num_additional_fused_ops = i_hp - i;
                 ctx->fused_mul_mat_vec_hc_post = true;
+                ctx->hc_post_idx = i_hp;
                 fusion_string = "MUL_MAT_HC_POST";
+                // and the stream sum after the hc_post, a second output (one row: the sum is contiguous and aligned)
+                if (const int i_sum = ggml_vk_fuse_hc_post_sum(cgraph, i_hp);
+                    i_sum > 0 && ggml_is_contiguous(cgraph->nodes[i_sum]) && get_misalign_bytes(ctx, cgraph->nodes[i_sum]) == 0) {
+                    ctx->num_additional_fused_ops = i_sum - i;
+                    ctx->fused_hc_post_sum = true;
+                    ctx->fused_ops_write_mask |= 1 << (i_hp - i);
+                    fusion_string = "MUL_MAT_HC_POST_SUM";
+                }
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 // each row reads its residual elements (one per stream) before it writes the same elements: the hc_post
-                // output may be the residual (in place)
-                op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = true;
+                // output may be the residual (in place); the sum views and ADDs read only nodes of the fusion
+                op_srcs_fused_elementwise[i_hp - i] = true;
+            } else if (const int i_sum = ggml_vk_fuse_hc_post_sum(cgraph, i); i_sum > 0) {
+                ctx->num_additional_fused_ops = i_sum - i;
+                ctx->fused_hc_post_sum = true;
+                ctx->hc_post_idx = i;
+                // the streams and the sum
+                ctx->fused_ops_write_mask |= 1;
+                fusion_string = "HC_POST_SUM";
+                // each element reads its x and residual elements before it writes the streams and the sum there
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
             } else if (const int i_glu = ggml_vk_fuse_mul_mat_glu(ctx, cgraph, i); i_glu > 0) {
                 ctx->num_additional_fused_ops = i_glu - i;
                 ctx->fused_mul_mat_vec_glu = cgraph->nodes[i_glu]->src[1] ? 2 : 1;
@@ -16214,6 +16289,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_select = false;
                 ctx->fused_mul_mat_vec_glu = 0;
                 ctx->fused_mul_mat_vec_hc_post = false;
+                ctx->fused_hc_post_sum = false;
                         ctx->fused_ssm_conv_state = false;
                 ctx->fused_gdn_state_cpy = false;
                 ctx->fused_gdn_gates = false;
@@ -17213,6 +17289,72 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             mi = std::find(new_order.begin(), new_order.end(), hp->src[0]) - new_order.begin();
             new_order.insert(new_order.begin() + mi + 1, hp);
             new_order.insert(new_order.begin() + mi + 1, views.begin(), views.end());
+        }
+    }
+    // The stream sum of a DSV4_HC_POST (ggml_vk_fuse_hc_post_sum) right after it, where the hc_post writes it too: the
+    // views of the streams and the ADDs read only the hc_post and each other, so they can move up. The fused pass reads
+    // the hc_post sources (and the input of a one-token mat-vec that writes the streams) while it writes the sum: keep
+    // them alive through the last ADD
+    if (!ctx->device->disable_fusion) {
+        for (size_t hi = 0; hi < new_order.size(); ++hi) {
+            ggml_tensor * hp = new_order[hi];
+            if (hp->op != GGML_OP_DSV4_HC_POST) {
+                continue;
+            }
+            // the chain in its fused order: view of stream 0, 1, add, view 2, add, view 3, add
+            ggml_tensor * chain[7] = {};
+            const size_t end = std::min(new_order.size(), hi + 64);
+            for (size_t k = hi + 1; k < end; ++k) {
+                ggml_tensor * t = new_order[k];
+                if (t->op == GGML_OP_VIEW && t->view_src == hp && t->ne[0] == hp->ne[0] && t->ne[1] == hp->ne[2] &&
+                    t->nb[1] == hp->nb[2] && t->view_offs % hp->nb[1] == 0 && t->view_offs / hp->nb[1] < 4) {
+                    const size_t s = t->view_offs / hp->nb[1];
+                    const int slot = s == 0 ? 0 : s == 1 ? 1 : s == 2 ? 3 : 5;
+                    if (!chain[slot]) {
+                        chain[slot] = t;
+                    }
+                } else if (t->op == GGML_OP_ADD && chain[0] && chain[1] && t->src[0] == chain[0] && t->src[1] == chain[1] && !chain[2]) {
+                    chain[2] = t;
+                } else if (t->op == GGML_OP_ADD && chain[2] && chain[3] && t->src[0] == chain[2] && t->src[1] == chain[3] && !chain[4]) {
+                    chain[4] = t;
+                } else if (t->op == GGML_OP_ADD && chain[4] && chain[5] && t->src[0] == chain[4] && t->src[1] == chain[5]) {
+                    chain[6] = t;
+                    break;
+                }
+            }
+            if (!chain[6]) {
+                continue;
+            }
+            // nothing in between may write into the hc_post (a view of it written in place)
+            const std::set<ggml_tensor *> in_chain(chain, chain + 7);
+            bool ok = true;
+            for (size_t k = hi + 1; k < new_order.size() && new_order[k] != chain[6] && ok; ++k) {
+                ggml_tensor * t = new_order[k];
+                ok = in_chain.count(t) || ggml_op_is_empty(t->op) || t->view_src != hp;
+            }
+            if (!ok) {
+                continue;
+            }
+            std::vector<ggml_tensor *> order;
+            order.reserve(new_order.size());
+            for (ggml_tensor * t : new_order) {
+                if (!in_chain.count(t)) {
+                    order.push_back(t);
+                }
+                if (t == hp) {
+                    order.insert(order.end(), chain, chain + 7);
+                }
+            }
+            new_order.swap(order);
+            for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                if (hp->src[si]) {
+                    params->add_alloc_dep(params->user_data, hp->src[si], chain[6]);
+                }
+            }
+            if (hp->src[0]->op == GGML_OP_MUL_MAT && ggml_nrows(hp->src[0]) == 1) {
+                params->add_alloc_dep(params->user_data, hp->src[0]->src[1], chain[6]);
+            }
+            hi += 7;
         }
     }
     // Each delta net gate run back right before its delta net

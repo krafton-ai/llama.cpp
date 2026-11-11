@@ -1137,6 +1137,7 @@ void process_shaders() {
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
+    string_to_spv("dsv4_hc_post_sum_f32", "dsv4_hc_post.comp", {{"WRITE_SUM", "1"}});
     string_to_spv("ssm_conv_state_f32",   "ssm_conv_state.comp",   {});
     string_to_spv("ssm_conv_state_l2_f32", "ssm_conv_state.comp",  {{"L2", "1"}});
     string_to_spv("ssm_conv_state_mt_f32",    "ssm_conv_state.comp", {{"MULTI_TOKEN", "1"}});

@@ -211,6 +211,9 @@ struct vk_op_dsv4_hc_post_push_constants {
     uint32_t gate;
     float    gate_scale_in;
     float    gate_scale_out;
+
+    uint32_t s_offset;   // dsv4_hc_post_sum_f32: the stream sum
+    uint32_t nbs0; uint32_t nbs1;
 };
 
 struct vk_op_count_experts_push_constants {

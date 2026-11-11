@@ -4838,6 +4838,51 @@ struct test_hc_site_ple : public test_case {
     }
 };
 
+// the sum of the streams [n_embd, n_tokens] as the Raon-1 nano graph builds it after a hc_post: VIEW x4, ADD x3
+static ggml_tensor * build_stream_sum(ggml_context * ctx, ggml_tensor * x) {
+    ggml_tensor * sum = nullptr;
+    for (int64_t i = 0; i < x->ne[1]; ++i) {
+        ggml_tensor * xi = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], i*x->nb[1]);
+        sum = sum ? ggml_add(ctx, sum, xi) : xi;
+    }
+    return sum;
+}
+
+// DSV4_HC_POST and the stream sum after it; a backend may write the sum in the hc_post (Vulkan). Both outputs are checked
+struct test_dsv4_hc_post_stream_sum : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    identity;
+    ggml_tensor * streams = nullptr;
+
+    std::string op_desc(ggml_tensor *) override { return "DSV4_HC_POST_SUM"; }
+    std::string vars() override { return VARS_TO_STR3(n_embd, n_tokens, identity); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { streams, out }; }
+
+    test_dsv4_hc_post_stream_sum(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+        ggml_tensor * comb = nullptr;
+        if (!identity) {
+            comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+            ggml_set_name(comb, "comb");
+        }
+        streams = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        ggml_set_name(streams, "streams");
+        out = build_stream_sum(ctx, streams);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -5502,20 +5547,30 @@ struct test_gated_delta_net : public test_case {
 // A one-token mat-vec followed by the 4-stream DSV4_HC_POST of its output, with post a view of the selector sigmoids and
 // comb its own tensor (Raon-1 nano layer outputs). A backend may write the streams in the mat-vec (Vulkan).
 // split: comb in another buffer than post (as when they fall in different chunks of the compute buffer)
+// sum: the stream sum after the hc_post (VIEW x4, ADD x3), which the mat-vec may write too; the streams are checked as well
 struct test_mul_mat_hc_post : public test_case {
     const ggml_type type_w;
     const int64_t n, k;
     const bool split;
+    const bool sum;
+    ggml_tensor * streams = nullptr;
+    ggml_tensor * out = nullptr;
 
     std::string vars() override {
-        return split ? VARS_TO_STR4(type_w, n, k, split) : VARS_TO_STR3(type_w, n, k);
+        return split || sum ? VARS_TO_STR5(type_w, n, k, split, sum) : VARS_TO_STR3(type_w, n, k);
     }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_HC_POST"; }
     bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (sum) {
+            return { streams, out };
+        }
+        return { out };
+    }
     bool use_weight_context() override { return split; }
 
-    test_mul_mat_hc_post(ggml_type type_w = GGML_TYPE_F16, int64_t n = 1536, int64_t k = 6144, bool split = false)
-        : type_w(type_w), n(n), k(k), split(split) {}
+    test_mul_mat_hc_post(ggml_type type_w = GGML_TYPE_F16, int64_t n = 1536, int64_t k = 6144, bool split = false, bool sum = false)
+        : type_w(type_w), n(n), k(k), split(split), sum(sum) {}
 
     // quantized weights: the backends may quantize the activations differently (as test_mul_mat)
     double max_nmse_err() override { return ggml_is_quantized(type_w) ? 5e-4 : 1e-7; }
@@ -5531,7 +5586,9 @@ struct test_mul_mat_hc_post : public test_case {
         ggml_tensor * comb = ggml_new_tensor_3d(split ? ctx_w : ctx, GGML_TYPE_F32, 4, 4, 1);
         ggml_tensor * post = ggml_view_2d(ctx, sg, 4, 1, sg->nb[1], 4*sizeof(float));
         ggml_tensor * mm   = ggml_mul_mat(ctx, w, x);
-        return ggml_dsv4_hc_post(ctx, mm, res, post, comb);
+        streams = ggml_dsv4_hc_post(ctx, mm, res, post, comb);
+        out = sum ? build_stream_sum(ctx, streams) : streams;
+        return out;
     }
 };
 
@@ -11675,6 +11732,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_site_ple(64, 2, 1, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_hc_site_ple(4096, 6, 1, GGML_TYPE_F16, false));
     test_cases.emplace_back(new test_hc_site_ple(75, 3, 1, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_dsv4_hc_post_stream_sum(1, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post_stream_sum(1536, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post_stream_sum(31, 17));
+    test_cases.emplace_back(new test_dsv4_hc_post_stream_sum(1536, 3, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -13721,8 +13782,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
         test_cases.emplace_back(new test_mul_mat_hc_post(t, 1536, 6144));
     }
-    // post and comb in different buffers
+    // post and comb in different buffers, and the stream sum after the hc_post
     test_cases.emplace_back(new test_mul_mat_hc_post(GGML_TYPE_Q4_K, 1536, 6144, true));
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        test_cases.emplace_back(new test_mul_mat_hc_post(t, 1536, 6144, false, true));
+    }
+    test_cases.emplace_back(new test_mul_mat_hc_post(GGML_TYPE_Q4_K, 1536, 6144, true, true));
     // delta net gates computed by the delta net (Raon-1 nano, one token)
     test_cases.emplace_back(new test_gdn_gates(16, 128, 32));
     test_cases.emplace_back(new test_gdn_gates(4, 64, 8));

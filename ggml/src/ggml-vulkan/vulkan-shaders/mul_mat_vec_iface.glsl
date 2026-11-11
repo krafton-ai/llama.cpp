@@ -12,7 +12,7 @@
 // the output feeds an mHC hc_post with 4 streams (dsv4_hc_post): fuse0 = the residual streams [n, 4], fuse1 = post (4)
 // and fuse2 = comb (4 x 4); row i writes stream d: v*post[d] + sum_s res[i, s]*comb[d + 4s]
 #define MAT_VEC_FUSION_FLAGS_HC_POST 0x40
-// ... and the stream sum after the 4 streams (raon_hc_post_sum)
+// ... and the sum of the 4 streams of row i to the second output (the stream sum after the hc_post)
 #define MAT_VEC_FUSION_FLAGS_HC_POST_SUM 0x80
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
