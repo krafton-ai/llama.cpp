@@ -522,6 +522,11 @@ __kernel void adreno_xmem_attn_softmax_reduce_basic(read_only image1d_buffer_t s
         new_max       = max(new_max, src.z);
         new_max       = max(new_max, src.w);
         new_max       = max(new_max, maximum);
+        if (isinf(new_max)) {
+            // every cell so far is masked: -inf - -inf below would turn the sum into NaN
+            maximum = new_max;
+            continue;
+        }
         float scale   = native_exp(maximum - new_max);
         maximum       = new_max;
         sum *= scale;

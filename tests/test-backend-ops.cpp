@@ -8615,6 +8615,34 @@ struct test_mul_mat_prec_f32 : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with the first n_masked kv cells of every row masked, e.g. unused cells at the start of the cache.
+// The OpenCL Adreno xmem path (GGML_OPENCL_XMEM_SDPA=1) gave NaN for these rows.
+struct test_flash_attn_ext_masked_head : public test_flash_attn_ext {
+    const int64_t n_masked;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",n_masked=" + std::to_string(n_masked);
+    }
+
+    test_flash_attn_ext_masked_head(int64_t hsk, int64_t hsv, int64_t nh, int64_t kv, int64_t nb, int64_t n_masked)
+        : test_flash_attn_ext(hsk, hsv, nh, {1, 1}, kv, nb), n_masked(n_masked) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        std::vector<float> data(ggml_nelements(m));
+        std::mt19937 gen(0x3d5);
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+        for (int64_t i = 0; i < ggml_nelements(m); i++) {
+            data[i] = i % m->ne[0] < n_masked ? -INFINITY : dis(gen);
+        }
+        std::vector<ggml_fp16_t> data_f16(data.size());
+        ggml_fp32_to_fp16_row(data.data(), data_f16.data(), data.size());
+        ggml_backend_tensor_set(m, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12120,6 +12148,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_prec_f32(type_a, 512, n, 4096));
         }
     }
+
+    // masked cells at the start of every kv row
+    test_cases.emplace_back(new test_flash_attn_ext_masked_head(128, 128, 8, 512, 32, 64));
+    test_cases.emplace_back(new test_flash_attn_ext_masked_head(64, 64, 4, 1024, 16, 300));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
