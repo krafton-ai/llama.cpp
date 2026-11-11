@@ -861,6 +861,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rms_norm_mul_mat_add_part_f16 = nullptr;
     cl_kernel kernel_rms_norm_mul_mat_add_part_f32 = nullptr;
     cl_kernel kernel_rms_norm_mul_mat_add_reduce   = nullptr;
+    cl_kernel kernel_mul_mat_pool_max_div_add      = nullptr;
     cl_kernel kernel_dsv4_hc_post_sum              = nullptr;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
@@ -1747,6 +1748,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_mat_add_part_f16 = clCreateKernel(prog, "kernel_rms_norm_mul_mat_add_part_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_mat_add_part_f32 = clCreateKernel(prog, "kernel_rms_norm_mul_mat_add_part_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_pool_max_div_add = clCreateKernel(prog, "kernel_mul_mat_pool_max_div_add", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_mat_add_reduce = clCreateKernel(prog, "kernel_rms_norm_mul_mat_add_reduce", &err), err));
         CL_CHECK((backend_ctx->kernel_dsv4_hc_post_sum = clCreateKernel(prog, "kernel_dsv4_hc_post_sum", &err), err));
         // the fusion kernels use 256-wide work-groups; without them the unfused graph runs
@@ -1754,6 +1756,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             &backend_ctx->kernel_rms_norm_mul_mat_add_part_f16,
             &backend_ctx->kernel_rms_norm_mul_mat_add_part_f32,
             &backend_ctx->kernel_rms_norm_mul_mat_add_reduce,
+            &backend_ctx->kernel_mul_mat_pool_max_div_add,
         };
         for (size_t i = 0; i < sizeof(fused)/sizeof(fused[0]); ++i) {
             size_t max_wg = 0;
@@ -8936,6 +8939,127 @@ static bool ggml_opencl_f32_rows(const ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float);
 }
 
+static int32_t ggml_opencl_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return 0;
+    }
+    return cgraph->use_counts[pos];
+}
+
+// MUL_MAT -> MUL -> POOL_1D(max) -> SCALE -> DIV -> ADD with constant operands from one tensor (chart):
+//   MUL_MAT(K = chart view, mixes) -> MUL(r) -> POOL_1D(max, hc*hc) -> SCALE_BIAS(1, 1) -> RESHAPE(rho)
+//   RESHAPE(e) -> DIV(e, rho) -> ADD(c0)       (only views of the constant chart in between)
+// Returns the index of the final ADD (comb), or 0.
+static int ggml_opencl_match_mul_mat_pool_max_div_add(ggml_backend_opencl_context * ctx,
+                                                      const ggml_cgraph *           cgraph,
+                                                      int                           i) {
+    const ggml_tensor * km = cgraph->nodes[i];
+    if (!ctx->kernel_mul_mat_pool_max_div_add || km->op != GGML_OP_MUL_MAT || !km->src[0]->view_src ||
+        km->src[0]->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const ggml_tensor * mixes = km->src[1];
+    const ggml_tensor * chart = km->src[0]->view_src;
+    const ggml_tensor * mr = nullptr, *pool = nullptr, *sc = nullptr, *r_rho = nullptr, *r_e = nullptr, *div = nullptr,
+                      *comb = nullptr;
+    int j                   = i + 1;
+    for (; j < cgraph->n_nodes && j < i + 16 && !comb; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (!mr && n->op == GGML_OP_MUL && n->src[0] == km) {
+            mr = n;
+        } else if (mr && !pool && n->op == GGML_OP_POOL_1D && n->src[0] == mr) {
+            pool = n;
+        } else if (pool && !sc && n->op == GGML_OP_SCALE && n->src[0] == pool) {
+            sc = n;
+        } else if (sc && !r_rho && n->op == GGML_OP_RESHAPE && n->src[0] == sc) {
+            r_rho = n;
+        } else if (!r_e && n->op == GGML_OP_RESHAPE && n->src[0] == km) {
+            r_e = n;
+        } else if (r_rho && r_e && !div && n->op == GGML_OP_DIV && n->src[0] == r_e && n->src[1] == r_rho) {
+            div = n;
+        } else if (div && n->op == GGML_OP_ADD && n->src[0] == div) {
+            comb = n;
+        } else if (n->op == GGML_OP_VIEW && n->view_src == chart) { /* r, c0 */
+        } else {
+            return 0;
+        }
+    }
+    if (!comb) {
+        return 0;
+    }
+    const int           last = j - 1;
+    const int           hc2  = (int) km->ne[0];
+    const int           hc   = (int) (sqrt((double) hc2) + 0.5);
+    const int           nmix = (int) mixes->ne[0];
+    const ggml_tensor * K    = km->src[0];
+    const ggml_tensor * r    = mr->src[1];
+    const ggml_tensor * c0   = comb->src[1];
+    const size_t        es   = sizeof(float);
+    if (hc * hc != hc2 || hc2 > 64 || nmix > 64 || chart->type != GGML_TYPE_F32 || !ggml_is_contiguous(chart) ||
+        mixes->type != GGML_TYPE_F32 || mixes->nb[0] != es || mixes->ne[2] != 1 || mixes->ne[3] != 1 ||
+        r->view_src != chart || c0->view_src != chart || K->ne[0] != nmix || K->ne[1] != hc2 ||
+        K->nb[1] != (size_t) nmix * es || r->view_offs != K->view_offs + (size_t) nmix * hc2 * es ||
+        c0->view_offs != r->view_offs + (size_t) hc2 * es || ggml_get_op_params_i32(pool, 0) != GGML_OP_POOL_MAX ||
+        ggml_get_op_params_i32(pool, 1) != hc2 || ggml_get_op_params_i32(pool, 2) != hc2 ||
+        ggml_get_op_params_i32(pool, 3) != 0 || mr->ne[0] != hc2 || pool->ne[0] != 1 ||
+        ggml_get_op_params_f32(sc, 0) != 1.0f || ggml_get_op_params_f32(sc, 1) != 1.0f || comb->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(comb) || ggml_nelements(comb) != (int64_t) hc2 * mixes->ne[1] ||
+        ggml_opencl_use_count(cgraph, km) != 2 || ggml_opencl_use_count(cgraph, mr) != 1 ||
+        ggml_opencl_use_count(cgraph, pool) != 1 || ggml_opencl_use_count(cgraph, sc) != 1 ||
+        ggml_opencl_use_count(cgraph, r_rho) != 1 || ggml_opencl_use_count(cgraph, r_e) != 1 ||
+        ggml_opencl_use_count(cgraph, div) != 1 || (km->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_opencl_overlaps(comb, chart)) {
+        return 0;
+    }
+    return last;
+}
+
+static void ggml_opencl_fused_mul_mat_pool_max_div_add(ggml_backend_t      backend,
+                                                       const ggml_tensor * km,
+                                                       const ggml_tensor * comb) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    cl_kernel                     kernel      = backend_ctx->kernel_mul_mat_pool_max_div_add;
+    const ggml_tensor *           mixes       = km->src[1];
+    const ggml_tensor *           chart       = km->src[0]->view_src;
+    ggml_tensor_extra_cl *        em          = (ggml_tensor_extra_cl *) mixes->extra;
+    ggml_tensor_extra_cl *        ec          = (ggml_tensor_extra_cl *) chart->extra;
+    ggml_tensor_extra_cl *        eo          = (ggml_tensor_extra_cl *) comb->extra;
+    const cl_ulong om = em->offset + mixes->view_offs, oc = ec->offset + chart->view_offs + km->src[0]->view_offs;
+    const cl_ulong oo  = eo->offset + comb->view_offs;
+    const cl_ulong nbm = mixes->nb[1];
+    const int      hc2 = (int) km->ne[0];
+    const int      hc = (int) (sqrt((double) hc2) + 0.5), nmix = (int) mixes->ne[0], nt = (int) mixes->ne[1];
+    const cl_ulong nbo     = (cl_ulong) hc2 * sizeof(float);
+    const bool     via_tmp = ggml_opencl_overlaps(comb, mixes);
+    cl_mem         out_mem = eo->data_device;
+    cl_ulong       out_off = oo;
+    if (via_tmp) {
+        backend_ctx->prealloc_fusion_tmp.allocate(backend_ctx->context, ggml_nbytes(comb));
+        out_mem = backend_ctx->prealloc_fusion_tmp.buffer;
+        out_off = 0;
+    }
+    int k = 0;
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(cl_mem), &em->data_device));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(cl_ulong), &om));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(cl_ulong), &nbm));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(cl_mem), &ec->data_device));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(cl_ulong), &oc));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(cl_mem), &out_mem));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(cl_ulong), &out_off));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(cl_ulong), &nbo));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(int), &hc));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(int), &nmix));
+    CL_CHECK(clSetKernelArg(kernel, k++, sizeof(int), &nt));
+    size_t lws[1] = { 64 };
+    size_t gws[1] = { (size_t) nt * 64 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, comb);
+    if (via_tmp) {
+        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, out_mem, eo->data_device, 0, oo, ggml_nbytes(comb), 0, nullptr,
+                                     nullptr));
+    }
+}
+
 // DSV4_HC_POST (hp) for up to 8 streams and, when sum is set, the sum of its streams
 static void ggml_opencl_dsv4_hc_post_sum(ggml_backend_t backend, const ggml_tensor * hp, const ggml_tensor * sum) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
@@ -9130,6 +9254,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_MUL_MAT) {
+            const int last = ggml_opencl_match_mul_mat_pool_max_div_add(backend_ctx, cgraph, i);
+            if (last > 0) {
+                ggml_opencl_fused_mul_mat_pool_max_div_add(backend, node, cgraph->nodes[last]);
+                i = last;
+                continue;
+            }
+        }
         if (!backend_ctx->disable_fusion && node->op == GGML_OP_RMS_NORM &&
             ggml_opencl_match_rms_norm_mul_mat_add(backend_ctx, cgraph, i)) {
             ggml_opencl_fused_rms_norm_mul_mat_add(backend, cgraph, i);

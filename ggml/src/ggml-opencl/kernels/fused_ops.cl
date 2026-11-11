@@ -105,6 +105,55 @@ kernel void kernel_rms_norm_mul_mat_add_part_f32(
 }
 
 //------------------------------------------------------------------------------
+// group size of mul_mat_pool_max_div_add: nmix and hc*hc <= MUL_MAT_POOL_WG
+#define MUL_MAT_POOL_WG 64
+//------------------------------------------------------------------------------
+// mul_mat_pool_max_div_add: y [hc*hc, t] = c0 + e/rho, e = K m, rho = 1 + max_o e[o]*r[o], m = mixes [nmix, t]
+//------------------------------------------------------------------------------
+kernel void kernel_mul_mat_pool_max_div_add(
+        global const char * src0,
+        ulong offset0,
+        ulong nb01,
+        global const float * chart,
+        ulong offset_c,
+        global char * dst,
+        ulong offsetd,
+        ulong nb1,
+        int hc,
+        int nmix,
+        int nt) {
+    local float m[MUL_MAT_POOL_WG];
+    local float er[MUL_MAT_POOL_WG];
+    const int t = get_group_id(0);
+    const int lid = get_local_id(0);
+    chart = (global const float *) ((global const char *) chart + offset_c);
+    const int hc2 = hc * hc;
+    global const float * K = chart;
+    global const float * r = chart + nmix * hc2;
+    global const float * c0 = r + hc2;
+    global float * y = (global float *) (dst + offsetd + t * nb1);
+    if (lid < nmix) {
+        m[lid] = ((global const float *) (src0 + offset0 + t * nb01))[lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float e = 0.0f;
+    if (lid < hc2) {
+        for (int k = 0; k < nmix; ++k) {
+            e += K[lid * nmix + k] * m[k];
+        }
+        er[lid] = e * r[lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid < hc2) {
+        float mx = er[0];
+        for (int o = 1; o < hc2; ++o) {
+            mx = fmax(mx, er[o]);
+        }
+        y[lid] = c0[lid] + e / (1.0f + mx);
+    }
+}
+
+//------------------------------------------------------------------------------
 // rms_norm_mul_mat_add_reduce: second half of RMS_NORM -> MUL_MAT -> ADD(base).
 //   parts [nmix + 1, nsplit, nt] from kernel_rms_norm_mul_mat_add_part_*: rows 0..nmix-1 partial w.x, row nmix partial x.x
 //   y[k, t] = sum_s parts[k, s, t] / sqrt(sum_s parts[nmix, s, t] / n + eps) + base[k]

@@ -8750,6 +8750,56 @@ struct test_rms_norm_mul_mat_add : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT -> MUL -> POOL_1D(max) -> SCALE -> DIV -> ADD with the constants in views of one tensor,
+// as an mHC combination matrix is built
+struct test_mul_mat_pool_max_div_add : public test_case {
+    const int64_t hc;
+    const int64_t n_mix;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_POOL_MAX_DIV_ADD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(hc, n_mix, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_pool_max_div_add(int64_t hc, int64_t n_mix, int64_t n_tokens)
+        : hc(hc), n_mix(n_mix), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc2 = hc*hc;
+
+        ggml_tensor * chart = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mix*hc2 + 2*hc2);
+        ggml_set_name(chart, "chart");
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_mix, n_tokens);
+        ggml_set_name(mixes, "mixes");
+
+        const size_t es = ggml_element_size(chart);
+        ggml_tensor * K  = ggml_view_2d(ctx, chart, n_mix, hc2, n_mix*es, 0);
+        ggml_tensor * r  = ggml_view_1d(ctx, chart, hc2, n_mix*hc2*es);
+        ggml_tensor * c0 = ggml_view_2d(ctx, chart, hc, hc, hc*es, (n_mix*hc2 + hc2)*es);
+
+        ggml_tensor * e   = ggml_mul_mat(ctx, K, mixes);
+        ggml_tensor * rho = ggml_pool_1d(ctx, ggml_mul(ctx, e, r), GGML_OP_POOL_MAX, hc2, hc2, 0);
+        rho = ggml_reshape_3d(ctx, ggml_scale_bias(ctx, rho, 1.0f, 1.0f), 1, 1, n_tokens);
+
+        ggml_tensor * out = ggml_add(ctx, ggml_div(ctx, ggml_reshape_3d(ctx, e, hc, hc, n_tokens), rho), c0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // r > 0 keeps the divisor rho = 1 + max(e*r) away from zero
+        init_tensor_uniform(ggml_get_tensor(ctx, "chart"), 0.25f, 1.0f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "mixes"), -1.0f, 1.0f);
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12312,6 +12362,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 2048, 17, n_tokens));
     }
     test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F32, 4096, 24, 3));
+
+    for (int64_t n_tokens : {1, 5, 32}) {
+        test_cases.emplace_back(new test_mul_mat_pool_max_div_add(4, 17, n_tokens));
+    }
+    test_cases.emplace_back(new test_mul_mat_pool_max_div_add(2, 6, 3));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
