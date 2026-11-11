@@ -1009,7 +1009,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_conv_2d_f16;
     cl_kernel kernel_conv_2d_f32;
     cl_kernel kernel_conv_2d_f16_f32;
-    cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
+    cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4, kernel_ssm_conv_f32_f32_t;
     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
@@ -3668,6 +3668,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32   = clCreateKernel(prog, "kernel_ssm_conv_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32_4 = clCreateKernel(prog, "kernel_ssm_conv_f32_f32_4", &err), err));
+        CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32_t = clCreateKernel(prog, "kernel_ssm_conv_f32_f32_t", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -15013,6 +15014,11 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
     if (ne10 % 4 == 0) {
         kernel = backend_ctx->kernel_ssm_conv_f32_f32_4;
     }
+    // prefill: tiled kernel (see kernel_ssm_conv_f32_f32_t)
+    const bool tiled = ne1 >= 16 && ne10 <= 8 && nb00 == sizeof(float);
+    if (tiled) {
+        kernel = backend_ctx->kernel_ssm_conv_f32_f32_t;
+    }
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
@@ -15028,6 +15034,15 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb0));
     CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb1));
     CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb2));
+
+    if (tiled) {
+        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int), &ne01));
+        CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int), &ne1));
+        size_t gws[] = { (size_t) CEIL_DIV(ne01, 16) * 16, (size_t) CEIL_DIV(ne1, 16) * 16, (size_t) ne2 };
+        size_t lws[] = { 16, 16, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+        return;
+    }
 
     size_t global_work_size[] = {(size_t)ne01, (size_t)ne1, (size_t)ne2};
     size_t local_work_size[]  = {64, 1, 1};

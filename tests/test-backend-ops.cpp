@@ -12233,6 +12233,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {1280, 512, 1, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {67, 129, 3, 2}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
 
+    // ssm_conv over 16 or more tokens with a channel count that is not a multiple of 16
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4 - 1 + 17, 1000, 2, 1}, {4, 1000, 1, 1}));
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {8 - 1 + 16, 96, 1, 1}, {8, 96, 1, 1}));
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));
