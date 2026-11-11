@@ -21,6 +21,8 @@ static const ggml_opencl_fa_dim g_fa_dims_adreno_default[] = {
     {192, 192, 16, 16, 1, 0},
     {256, 256, 16, 16, 16, 0},
     {512, 512,  8, 16, 64, 0},
+    // absorbed MLA latent head: N_SPLIT 16 divides both DK/4 = 144 and DV/4 = 128
+    { 576, 512, 16, 8,  16, 0  },
 };
 
 struct ggml_opencl_fa_dim_table {

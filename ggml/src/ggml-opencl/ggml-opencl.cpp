@@ -5984,14 +5984,17 @@ static void ggml_opencl_ensure_fa_f32_f16_mq_decode(ggml_backend_opencl_context 
     }
 }
 
-// DK=512 prefill BM-tile
-static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_context * backend_ctx, bool split) {
-    const int dk = 512, dv = 512;
+// DK=512 prefill and DK=576 BM-tile, each in its own FA_PREFILL_ONLY program
+static bool ggml_opencl_ensure_fa_f32_f16_prefill_tile(ggml_backend_opencl_context * backend_ctx,
+                                                       int                           dk,
+                                                       int                           dv,
+                                                       bool                          split) {
     const std::pair<int, int> dk_dv = {dk, dv};
     auto & target = split ? backend_ctx->fa.f32_f16_split : backend_ctx->fa.f32_f16;
     if (target.count(dk_dv) > 0) { return true; }
 
-    static bool failed[2] = { false, false };
+    static bool failed_by_dk[2][2] = {};
+    bool *      failed             = failed_by_dk[dk == 576 ? 1 : 0];
     if (failed[split ? 1 : 0]) { return false; }
 
     const ggml_opencl_fa_dim * cfg = nullptr;
@@ -6000,6 +6003,10 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
     }
     if (cfg == nullptr) { failed[split ? 1 : 0] = true; return false; }
     if (split && cfg->n_split <= 1) { failed[1] = true; return false; }
+    if (split && dk == 576 && (dk / 4 % cfg->n_split != 0 || dv / 4 % cfg->n_split != 0)) {
+        failed[1] = true;
+        return false;
+    }
 
     const ggml_opencl_fa_variant variant = split ? FA_VARIANT_F32_F16_SPLIT : FA_VARIANT_F32_F16;
     std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, variant) + " -D FA_PREFILL_ONLY";
@@ -9142,6 +9149,16 @@ inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+// MLA latent head at decode: one row of n_head heads sharing one KV head is n_head rows of one head, so the tile
+// reads K and V once instead of once per head. Sinks and the ALiBi slope are per head and rule the fold out
+static bool ggml_cl_fa_fold_heads_to_rows(const ggml_tensor * op) {
+    const ggml_tensor * q        = op->src[0];
+    const ggml_tensor * k        = op->src[1];
+    const float         max_bias = ((const float *) op->op_params)[1];
+    return q->ne[0] == 576 && q->ne[1] == 1 && q->ne[2] > 1 && q->ne[3] == 1 && k->ne[2] == 1 &&
+           op->src[4] == nullptr && max_bias == 0.0f;
+}
+
 static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
     if (backend_ctx->fa.kernel_flash_attn_f32_f16_bin == nullptr) {
         return false;
@@ -9698,7 +9715,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 { 40,  40}, { 64,  64}, { 80,  80}, { 96,  96},
                 {112, 112}, {128, 128}, {192, 128},
                 {192, 192}, {256, 256},
-                {512, 512},
+                {512, 512}, {576, 512},
             };
 
             bool dims_supported = false;
@@ -9764,6 +9781,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return false;
             }
 
+            if (dk == 576) {
+                // only the MLA latent head: rows of one or more heads, or one row of many heads folded into rows
+                if (backend_ctx->gpu_family != ADRENO || !is_f32_f16 ||
+                    (q->ne[1] == 1 && !ggml_cl_fa_fold_heads_to_rows(op)) ||
+                    !ggml_opencl_ensure_fa_f32_f16_prefill_tile(backend_ctx, 576, 512, /*split=*/true)) {
+                    return false;
+                }
+            }
             if (dk == 512) {
                 if (backend_ctx->gpu_family == INTEL) {
                     return false;
@@ -9781,7 +9806,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     }
                 } else {
                     // prefill, BM-tile in its own FA_PREFILL_ONLY program
-                    if (!ggml_opencl_ensure_fa_f32_f16_prefill_512(backend_ctx, /*split=*/false)) {
+                    if (!ggml_opencl_ensure_fa_f32_f16_prefill_tile(backend_ctx, 512, 512, /*split=*/false)) {
                         return false;
                     }
                 }
@@ -17957,7 +17982,7 @@ static bool ggml_cl_adreno_xmem_attn_can_use(
     const int n_head_kv = k->ne[2];
     const int n_batch = q->ne[3];
 
-    if (n_q <= 1 || n_kv <= 0 || n_kv > 8192) {
+    if (n_q <= 1 || n_kv <= 0) {
         return false;
     }
     if (d_head_q != k->ne[0] || d_head_v != v->ne[0] || k->ne[1] != v->ne[1] || k->ne[3] != v->ne[3]) {
@@ -18710,16 +18735,43 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    const int n_q = q->ne[1];
+    const bool fold_heads_to_rows = ggml_cl_fa_fold_heads_to_rows(dst);
+
+    const int n_q       = fold_heads_to_rows ? q->ne[2] : q->ne[1];
     const int n_kv = k->ne[1];
     const int d_head_q = q->ne[0];
     const int d_head_v = v->ne[0];
-    const int n_head = q->ne[2];
+    const int n_head    = fold_heads_to_rows ? 1 : q->ne[2];
     const int n_head_kv = k->ne[2];
     const int n_batch = q->ne[3];
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    if (ggml_cl_adreno_xmem_attn_can_use(backend_ctx, q, k, dst)) {
+    if (fold_heads_to_rows) {
+        // the xmem path has no one-row form: present the heads as rows, all reading the one mask row
+        ggml_tensor q_fold = *q;
+        q_fold.ne[1]       = q->ne[2];
+        q_fold.ne[2]       = 1;
+        q_fold.nb[1]       = q->nb[2];
+        q_fold.nb[2] = q_fold.nb[3] = q->nb[2] * q->ne[2];
+
+        ggml_tensor dst_fold = *dst;
+        dst_fold.ne[1]       = 1;
+        dst_fold.ne[2]       = dst->ne[1];
+        dst_fold.nb[2]       = dst->nb[1];
+        dst_fold.nb[3]       = dst->nb[1] * dst->ne[1];
+
+        ggml_tensor mask_fold;
+        if (mask) {
+            mask_fold       = *mask;
+            mask_fold.ne[1] = q->ne[2];
+            mask_fold.nb[1] = 0;
+            dst_fold.src[3] = &mask_fold;
+        }
+        if (ggml_cl_adreno_xmem_attn_can_use(backend_ctx, &q_fold, k, &dst_fold)) {
+            ggml_cl_adreno_xmem_attn_run(backend, &q_fold, k, &dst_fold);
+            return;
+        }
+    } else if (ggml_cl_adreno_xmem_attn_can_use(backend_ctx, q, k, dst)) {
         ggml_cl_adreno_xmem_attn_run(backend, q, k, dst);
         return;
     }
@@ -18754,17 +18806,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     if (is_f16) {
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F16);
     } else if (is_mixed) {
-        if (fa_decode_only_512 && n_q == 1) {
+        if (d_head_q == 576) {
+            GGML_ASSERT(ggml_opencl_ensure_fa_f32_f16_prefill_tile(backend_ctx, 576, 512, /*split=*/true));
+        } else if (fa_decode_only_512 && n_q == 1) {
             GGML_ASSERT(ggml_opencl_ensure_fa_f32_f16_vec_512(backend_ctx));
         } else {
             ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32_F16);
         }
-        if (fa_decode_only_512) {
+        if (d_head_q == 576) {
+            // the tile above is all this shape uses
+        } else if (fa_decode_only_512) {
             // DK=512: the BM-tile prefill kernels are specifically compiled from
             // FA_PREFILL_ONLY
             if (n_q > 1) {
-                ggml_opencl_ensure_fa_f32_f16_prefill_512(backend_ctx, /*split=*/false);
-                ggml_opencl_ensure_fa_f32_f16_prefill_512(backend_ctx, /*split=*/true);
+                ggml_opencl_ensure_fa_f32_f16_prefill_tile(backend_ctx, 512, 512, /*split=*/false);
+                ggml_opencl_ensure_fa_f32_f16_prefill_tile(backend_ctx, 512, 512, /*split=*/true);
             }
         } else {
             ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32_F16_SPLIT);
@@ -18860,7 +18916,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_mem   sinks_buffer = extra_sinks ? extra_sinks->data_device : NULL;
     cl_ulong offset_sinks = extra_sinks ? extra_sinks->offset + sinks->view_offs : 0;
 
-    const cl_ulong q_nb1 = q->nb[1];
+    const cl_ulong q_nb1 = fold_heads_to_rows ? q->nb[2] : q->nb[1];
     const cl_ulong q_nb2 = q->nb[2];
     const cl_ulong q_nb3 = q->nb[3];
 
@@ -18873,10 +18929,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_ulong v_nb3 = v->nb[3];
 
     const cl_ulong o_nb1 = dst->nb[1];
-    const cl_ulong o_nb2 = dst->nb[2];
+    const cl_ulong o_nb2 = fold_heads_to_rows ? dst->nb[1] : dst->nb[2];
     const cl_ulong o_nb3 = dst->nb[3];
 
-    const cl_ulong mask_nb1 = mask ? mask->nb[1] : 0;
+    // all folded rows share the one mask row
+    const cl_ulong mask_nb1 = mask && !fold_heads_to_rows ? mask->nb[1] : 0;
     const cl_ulong mask_nb2 = mask ? mask->nb[2] : 0;
     const cl_ulong mask_nb3 = mask ? mask->nb[3] : 0;
     const int mask_ne2 = mask ? mask->ne[2] : 0;
