@@ -376,7 +376,8 @@ void ggml_cuda_op_hc_pre_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggm
 // ---------------------------------------------------------------------------------------------------------------------
 // one token: RMS_NORM -> MUL_MAT -> ADD -> VIEW -> SIGMOID -> VIEW(pre) -> DSV4_HC_PRE -> RMS_NORM -> MUL in one kernel.
 // Every block computes the partial dot products of one split and one group of rows (as rms_norm_mat_vec_part_f32<1>),
-// then the last block to finish (block counter, zero before the launch) reduces them into the mixes and the sigmoid
+// then the last block to finish (block counter, zero before the launch and set back to zero by that block) reduces
+// them into the mixes and the sigmoid
 // (as rms_norm_mat_vec_reduce_f32) and runs the pre-norm row (as hc_pre_rms_norm_mul_f32).
 
 static constexpr int HC_CHAIN_BLOCK = 256;
@@ -445,6 +446,9 @@ static __global__ void rms_norm_mat_vec_pre_norm_f32(
         return;
     }
     __threadfence();
+    if (threadIdx.x == 0) {
+        *counter = 0;
+    }
 
     float ss = 0.0f;
     for (int i = 0; i < nsplit; ++i) {
@@ -505,8 +509,22 @@ void ggml_cuda_op_rms_norm_mat_vec_pre_norm(ggml_backend_cuda_context & ctx, con
 
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool_alloc<float>        part(ctx.pool(), (size_t) nsplit*(nrows_w + 1));
-    ggml_cuda_pool_alloc<unsigned int> counter(ctx.pool(), 1);
-    CUDA_CHECK(cudaMemsetAsync(counter.get(), 0, sizeof(unsigned int), stream));
+
+    // a persistent counter keeps a memset node out of every CUDA graph launch;
+    // it is created outside of stream capture, so a capture before the first eager run zeroes a temporary one
+    unsigned int *                     counter = ctx.block_counters[ctx.curr_stream_no];
+    ggml_cuda_pool_alloc<unsigned int> counter_tmp(ctx.pool());
+    if (counter == nullptr) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        if (capture == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaMalloc(&ctx.block_counters[ctx.curr_stream_no], sizeof(unsigned int)));
+            counter = ctx.block_counters[ctx.curr_stream_no];
+        } else {
+            counter = counter_tmp.alloc(1);
+        }
+        CUDA_CHECK(cudaMemsetAsync(counter, 0, sizeof(unsigned int), stream));
+    }
 
     hc_chain_pre_norm_params pn;
     pn.x         = (const float *) hx->data;
@@ -527,11 +545,11 @@ void ggml_cuda_op_rms_norm_mat_vec_pre_norm(ggml_backend_cuda_context & ctx, con
     const ggml_cuda_kernel_launch_params lp(grid, dim3(HC_CHAIN_BLOCK), 0, stream);
     if (w->type == GGML_TYPE_F16) {
         ggml_cuda_kernel_launch(rms_norm_mat_vec_pre_norm_f32<half>, lp, (const float *) x->data, (const half *) w->data,
-                part.get(), counter.get(), nrows_w, chunk, sw1, (const float *) bias->data, (float *) add->data,
+                part.get(), counter, nrows_w, chunk, sw1, (const float *) bias->data, (float *) add->data,
                 (float *) sig->data, (int) sig->ne[0], n, eps, pn);
     } else {
         ggml_cuda_kernel_launch(rms_norm_mat_vec_pre_norm_f32<float>, lp, (const float *) x->data, (const float *) w->data,
-                part.get(), counter.get(), nrows_w, chunk, sw1, (const float *) bias->data, (float *) add->data,
+                part.get(), counter, nrows_w, chunk, sw1, (const float *) bias->data, (float *) add->data,
                 (float *) sig->data, (int) sig->ne[0], n, eps, pn);
     }
 }

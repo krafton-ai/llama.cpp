@@ -759,6 +759,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             }
         }
     }
+    for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+        if (block_counters[j] != nullptr) {
+            CUDA_CHECK(cudaFree(block_counters[j]));
+        }
+    }
 }
 
 

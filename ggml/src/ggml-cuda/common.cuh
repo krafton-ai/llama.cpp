@@ -1469,6 +1469,10 @@ struct ggml_backend_cuda_context {
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
+    // one block counter per stream for kernels whose last block finishes the work;
+    // zero between launches: the kernel that uses it sets it back to zero
+    unsigned int * block_counters[GGML_CUDA_MAX_STREAMS] = {};
+
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
