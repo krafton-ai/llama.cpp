@@ -12858,6 +12858,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vt_shared(n_kv));
     }
 
+    // f16 x f32 GEMM with a src1 of 8192 columns
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 8192, 576, {1, 1}, {1, 1}));
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));

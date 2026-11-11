@@ -957,6 +957,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_l4_y8_gqa_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_tiled;
     cl_kernel kernel_adreno_xmem_pack_src_f32;
+    cl_kernel kernel_adreno_xmem_pack_src_f32_k = nullptr;  // optional, K-major work items
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
     cl_kernel kernel_gemm_xmem_f16_f32_os8;
     cl_kernel kernel_adreno_xmem_store_dst_f32;
@@ -1390,6 +1391,9 @@ struct ggml_backend_opencl_context {
 
     ~ggml_backend_opencl_context() {
         release_ncol_kernels();
+        if (kernel_adreno_xmem_pack_src_f32_k) {
+            clReleaseKernel(kernel_adreno_xmem_pack_src_f32_k);
+        }
     }
 
     void free() {
@@ -2894,6 +2898,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_adreno_xmem_pack_src_f32 =
             clCreateKernel(prog, "adreno_xmem_pack_src_f32", &err), err));
+        // the same pack with the work items along K: optional, see ggml_cl_mul_mat_f16_f32_adreno_xmem
+        if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+            const std::string pack_src {
+                #include "gemm_xmem_pack_src_f32_k.cl.h"
+            };
+#else
+            const std::string pack_src = read_file("gemm_xmem_pack_src_f32_k.cl");
+#endif
+            cl_program pack_prog = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
+                pack_src.c_str(), compile_opts, false, "gemm_xmem_pack_src_f32_k", backend_ctx->queue);
+            if (pack_prog) {
+                backend_ctx->kernel_adreno_xmem_pack_src_f32_k = ggml_cl_create_optional_kernel(backend_ctx, pack_prog,
+                    "adreno_xmem_pack_src_f32_k", 256);
+                CL_CHECK(clReleaseProgram(pack_prog));
+            }
+        }
+
         CL_CHECK((backend_ctx->kernel_adreno_xmem_prepack_weight_f16 =
             clCreateKernel(prog, "adreno_xmem_prepack_weight_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_xmem_f16_f32_os8 =
@@ -21340,7 +21362,16 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     size_t gws = CEIL_DIV(static_cast<size_t>(kpack) * static_cast<size_t>(npack_padded), lws) * lws;
     backend_ctx->enqueue_ndrange_kernel(prepack, 1, &gws, &lws, dst);
 
-    cl_kernel pack_src = backend_ctx->kernel_adreno_xmem_pack_src_f32;
+    // the K-major pack for one exact shape; it reads K x N floats of src1, so check the buffer holds them
+    size_t         src1_size  = 0;
+    const cl_ulong src1_bytes = (cl_ulong) K * (cl_ulong) N * sizeof(float);
+    const bool     use_pack_k =
+        backend_ctx->kernel_adreno_xmem_pack_src_f32_k && ggml_is_contiguous(src1) && src1->type == GGML_TYPE_F32 &&
+        K >= 64 && K <= 16384 && K % 64 == 0 && M == 512 && N == 8192 && offset1 % 4 == 0 &&
+        clGetMemObjectInfo(extra1->data_device, CL_MEM_SIZE, sizeof(src1_size), &src1_size, nullptr) == CL_SUCCESS &&
+        offset1 <= src1_size && src1_bytes <= src1_size - offset1;
+    cl_kernel pack_src =
+        use_pack_k ? backend_ctx->kernel_adreno_xmem_pack_src_f32_k : backend_ctx->kernel_adreno_xmem_pack_src_f32;
     CL_CHECK(clSetKernelArg(pack_src, 0, sizeof(cl_mem),   &extra1->data_device));
     CL_CHECK(clSetKernelArg(pack_src, 1, sizeof(cl_ulong), &offset1));
     CL_CHECK(clSetKernelArg(pack_src, 2, sizeof(cl_mem),   &src_img));
@@ -21351,6 +21382,11 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
         CEIL_DIV(static_cast<size_t>(N), pack_src_lws[0])*pack_src_lws[0],
         CEIL_DIV(static_cast<size_t>(kpack), pack_src_lws[1])*pack_src_lws[1]
     };
+    if (use_pack_k) {
+        const size_t gws0 = pack_src_gws[0];
+        pack_src_gws[0]   = pack_src_gws[1];
+        pack_src_gws[1]   = gws0;
+    }
     backend_ctx->enqueue_ndrange_kernel(pack_src, 2, pack_src_gws, pack_src_lws, dst);
 
     cl_kernel gemm = backend_ctx->kernel_gemm_xmem_f16_f32_os8;
