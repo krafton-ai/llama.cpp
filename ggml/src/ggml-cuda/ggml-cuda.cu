@@ -3395,6 +3395,47 @@ static bool ggml_cuda_state_rows_can_skip(ggml_backend_cuda_context * cuda_ctx, 
     return false;
 }
 
+// gated RMS norm: RMS_NORM(x) -> MUL(w) ... UNARY(g) -> MUL, w broadcast along the rows, unary SIGMOID or SILU.
+// Returns the index of the last MUL or -1
+static int ggml_cuda_match_rms_norm_mul_gate(const ggml_cgraph * cgraph, int i) {
+    if (i + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * rms  = cgraph->nodes[i];
+    const ggml_tensor * mulw = cgraph->nodes[i + 1];
+    const int j_gate = ggml_cuda_next_compute_node(cgraph, i + 1);
+    const int j_out  = j_gate < 0 ? -1 : ggml_cuda_next_compute_node(cgraph, j_gate);
+    if (rms->op != GGML_OP_RMS_NORM || mulw->op != GGML_OP_MUL || j_out < 0) {
+        return -1;
+    }
+    const ggml_tensor * gate = cgraph->nodes[j_gate];
+    const ggml_tensor * out  = cgraph->nodes[j_out];
+    if (gate->op != GGML_OP_UNARY || out->op != GGML_OP_MUL ||
+            (ggml_get_unary_op(gate) != GGML_UNARY_OP_SIGMOID && ggml_get_unary_op(gate) != GGML_UNARY_OP_SILU) ||
+            !((out->src[0] == mulw && out->src[1] == gate) || (out->src[0] == gate && out->src[1] == mulw)) ||
+            !(mulw->src[0] == rms || mulw->src[1] == rms)) {
+        return -1;
+    }
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mulw->src[0] == rms ? mulw->src[1] : mulw->src[0];
+    const ggml_tensor * g = gate->src[0];
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 ||
+            mulw->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
+            x->nb[0] != sizeof(float) || g->nb[0] != sizeof(float) || !ggml_is_contiguous(w) || w->ne[0] != x->ne[0] ||
+            ggml_nrows(w) != 1 || !ggml_are_same_shape(x, g) || !ggml_are_same_shape(x, mulw) ||
+            !ggml_are_same_shape(x, out) || !ggml_is_contiguous(out)) {
+        return -1;
+    }
+    const int          idxs[] = { i, i + 1, j_gate, j_out };
+    const ggml_op      ops[]  = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+    const int          outs[] = { j_out };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, outs, 1) || ggml_cuda_tensors_overlap(out, x, true) ||
+            ggml_cuda_tensors_overlap(out, w) || ggml_cuda_tensors_overlap(out, g)) {
+        return -1;
+    }
+    return j_out;
+}
+
 // [ADD(x, bias)] -> SIGMOID -> SCALE, the bias broadcast along the rows. Returns the number of nodes or 0
 static int ggml_cuda_match_add_sigmoid_scale(const ggml_cgraph * cgraph, int i) {
     const bool    with_add  = cgraph->nodes[i]->op == GGML_OP_ADD;
@@ -4597,6 +4638,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_conv_state(*cuda_ctx, m.args);
                 return m.last - i;
             }
+        }
+    }
+
+    // gated RMS norm: RMS_NORM -> MUL(w) ... SIGMOID|SILU(g) -> MUL
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int j_out = ggml_cuda_match_rms_norm_mul_gate(cgraph, i);
+        if (j_out > 0) {
+            ggml_tensor * gate = cgraph->nodes[ggml_cuda_next_compute_node(cgraph, i + 1)];
+            ggml_cuda_op_rms_norm_mul_gate(*cuda_ctx, node, cgraph->nodes[i + 1], gate, cgraph->nodes[j_out]);
+            return j_out - i;
         }
     }
 

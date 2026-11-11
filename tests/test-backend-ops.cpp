@@ -5882,6 +5882,46 @@ struct test_bias_sigmoid_scale : public test_case {
     }
 };
 
+// MUL(MUL(RMS_NORM(x), w), unary(g)) with g a view of a wider projection (the gated output norm of a gated delta net
+// layer: SIGMOID for Raon-1 nano, SILU for qwen3next)
+struct test_rms_norm_mul_gate : public test_case {
+    const int64_t      head_dim;
+    const int64_t      n_head;
+    const int64_t      n_tokens;
+    const ggml_unary_op gate_op;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_GATE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_dim, n_head, n_tokens, gate_op);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_rms_norm_mul_gate(int64_t head_dim = 128, int64_t n_head = 4, int64_t n_tokens = 1,
+            ggml_unary_op gate_op = GGML_UNARY_OP_SIGMOID)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens), gate_op(gate_op) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d = head_dim*n_head;
+        ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_tensor * w    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor * proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*d, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+        ggml_set_name(proj, "proj");
+        ggml_tensor * g = ggml_view_3d(ctx, proj, head_dim, n_head, n_tokens, ggml_row_size(proj->type, head_dim), proj->nb[1],
+                3*ggml_row_size(proj->type, d));
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_exp(ctx, x), 1e-6f), w);
+        ggml_tensor * out = ggml_mul(ctx, normed, ggml_unary(ctx, g, gate_op));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -13705,6 +13745,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_bias_sigmoid_scale(2048,   7, true));
     test_cases.emplace_back(new test_bias_sigmoid_scale( 512, 512, true));
     test_cases.emplace_back(new test_bias_sigmoid_scale( 512,   7, false));
+    test_cases.emplace_back(new test_rms_norm_mul_gate(128,  4,   1, GGML_UNARY_OP_SIGMOID));
+    test_cases.emplace_back(new test_rms_norm_mul_gate(128, 16,   7, GGML_UNARY_OP_SIGMOID));
+    test_cases.emplace_back(new test_rms_norm_mul_gate(128,  4, 512, GGML_UNARY_OP_SIGMOID));
+    test_cases.emplace_back(new test_rms_norm_mul_gate( 64,  4,   7, GGML_UNARY_OP_SILU));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
