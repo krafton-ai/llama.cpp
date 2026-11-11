@@ -597,10 +597,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
         switch (ncols_dst) {
             case 1:
                 if (small_k) {
-                    return nwarps;
+                    return table_id == MMVQ_PARAMETERS_TURING ? 4 : nwarps;
                 }
                 if (table_id == MMVQ_PARAMETERS_GB10) {
                     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
+                }
+                if (table_id == MMVQ_PARAMETERS_TURING) {
+                    // 4 rows per block keep more weight loads in flight (faster single-token decode for Q4_K/Q6_K/Q8_0)
+                    return 4;
                 }
                 return table_id == MMVQ_PARAMETERS_GENERIC && mmvq_two_rows_ncols1(type) ? 2 : 1;
             case 2:
