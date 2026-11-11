@@ -12820,6 +12820,19 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_CPY:
     case GGML_OP_CONT:
     case GGML_OP_DUP:
+        if (ctx->fused_cont_mul) {
+            // the MUL in the shape of the CONT source (a CONT may also reshape, ggml_cont_2d): src1 and dst as contiguous
+            // tensors of that shape
+            ggml_tensor * mul = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+            ggml_tensor b = *mul->src[1];
+            ggml_tensor d = *mul;
+            for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+                b.ne[k] = d.ne[k] = src0->ne[k];
+                b.nb[k] = d.nb[k] = k == 0 ? sizeof(float) : b.nb[k - 1]*b.ne[k - 1];
+            }
+            ggml_vk_mul(ctx, compute_ctx, src0, &b, &d);
+            break;
+        }
         ggml_vk_cpy(ctx, compute_ctx, src0, node);
 
         break;
@@ -14193,6 +14206,10 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_are_same_shape(scale_in->src[0], scale_out);
 }
 
+// CONT of a non-contiguous tensor whose only reader is (a reshape of it as) src0 of an elementwise MUL with a
+// contiguous src1 of the same size, as the gated MLA output of Raon-1 (llm_graph_context::build_attn_mha with v_mla
+// makes the permuted output contiguous for the reshape): the MUL reads the non-contiguous tensor itself.
+// Returns the MUL index, or -1
 // A MUL_MAT of an f16 matrix by a contiguous f32 one (a mat-mat multiply, 2D) followed by the CPY of its result to a
 // contiguous f16 tensor of the same shape, the only use of that result: one multiply writing f16 (matmul *_d16). The
 // graph optimizer puts such a CPY right after its MUL_MAT and keeps the multiply's inputs alive through it.
@@ -14229,6 +14246,30 @@ static bool ggml_vk_fuse_mul_mat_cpy_f16(const ggml_backend_vk_context * ctx, co
         }
     }
     return (mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+}
+
+static int ggml_vk_fuse_cont_mul(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED(ctx);
+    const ggml_tensor *cont = cgraph->nodes[node_idx];
+    if (cont->op != GGML_OP_CONT || cont->type != GGML_TYPE_F32 || cont->src[0]->type != GGML_TYPE_F32 ||
+            !ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+        return -1;
+    }
+    int j = node_idx + 1;
+    while (j < cgraph->n_nodes && j <= node_idx + 4 && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor *mul = cgraph->nodes[j];
+    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) ||
+            !(mul->src[0] == cont || (mul->src[0]->view_src == cont && mul->src[0]->view_offs == 0)) ||
+            mul->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul->src[1]) ||
+            ggml_nelements(mul->src[1]) != ggml_nelements(cont) || ggml_nelements(mul) != ggml_nelements(cont)) {
+        return -1;
+    }
+    return j;
 }
 
 // A mat-vec whose output is the branch input x of a 4-stream hc_post (DSV4_HC_POST with comb), one token: the mat-vec
@@ -15164,6 +15205,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_select = false;
         ctx->fused_mul_mat_vec_glu = 0;
         ctx->fused_mul_mat_vec_hc_post = false;
+        ctx->fused_cont_mul = false;
         ctx->fused_mul_mat_cpy_f16 = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
@@ -15203,6 +15245,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_CPY_F16";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (const int i_mul = ggml_vk_fuse_cont_mul(ctx, cgraph, i); i_mul > 0) {
+                ctx->num_additional_fused_ops = i_mul - i;
+                ctx->fused_cont_mul = true;
+                fusion_string = "CONT_MUL";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // src1 of the MUL is elementwise
+                op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = true;
             } else if (const int i_hp = ggml_vk_fuse_mul_mat_hc_post(ctx, cgraph, i); i_hp > 0) {
                 ctx->num_additional_fused_ops = i_hp - i;
                 ctx->fused_mul_mat_vec_hc_post = true;
@@ -15467,6 +15516,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_select = false;
                 ctx->fused_mul_mat_vec_glu = 0;
                 ctx->fused_mul_mat_vec_hc_post = false;
+                ctx->fused_cont_mul = false;
                 ctx->fused_mul_mat_cpy_f16 = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
@@ -15724,6 +15774,19 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         params->add_alloc_dep(params->user_data, glu->src[0]->src[1], glu);
     }
 
+    // a CONT read only by a MUL (ggml_vk_fuse_cont_mul): the MUL reads the CONT source, keep it alive through the MUL;
+    // the CONT starts its own run with the MUL (below)
+    std::set<const ggml_tensor *> mul_conts;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * mul = graph->nodes[i];
+        if (mul->op != GGML_OP_MUL || !mul->src[0]->view_src || mul->src[0]->view_src->op != GGML_OP_CONT) {
+            continue;
+        }
+        mul_conts.insert(mul->src[0]->view_src);
+        ggml_tensor * src = mul->src[0]->view_src->src[0];
+        params->add_alloc_dep(params->user_data, src->view_src ? src->view_src : src, mul);
+    }
+
     int first_unused = 0;
 
     // scheduled or zero-compute nodes in [lo, hi)
@@ -15835,6 +15898,45 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(rope_view_set_rows_pattern)) {
             continue;
         }
+        // a CONT and the MUL that reads (a reshape of) it in a row, for the MUL reading the CONT source itself
+        // (ggml_vk_fuse_cont_mul), when the MUL's other source is ready
+        if (mul_conts.count(graph->nodes[first_unused])) {
+            ggml_tensor * cont = graph->nodes[first_unused];
+            const int end = std::min(first_unused + 32, graph->n_nodes);
+            int j_mul = -1;
+            for (int j = first_unused + 1; j < end; ++j) {
+                const ggml_tensor * n = graph->nodes[j];
+                if (n->op == GGML_OP_MUL && (n->src[0] == cont || n->src[0]->view_src == cont)) {
+                    j_mul = j;
+                    break;
+                }
+            }
+            bool ready = j_mul > 0 && !used[j_mul];
+            for (int k = first_unused + 1; ready && k < j_mul; ++k) {
+                if (!used[k] && graph->nodes[k] == graph->nodes[j_mul]->src[1]) {
+                    ready = false;
+                }
+            }
+            if (ready) {
+                // the CONT, its views (the reshape the MUL reads), the MUL
+                std::vector<int> order = { first_unused };
+                for (int k = first_unused + 1; k < j_mul; ++k) {
+                    if (!used[k] && graph->nodes[k]->view_src == cont && is_empty(graph->nodes[k])) {
+                        order.push_back(k);
+                    }
+                }
+                order.push_back(j_mul);
+                for (int j : order) {
+                    new_order.push_back(graph->nodes[j]);
+                    used_node_set.insert(graph->nodes[j]);
+                    used[j] = true;
+                }
+                while (first_unused < graph->n_nodes && used[first_unused]) {
+                    first_unused++;
+                }
+                continue;
+            }
+        }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
@@ -15883,7 +15985,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
-                match_pattern(hc_post_gate_pattern, j)) {
+                match_pattern(hc_post_gate_pattern, j) ||
+                // start their own runs (above)
+                mul_conts.count(graph->nodes[j])) {
                 continue;
             }
             bool ok = true;
@@ -15893,6 +15997,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
+                    // a CONT and the MUL that reads (a reshape of) it: the MUL reads the CONT source itself
+                    !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_CONT && graph->nodes[j]->op == GGML_OP_MUL &&
+                      graph->nodes[j]->src[0]->view_src == graph->nodes[c] && empty_or_scheduled_between(c+1, j)) &&
                     // a mat-vec and the hc_post of its output: keep the pair together for the mat-vec epilogue
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_DSV4_HC_POST &&
                       graph->nodes[j]->src[0] == graph->nodes[c] && empty_or_scheduled_between(c+1, j)) &&

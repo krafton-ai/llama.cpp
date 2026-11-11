@@ -1320,6 +1320,7 @@ struct ggml_backend_vk_context {
     int  hc_select_run[16] {};
     int  fused_mul_mat_vec_glu {};  // 1: [gate | up] swiglu, 2: geglu with an external second input
     bool fused_mul_mat_vec_hc_post {};
+    bool fused_cont_mul {};
     bool fused_mul_mat_cpy_f16 = false; // a MUL_MAT and the CPY of its result to f16 as one multiply writing f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
