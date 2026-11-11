@@ -9162,6 +9162,52 @@ struct test_gated_delta_net_state_cpy : public test_case {
     }
 };
 
+// GGML_OP_CONT(TRANSPOSE(V)) + GGML_OP_MUL_MAT: the attention output of n_head heads against one V that is a view
+// of the K cache (absorbed MLA without FA)
+struct test_mul_mat_vt_shared : public test_case {
+    const int64_t n_kv;
+    const int64_t d_k;
+    const int64_t d_v;
+    const int64_t n_head;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONT_TRANSPOSE_MUL_MAT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_kv, d_k, d_v, n_head);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_vt_shared(int64_t n_kv, int64_t d_k = 576, int64_t d_v = 512, int64_t n_head = 32)
+        : n_kv(n_kv), d_k(d_k), d_v(d_v), n_head(n_head) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d_k, n_kv);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * p = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, 1, n_head);
+        ggml_set_name(p, "p");
+
+        ggml_tensor * v  = ggml_view_2d(ctx, cache, d_v, n_kv, cache->nb[1], 0);
+        ggml_tensor * vt = ggml_cont(ctx, ggml_transpose(ctx, v));
+
+        ggml_tensor * out = ggml_mul_mat(ctx, vt, p);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_tensor_uniform(ggml_get_tensor(ctx, "cache"));
+        init_tensor_uniform(ggml_get_tensor(ctx, "p"), 0.0f, 1.0f);
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12763,6 +12809,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_state_cpy(4, 32,  1, 1));
     test_cases.emplace_back(new test_gated_delta_net_state_cpy(4, 64,  5, 2));
     test_cases.emplace_back(new test_gated_delta_net_state_cpy(8, 128, 1, 1));
+
+    for (int64_t n_kv : {300, 1280}) {
+        test_cases.emplace_back(new test_mul_mat_vt_shared(n_kv));
+    }
+    test_cases.emplace_back(new test_mul_mat_vt_shared(1000, 192, 128));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

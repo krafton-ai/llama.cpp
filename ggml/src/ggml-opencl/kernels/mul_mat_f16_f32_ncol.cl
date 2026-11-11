@@ -15,6 +15,8 @@
 // Decode attention of one KV head against NCOL query heads without flash attention, as two matrix
 // multiplies with the heads as the columns:
 //   scores[j][h] = sum_k K[j][k] * q[h][k]      kernel_mul_mat_f16_f32_ncol: K rows streamed once, q in local memory
+//   out[d][h]    = sum_j V[j][d] * P[h][j]      kernel_mul_mat_f16t_f32_ncol_split (+ _reduce): V read in its cache
+//                                               layout, so the transposed copy the graph asks for is not made
 #define NCOL 32
 
 #define NCOL_RED8(v, o)                     \
@@ -126,4 +128,82 @@ kernel void kernel_mul_mat_f16_f32_ncol(
             NCOL_STORE8(acc3, out, s)
         }
     }
+}
+
+//------------------------------------------------------------------------------
+// part[s][n][d] = sum_{j in split s} V[j][d] * P[n][j]; V f16 with d contiguous and row stride nbvj (the latent
+// cache rows), P f32 rows of stride nbp1. Work-group 64 lanes = 64 consecutive d (one coalesced row read per j),
+// one group per (d block, split of JC rows); the split's P rows sit in local memory and every lane reads the
+// same NCOL values of a j (broadcast). kernel_mul_mat_ncol_split_reduce sums the splits into D[n][d].
+//------------------------------------------------------------------------------
+#define NCOL_JC 128
+
+kernel void kernel_mul_mat_f16t_f32_ncol_split(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D,
+        int JC) {
+    local float Pl[NCOL_JC][NCOL + 4];
+
+    const int lid = get_local_id(0);  // 0..63
+    const int d = get_group_id(0) * 64 + lid;
+    const int s = get_group_id(1);
+    const int j0 = s * JC;
+    const int jn = min(JC, J - j0);
+
+    v += offv;
+    p += offp;
+
+    for (int n = 0; n < NCOL; ++n) {
+        global const float * pn = (global const float *) (p + (ulong) n * nbp1) + j0;
+        for (int jj = lid; jj < NCOL_JC; jj += 64) {
+            Pl[jj][n] = jj < jn ? pn[jj] : 0.0f;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (d >= D) {
+        return;
+    }
+    float8 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    global const char * vd = v + (ulong) j0 * nbvj + (ulong) d * sizeof(half);
+    for (int jj = 0; jj < jn; ++jj) {
+        const float8 vv = (float8) (vload_half(0, (global const half *) (vd + (ulong) jj * nbvj)));
+        acc0 = mad(vv, vload8(0, &Pl[jj][0]), acc0);
+        acc1 = mad(vv, vload8(1, &Pl[jj][0]), acc1);
+        acc2 = mad(vv, vload8(2, &Pl[jj][0]), acc2);
+        acc3 = mad(vv, vload8(3, &Pl[jj][0]), acc3);
+    }
+
+    global float * out = part + ((ulong) s * NCOL) * D + d;
+    NCOL_STORE8(acc0, out, D) out += 8 * D;
+    NCOL_STORE8(acc1, out, D) out += 8 * D;
+    NCOL_STORE8(acc2, out, D) out += 8 * D;
+    NCOL_STORE8(acc3, out, D)
+}
+
+kernel void kernel_mul_mat_ncol_split_reduce(
+        global const float * part,
+        global char * d,
+        ulong offd,
+        ulong nbd1,
+        int n_split,
+        int D) {
+    const int gid = get_global_id(0);
+    if (gid >= NCOL * D) {
+        return;
+    }
+    const int n = gid / D;
+    const int dd = gid - n * D;
+    float sum = 0.0f;
+    for (int s = 0; s < n_split; ++s) {
+        sum += part[((ulong) s * NCOL + n) * D + dd];
+    }
+    *(global float *) (d + offd + (ulong) n * nbd1 + (ulong) dd * sizeof(float)) = sum;
 }

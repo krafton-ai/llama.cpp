@@ -858,6 +858,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_pool_1d_f32;
     // decode attention of one KV head against 32 query heads without FA (kernels/mul_mat_f16_f32_ncol*.cl)
     cl_kernel kernel_mul_mat_f16_f32_ncol                    = nullptr;
+    cl_kernel kernel_mul_mat_f16t_f32_ncol_split             = nullptr;
+    cl_kernel kernel_mul_mat_ncol_split_reduce               = nullptr;
+    ggml_cl_buffer prealloc_ncol_part;      // the split partial sums of kernel_mul_mat_f16t_f32_ncol_split
     // fused op chains (kernels/fused_ops.cl)
     cl_kernel kernel_rms_norm_mul_mat_add_part_f16 = nullptr;
     cl_kernel kernel_rms_norm_mul_mat_add_part_f32 = nullptr;
@@ -1733,6 +1736,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             kernel_src.c_str(), compile_opts, false, "mul_mat_f16_f32_ncol");
         if (prog) {
             CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_ncol        = clCreateKernel(prog, "kernel_mul_mat_f16_f32_ncol", &err), err));
+            CL_CHECK((backend_ctx->kernel_mul_mat_f16t_f32_ncol_split = clCreateKernel(prog, "kernel_mul_mat_f16t_f32_ncol_split", &err), err));
+            CL_CHECK((backend_ctx->kernel_mul_mat_ncol_split_reduce   = clCreateKernel(prog, "kernel_mul_mat_ncol_split_reduce", &err), err));
         }
         GGML_LOG_CONT(".");
 
@@ -9058,6 +9063,8 @@ static bool ggml_opencl_match_concat_ssm_conv_silu(const ggml_cgraph * cgraph, i
 static void                ggml_opencl_fused_concat_ssm_conv_silu(ggml_backend_t            backend,
                                                                   const ggml_tensor *       cat,
                                                                   const ggml_tensor * const nodes[3]);
+static const ggml_tensor * ggml_opencl_ncol_split_mul_mat_node(const ggml_cgraph * cgraph, int i, size_t max_alloc);
+static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor * cont, ggml_tensor * mm);
 
 // Fused op chains (kernels/fused_ops.cl): each matcher checks one chain, each runner computes it with one kernel.
 
@@ -9850,6 +9857,9 @@ static void ggml_opencl_fused_concat_ssm_conv_silu(ggml_backend_t            bac
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     const ggml_tensor *          cpy_skip        = nullptr;
+    // a CONT of the transposed latent V left to the MUL_MAT that reads it (ggml_opencl_ncol_split_mul_mat_node)
+    const ggml_tensor *          ncol_split_cont = nullptr;
+    const ggml_tensor *          ncol_split_mm   = nullptr;
     // nodes already computed by a fused kernel at an earlier node
     const ggml_tensor *          fused_skip[3]   = {};
 
@@ -9878,6 +9888,21 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             }
         }
         if (node == cpy_skip || node == fused_skip[0] || node == fused_skip[1] || node == fused_skip[2]) {
+            continue;
+        }
+        if (!backend_ctx->disable_fusion && backend_ctx->kernel_mul_mat_f16t_f32_ncol_split != nullptr &&
+            node->op == GGML_OP_CONT && ncol_split_mm == nullptr) {
+            const ggml_tensor * mm = ggml_opencl_ncol_split_mul_mat_node(cgraph, i, backend_ctx->max_alloc_size);
+            if (mm) {
+                ncol_split_cont = node;
+                ncol_split_mm   = mm;
+                continue;
+            }
+        }
+        if (node == ncol_split_mm) {
+            ggml_cl_mul_mat_ncol_split(backend, ncol_split_cont, node);
+            ncol_split_cont = nullptr;
+            ncol_split_mm   = nullptr;
             continue;
         }
         if (!backend_ctx->disable_fusion && node->op == GGML_OP_UNARY) {
@@ -25452,6 +25477,110 @@ static cl_mem ggml_cl_img_pool_get_or_create(
     entry.channel_data_type = channel_data_type;
     pool[key] = entry;
     return img;
+}
+
+// the split partial sums fit in one allocation (sized for the generic split; the JC = 256 variants need less)
+static bool ggml_cl_ncol_split_fits(int64_t rows, int64_t width, size_t limit) {
+    if (rows <= 0 || rows > INT32_MAX - 255 || width <= 0 || width > (INT32_MAX - 255) / 32) {
+        return false;
+    }
+    const int64_t chunk  = rows >= 4096 ? 128 : rows >= 1024 ? 64 : 32;
+    const size_t  splits = 1 + (size_t) ((rows - 1) / chunk);
+    return splits <= limit / 32 / sizeof(float) / (size_t) width;
+}
+
+// the 32 columns of P and rows of dst, as dim 1 or dim 2 (the decode graph has them in dim 2)
+static bool ggml_cl_ncol_split_cols_ok(const ggml_tensor * t, int64_t ne0) {
+    return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->ne[0] == ne0 && t->ne[3] == 1 &&
+           ((t->ne[1] == 1 && t->ne[2] == 32) || (t->ne[1] == 32 && t->ne[2] == 1));
+}
+
+// 32 query heads' probabilities against one latent V that the graph transposes and copies first (MLA decode
+// without FA). The CONT at node i is skipped and the MUL_MAT that reads it runs on the cache view. Returns that
+// MUL_MAT, or nullptr
+static const ggml_tensor * ggml_opencl_ncol_split_mul_mat_node(const ggml_cgraph * cgraph, int i, size_t max_alloc) {
+    const ggml_tensor * cont = cgraph->nodes[i];
+    const ggml_tensor * view = cont->src[0];
+    if ((cont->flags & GGML_TENSOR_FLAG_OUTPUT) || cont->type != GGML_TYPE_F16 || view->type != GGML_TYPE_F16 ||
+        !ggml_is_contiguous(cont) || view->ne[2] != 1 || view->ne[3] != 1 || view->ne[0] < 1 || view->ne[1] < 1 ||
+        view->nb[1] != sizeof(ggml_fp16_t) || view->nb[0] == sizeof(ggml_fp16_t) ||
+        view->nb[0] % sizeof(ggml_fp16_t) != 0) {
+        return nullptr;
+    }
+    const ggml_tensor * mm = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes && mm == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_MUL_MAT && n->src[0] == cont) {
+            mm = n;
+        }
+    }
+    if (mm == nullptr || !ggml_opencl_only_users(cgraph, cont, mm, nullptr)) {
+        return nullptr;
+    }
+    const ggml_tensor * p = mm->src[1];
+    const int64_t       J = view->ne[0];
+    const int64_t       D = view->ne[1];
+    if (!ggml_cl_ncol_split_fits(J, D, max_alloc) || !ggml_cl_ncol_split_cols_ok(p, J) ||
+        !ggml_cl_ncol_split_cols_ok(mm, D)) {
+        return nullptr;
+    }
+    return mm;
+}
+
+static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor * cont, ggml_tensor * mm) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    const ggml_tensor *           view        = cont->src[0];
+    const ggml_tensor *           p           = mm->src[1];
+    GGML_ASSERT(view->extra && p->extra && mm->extra);
+    ggml_tensor_extra_cl * extrav     = (ggml_tensor_extra_cl *) view->extra;
+    ggml_tensor_extra_cl * extrap     = (ggml_tensor_extra_cl *) p->extra;
+    ggml_tensor_extra_cl * extrad     = (ggml_tensor_extra_cl *) mm->extra;
+    const cl_ulong         offv       = extrav->offset + view->view_offs;
+    const cl_ulong         offp       = extrap->offset + p->view_offs;
+    const cl_ulong         offd       = extrad->offset + mm->view_offs;
+    const cl_ulong         nbv0       = view->nb[0];
+    const cl_ulong         nbp1       = p->ne[1] == 1 ? p->nb[2] : p->nb[1];
+    const cl_ulong         nbd1       = mm->ne[1] == 1 ? mm->nb[2] : mm->nb[1];
+    const int              J          = (int) view->ne[0];
+    const int              D          = (int) view->ne[1];
+
+    const int JC      = J >= 4096 ? 128 : J >= 1024 ? 64 : 32;
+    const int n_split = CEIL_DIV(J, JC);
+
+    backend_ctx->prealloc_ncol_part.allocate(backend_ctx->context, (size_t) n_split * 32 * D * sizeof(float));
+
+    {
+        cl_kernel kernel = backend_ctx->kernel_mul_mat_f16t_f32_ncol_split;
+
+        cl_uint idx = 0;
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &extrav->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offv));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbv0));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &extrap->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offp));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbp1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &backend_ctx->prealloc_ncol_part.buffer));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &J));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &D));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &JC));
+
+        size_t lws[2] = { 64, 1 };
+        size_t gws[2] = { (size_t) CEIL_DIV(D, 64) * 64, (size_t) n_split };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, mm);
+    }
+    {
+        cl_kernel kernel = backend_ctx->kernel_mul_mat_ncol_split_reduce;
+        cl_uint   idx    = 0;
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &backend_ctx->prealloc_ncol_part.buffer));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offd));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbd1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &n_split));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &D));
+        size_t lws[1] = { 256 };
+        size_t gws[1] = { (size_t) CEIL_DIV(32 * D, 256) * 256 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, mm);
+    }
 }
 
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
