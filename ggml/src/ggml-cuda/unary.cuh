@@ -81,6 +81,12 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// GLU ops whose F32 kernel can also write its output (one row) quantized to q8_1 for mul_mat_vec_q
+bool ggml_cuda_glu_q8_1_supported(const ggml_tensor * dst);
+
+// the GLU of dst for one row, also written quantized to q8_1 (as quantize_row_q8_1_cuda, zero padded to ncols_padded)
+void ggml_cuda_op_glu_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * dst_q8_1, int64_t ncols_padded);
+
 void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

@@ -3954,6 +3954,130 @@ struct test_rms_norm_mul_mat_vec : public test_case {
     }
 };
 
+// a producer of one row followed by MUL_MAT(quantized weight, one row) x n, consecutive nodes that read its output
+// (fused on CUDA: the producer writes the q8_1 input of the mat-vec products). Producers:
+//   HC_PRE_NORM: the mHC mix and pre-norm of one token (RMS_NORM, MUL_MAT, ADD, SIGMOID, DSV4_HC_PRE, RMS_NORM, MUL)
+//   GATED_NORM:  MUL(MUL(RMS_NORM(x), w), SIGMOID(g)) over heads, the products reading all heads as one row
+//   GLU:         SWIGLU of one row (split: GEGLU of two tensors)
+//   FFN:         RMS_NORM, MUL, MUL_MAT(up), SWIGLU: the norm and the GLU both feed products
+struct test_mat_vec_q8_1_producer : public test_case {
+    enum producer_t { HC_PRE_NORM, GATED_NORM, GLU, GLU_SPLIT, FFN };
+
+    const producer_t producer;
+    const std::vector<ggml_type> types_w; // one product per entry
+    const int64_t n;                      // length of the producer output
+    const int64_t m;                      // rows of the weights
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        switch (producer) {
+            case HC_PRE_NORM: return "HC_PRE_NORM_MAT_VEC";
+            case GATED_NORM:  return "RMS_NORM_MUL_GATE_MAT_VEC";
+            case FFN:         return "RMS_NORM_MUL_MAT_GLU_MAT_VEC";
+            default:          return "GLU_MAT_VEC";
+        }
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        std::string types;
+        for (ggml_type t : types_w) {
+            types += (types.empty() ? "" : "+") + std::string(ggml_type_name(t));
+        }
+        return "types_w=" + types + "," + VARS_TO_STR2(n, m) + (producer == GLU_SPLIT ? ",split" : "");
+    }
+
+    double max_nmse_err() override {
+        // FFN chains two quantized products: the CPU quantizes the activations to Q8_K, CUDA to q8_1, and the
+        // difference of the first product carries into the second
+        return producer == FFN ? 2e-3 : 5e-4;
+    }
+
+    test_mat_vec_q8_1_producer(producer_t producer, std::vector<ggml_type> types_w, int64_t n, int64_t m = 96)
+        : producer(producer), types_w(types_w), n(n), m(m) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t hc = 4;
+        constexpr int64_t head_dim = 128;
+        constexpr int64_t nmix = 2*hc + (hc - 1)*(hc - 1);
+
+        auto tensor = [&](const char * name, ggml_type type, int64_t ne0, int64_t ne1 = 1, int64_t ne2 = 1) {
+            ggml_tensor * t = ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2);
+            ggml_set_name(t, name);
+            return t;
+        };
+
+        ggml_tensor * cur   = nullptr; // the row read by the products
+        ggml_tensor * extra = nullptr; // another output of the producer, also checked
+        switch (producer) {
+            case HC_PRE_NORM: {
+                ggml_tensor * x    = tensor("x", GGML_TYPE_F32, n, hc);
+                ggml_tensor * fn   = tensor("fn", GGML_TYPE_F32, n*hc, nmix);
+                ggml_tensor * base = tensor("base", GGML_TYPE_F32, nmix);
+                ggml_tensor * w    = tensor("w", GGML_TYPE_F32, n);
+                ggml_tensor * flat = ggml_reshape_2d(ctx, x, n*hc, 1);
+                extra = ggml_add(ctx, ggml_mul_mat(ctx, fn, ggml_rms_norm(ctx, flat, 1e-6f)), base);
+                ggml_tensor * sg  = ggml_sigmoid(ctx, ggml_view_2d(ctx, extra, 2*hc, 1, extra->nb[1], 0));
+                ggml_tensor * pre = ggml_view_2d(ctx, sg, hc, 1, sg->nb[1], 0);
+                cur = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_dsv4_hc_pre(ctx, x, pre), 1e-6f), w);
+            } break;
+            case GATED_NORM: {
+                GGML_ASSERT(n % head_dim == 0);
+                ggml_tensor * x    = tensor("x", GGML_TYPE_F32, head_dim, n/head_dim);
+                ggml_tensor * w    = tensor("w", GGML_TYPE_F32, head_dim);
+                ggml_tensor * proj = tensor("proj", GGML_TYPE_F32, 2*n);
+                ggml_tensor * g    = ggml_view_2d(ctx, proj, head_dim, n/head_dim, ggml_row_size(proj->type, head_dim),
+                        ggml_row_size(proj->type, n));
+                ggml_tensor * out  = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), ggml_sigmoid(ctx, g));
+                cur = ggml_reshape_2d(ctx, out, n, 1);
+            } break;
+            case GLU:
+                cur = ggml_swiglu(ctx, tensor("a", GGML_TYPE_F32, 2*n));
+                break;
+            case GLU_SPLIT:
+                cur = ggml_geglu_split(ctx, tensor("a", GGML_TYPE_F32, n), tensor("b", GGML_TYPE_F32, n));
+                break;
+            case FFN: {
+                ggml_tensor * x  = tensor("x", GGML_TYPE_F32, n);
+                ggml_tensor * w  = tensor("w", GGML_TYPE_F32, n);
+                ggml_tensor * up = tensor("up", types_w[0], n, 2*n);
+                cur = ggml_swiglu(ctx, ggml_mul_mat(ctx, up, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w)));
+            } break;
+        }
+        ggml_set_name(cur, "cur");
+
+        // sum = mm_0 + (mm_1 + (... + (mm_last + sum(cur)))): the products are consecutive nodes right after the
+        // producer, and the node after them (SUM) reads the producer output, not a product
+        std::vector<ggml_tensor *> mm;
+        for (size_t k = 0; k < types_w.size(); ++k) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, types_w[k], n, m);
+            ggml_set_name(a, ("a" + std::to_string(k)).c_str());
+            mm.push_back(ggml_mul_mat(ctx, a, cur));
+        }
+        ggml_tensor * sum = ggml_sum(ctx, cur);
+        for (int k = (int) mm.size() - 1; k >= 0; --k) {
+            sum = ggml_add(ctx, mm[k], sum);
+        }
+        // the producer output itself is also checked
+        ggml_tensor * out = ggml_concat(ctx, sum, cur, 0);
+        if (extra != nullptr) {
+            out = ggml_concat(ctx, out, extra, 0);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            // a small mix projection keeps the mixes at a few units, as in the model
+            const bool small = strcmp(t->name, "fn") == 0;
+            init_tensor_uniform(t, small ? -0.05f : -1.0f, small ? 0.05f : 1.0f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -12543,6 +12667,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mat_vec({ GGML_TYPE_Q4_K }, 2048, 512));
     test_cases.emplace_back(new test_rms_norm_mul_mat_vec({ GGML_TYPE_Q6_K }, 1536, 64));
     test_cases.emplace_back(new test_rms_norm_mul_mat_vec({ GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, 96, 32));
+    {
+        using p = test_mat_vec_q8_1_producer;
+        // n not a multiple of MATRIX_ROW_PADDING (512) checks the zero padding of the q8_1 row
+        for (p::producer_t producer : { p::HC_PRE_NORM, p::GATED_NORM, p::GLU, p::GLU_SPLIT, p::FFN }) {
+            for (int64_t n : { 768, 1536 }) {
+                test_cases.emplace_back(new p(producer, { GGML_TYPE_Q4_K }, n));
+                test_cases.emplace_back(new p(producer, { GGML_TYPE_Q6_K }, n));
+                test_cases.emplace_back(new p(producer, { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }, n));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));

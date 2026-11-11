@@ -24,6 +24,9 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// MUL(MUL(RMS_NORM(x), w), unary(g)) with w broadcast along the rows of x and unary SIGMOID or SILU (a gated RMS norm)
+// MUL(MUL(RMS_NORM(x), w), unary(g)) with w broadcast along the rows of x and unary SIGMOID or SILU (a gated RMS norm).
+// dst_q8_1: also writes the whole output, as one row, quantized to q8_1 for mul_mat_vec_q (see ggml_cuda_op_rms_norm_mul_q8_1);
+// needs x->ne[0] % QK8_1 == 0
 void ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_w,
-                                    ggml_tensor * gate, ggml_tensor * mul_out);
+                                    ggml_tensor * gate, ggml_tensor * mul_out,
+                                    void * dst_q8_1 = nullptr, int64_t ncols_padded = 0);

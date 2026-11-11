@@ -698,7 +698,6 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 template <int block_size>
 static __global__ void rms_norm_mul_q8_1_f32(const float * x, const float * w, float * dst, block_q8_1 * dst_q8_1,
                                              const int ncols, const int ncols_padded, const float eps) {
-    static_assert(QK8_1 == WARP_SIZE, "one q8_1 block per warp");
     ggml_cuda_pdl_lc();
     const int tid = threadIdx.x;
 
@@ -721,14 +720,7 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x, const float * w, f
             xi = scale * x[col] * w[col];
             dst[col] = xi;
         }
-        const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
-        const float sum  = warp_reduce_sum<QK8_1>(xi);
-        const float d    = amax / 127.0f;
-        block_q8_1 & b = dst_q8_1[col / QK8_1];
-        b.qs[col % QK8_1] = amax == 0.0f ? 0 : roundf(xi / d);
-        if (col % QK8_1 == 0) {
-            b.ds = make_half2(d, sum);
-        }
+        quantize_q8_1_store(xi, dst_q8_1, col);
     }
 }
 
@@ -893,14 +885,22 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
-// one warp per row
+// one warp per row. dst_q8_1 != nullptr: dst (contiguous) is also written as one q8_1 row of ncols_padded values, zero
+// past the last row; ncols is a multiple of QK8_1 and the warps of rows >= nrows write that zero padding
 template <bool gate_silu>
 static __global__ void rms_norm_mul_gate_f32(
         const float * x, const float * w, const float * g, float * dst, const int ncols, const int64_t nrows,
         const int ne1, const int ne2, const int64_t sx1, const int64_t sx2, const int64_t sx3,
-        const int64_t sg1, const int64_t sg2, const int64_t sg3, const float eps) {
+        const int64_t sg1, const int64_t sg2, const int64_t sg3, const float eps,
+        block_q8_1 * dst_q8_1, const int64_t ncols_padded) {
     const int64_t row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y;
+    if (row >= nrows && (dst_q8_1 == nullptr || row*ncols >= ncols_padded)) {
+        return;
+    }
     if (row >= nrows) {
+        for (int col = threadIdx.x; col < ncols && row*ncols + col < ncols_padded; col += WARP_SIZE) {
+            quantize_q8_1_store(0.0f, dst_q8_1, row*ncols + col);
+        }
         return;
     }
     const int64_t i1 = row % ne1;
@@ -921,12 +921,16 @@ static __global__ void rms_norm_mul_gate_f32(
     for (int col = threadIdx.x; col < ncols; col += WARP_SIZE) {
         const float gv   = gr[col];
         const float gate = gate_silu ? gv/(1.0f + expf(-gv)) : 1.0f/(1.0f + expf(-gv));
-        yr[col] = (scale*xr[col])*w[col]*gate;
+        const float y    = (scale*xr[col])*w[col]*gate;
+        yr[col] = y;
+        if (dst_q8_1 != nullptr) {
+            quantize_q8_1_store(y, dst_q8_1, row*ncols + col);
+        }
     }
 }
 
 void ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_w,
-                                    ggml_tensor * gate, ggml_tensor * mul_out) {
+                                    ggml_tensor * gate, ggml_tensor * mul_out, void * dst_q8_1, const int64_t ncols_padded) {
     const ggml_tensor * x = rms_norm->src[0];
     const ggml_tensor * w = mul_w->src[0] == rms_norm ? mul_w->src[1] : mul_w->src[0];
     const ggml_tensor * g = gate->src[0];
@@ -942,7 +946,12 @@ void ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor
 
     constexpr int rows_per_block = 4;
     const int64_t nrows = ggml_nrows(x);
-    const dim3 blocks((nrows + rows_per_block - 1) / rows_per_block, 1, 1);
+    int64_t nrows_launch = nrows;
+    if (dst_q8_1 != nullptr) {
+        GGML_ASSERT(x->ne[0] % QK8_1 == 0 && ncols_padded % QK8_1 == 0 && ncols_padded >= ggml_nelements(mul_out));
+        nrows_launch = (ncols_padded + x->ne[0] - 1) / x->ne[0];
+    }
+    const dim3 blocks((nrows_launch + rows_per_block - 1) / rows_per_block, 1, 1);
     const dim3 threads(WARP_SIZE, rows_per_block, 1);
 
     auto launch = [&](auto kernel) {
@@ -950,7 +959,8 @@ void ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor
             (const float *) x->data, (const float *) w->data, (const float *) g->data, (float *) mul_out->data,
             (int) x->ne[0], nrows, (int) x->ne[1], (int) x->ne[2],
             x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float),
-            g->nb[1]/sizeof(float), g->nb[2]/sizeof(float), g->nb[3]/sizeof(float), eps);
+            g->nb[1]/sizeof(float), g->nb[2]/sizeof(float), g->nb[3]/sizeof(float), eps,
+            (block_q8_1 *) dst_q8_1, ncols_padded);
     };
     if (gate_silu) {
         launch(rms_norm_mul_gate_f32<true>);

@@ -700,6 +700,20 @@ static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
    return x;
 }
 
+// stores xi as element i of the q8_1 array y, quantized as quantize_q8_1 does: the QK8_1 lanes of a warp call it
+// together for the elements of one block (lane i % QK8_1 holds element i)
+static __device__ __forceinline__ void quantize_q8_1_store(const float xi, block_q8_1 * y, const int64_t i) {
+    static_assert(QK8_1 == WARP_SIZE, "one q8_1 block per warp");
+    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+    const float sum  = warp_reduce_sum<QK8_1>(xi);
+    const float d    = amax / 127.0f;
+    block_q8_1 & b = y[i / QK8_1];
+    b.qs[i % QK8_1] = amax == 0.0f ? 0 : roundf(xi / d);
+    if (i % QK8_1 == 0) {
+        b.ds = make_half2(d, sum);
+    }
+}
+
 #if (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || \
     (defined(MUSART_VERSION) && MUSART_VERSION < MUSART_HMASK)
 static __device__ __forceinline__ uint32_t __hgt2_mask(const half2 a, const half2 b) {

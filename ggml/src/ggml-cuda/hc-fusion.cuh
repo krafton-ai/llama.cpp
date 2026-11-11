@@ -11,14 +11,16 @@ void ggml_cuda_op_rms_norm_mat_vec_add(ggml_backend_cuda_context & ctx, const gg
         const ggml_tensor * mul_mat, ggml_tensor * add, ggml_tensor * sig);
 
 // DSV4_HC_PRE(x, pre) -> RMS_NORM -> MUL(w)
+// dst_q8_1 (one token): also writes MUL quantized to q8_1 for mul_mat_vec_q, zero padded to ncols_padded
 void ggml_cuda_op_hc_pre_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * hc_pre,
-        const ggml_tensor * rms_norm, ggml_tensor * mul);
+        const ggml_tensor * rms_norm, ggml_tensor * mul, void * dst_q8_1 = nullptr, int64_t ncols_padded = 0);
 
 // one token: RMS_NORM -> MUL_MAT -> ADD -> VIEW -> SIGMOID -> VIEW(pre) -> DSV4_HC_PRE -> RMS_NORM -> MUL in one kernel
 // (the two functions above chained through a block counter); other shapes run the two functions above
 void ggml_cuda_op_rms_norm_mat_vec_pre_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
         const ggml_tensor * mul_mat, ggml_tensor * add, ggml_tensor * sig,
-        const ggml_tensor * hc_pre, const ggml_tensor * rms_norm_pre, ggml_tensor * mul);
+        const ggml_tensor * hc_pre, const ggml_tensor * rms_norm_pre, ggml_tensor * mul,
+        void * dst_q8_1 = nullptr, int64_t ncols_padded = 0);
 
 // the comb input of DSV4_HC_POST computed from the mix vector:
 // e = MUL_MAT(K, mixes); comb = RESHAPE(e) / (scale*POOL_1D_MAX(e*r) + bias) + c0
