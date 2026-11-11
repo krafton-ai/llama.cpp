@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include <climits>
 #include <cstdint>
 
 template <int block_size>
@@ -691,6 +692,74 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+// one row: column col is handled by lane col % WARP_SIZE, so a warp holds one q8_1 block
+template <int block_size>
+static __global__ void rms_norm_mul_q8_1_f32(const float * x, const float * w, float * dst, block_q8_1 * dst_q8_1,
+                                             const int ncols, const int ncols_padded, const float eps) {
+    static_assert(QK8_1 == WARP_SIZE, "one q8_1 block per warp");
+    ggml_cuda_pdl_lc();
+    const int tid = threadIdx.x;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    // ncols_padded is a multiple of WARP_SIZE: the loop condition is the same for all lanes of a warp
+    for (int col = tid; col < ncols_padded; col += block_size) {
+        float xi = 0.0f;
+        if (col < ncols) {
+            xi = scale * x[col] * w[col];
+            dst[col] = xi;
+        }
+        const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+        const float sum  = warp_reduce_sum<QK8_1>(xi);
+        const float d    = amax / 127.0f;
+        block_q8_1 & b = dst_q8_1[col / QK8_1];
+        b.qs[col % QK8_1] = amax == 0.0f ? 0 : roundf(xi / d);
+        if (col % QK8_1 == 0) {
+            b.ds = make_half2(d, sum);
+        }
+    }
+}
+
+void ggml_cuda_op_rms_norm_mul_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_tensor,
+                                    void * dst_q8_1, const int64_t ncols_padded) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul_tensor->src[0] == rms_norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const int64_t ncols = x->ne[0];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nrows(x) == 1 && ggml_is_contiguous(x) && ggml_is_contiguous(w) && ggml_nelements(w) == ncols);
+    GGML_ASSERT(ggml_is_contiguous(mul_tensor) && ggml_nelements(mul_tensor) == ncols);
+    GGML_ASSERT(ncols_padded >= ncols && ncols_padded % QK8_1 == 0 && ncols_padded <= INT_MAX);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const float * x_d = (const float *) x->data;
+    const float * w_d = (const float *) w->data;
+    float       * dst = (float *) mul_tensor->data;
+    block_q8_1  * q8  = (block_q8_1 *) dst_q8_1;
+    cudaStream_t stream = ctx.stream();
+
+    if (ncols < 1024) {
+        const ggml_cuda_kernel_launch_params launch_params{ dim3(1), dim3(256), 32 * sizeof(float), stream };
+        ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<256>, launch_params, x_d, w_d, dst, q8, (int) ncols, (int) ncols_padded, eps);
+    } else {
+        const ggml_cuda_kernel_launch_params launch_params{ dim3(1), dim3(1024), 32 * sizeof(float), stream };
+        ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<1024>, launch_params, x_d, w_d, dst, q8, (int) ncols, (int) ncols_padded, eps);
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

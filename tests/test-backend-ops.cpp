@@ -3894,6 +3894,66 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_MUL_MAT(quantized weight, one row) x n, consecutive nodes that read the
+// norm output (fused on CUDA: the norm writes the q8_1 input of the mat-vec products)
+struct test_rms_norm_mul_mat_vec : public test_case {
+    const std::vector<ggml_type> types_w; // one product per entry
+    const int64_t n;
+    const int64_t m;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT_VEC";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        std::string types;
+        for (ggml_type t : types_w) {
+            types += (types.empty() ? "" : "+") + std::string(ggml_type_name(t));
+        }
+        return "types_w=" + types + "," + VARS_TO_STR3(n, m, eps);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rms_norm_mul_mat_vec(std::vector<ggml_type> types_w = { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 },
+            int64_t n = 2048, int64_t m = 96, float eps = 1e-6f)
+        : types_w(types_w), n(n), m(m), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        ggml_set_name(cur, "cur");
+
+        // sum = mm_0 + (mm_1 + (... + (mm_last + sum(cur)))): the products are consecutive nodes right after the
+        // norm, and the node after them (SUM) reads the norm output, not a product
+        std::vector<ggml_tensor *> mm;
+        for (size_t k = 0; k < types_w.size(); ++k) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, types_w[k], n, m);
+            ggml_set_name(a, ("a" + std::to_string(k)).c_str());
+            mm.push_back(ggml_mul_mat(ctx, a, cur));
+        }
+        ggml_tensor * sum = ggml_sum(ctx, cur);
+        for (int k = (int) mm.size() - 1; k >= 0; --k) {
+            sum = ggml_add(ctx, mm[k], sum);
+        }
+        // the norm output itself is also checked
+        ggml_tensor * out = ggml_concat(ctx, sum, cur, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -12100,6 +12160,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
+
+    for (int64_t n : { 768, 2048, 4096 }) {
+        test_cases.emplace_back(new test_rms_norm_mul_mat_vec({ GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }, n));
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_mat_vec({ GGML_TYPE_Q4_K }, 2048, 512));
+    test_cases.emplace_back(new test_rms_norm_mul_mat_vec({ GGML_TYPE_Q6_K }, 1536, 64));
+    test_cases.emplace_back(new test_rms_norm_mul_mat_vec({ GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, 96, 32));
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));

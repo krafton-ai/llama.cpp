@@ -4552,6 +4552,88 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// nodes i .. i + n - 1 run on one stream: none of them but the last forks a concurrent region, none but the first
+// joins one, and all of them are in the same branch of a region (or in none)
+static bool ggml_cuda_nodes_on_one_stream(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i, int n) {
+    for (const auto & [fork, event] : cuda_ctx->stream_context().concurrent_events) {
+        const auto first = event.stream_mapping.find(cgraph->nodes[i]);
+        for (int j = i; j < i + n; ++j) {
+            const ggml_tensor * node = cgraph->nodes[j];
+            if ((node == fork && j < i + n - 1) || (node == event.join_node && j > i)) {
+                return false;
+            }
+            const auto it = event.stream_mapping.find(node);
+            if ((it == event.stream_mapping.end()) != (first == event.stream_mapping.end()) ||
+                    (it != event.stream_mapping.end() && it->second != first->second)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// RMS_NORM -> MUL(w) -> MUL_MAT(quantized, ·) x n_mm for one row: the norm writes its output also quantized to q8_1,
+// and the following mat-vec products that read it (consecutive nodes) skip their own quantization of src1.
+// Returns n_mm, 0 if the pattern does not apply
+static int ggml_cuda_match_rms_norm_mul_mat_vec_q(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    if (i + 2 >= cgraph->n_nodes || !ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        return 0;
+    }
+    const ggml_tensor * rn  = cgraph->nodes[i];
+    const ggml_tensor * mul = cgraph->nodes[i + 1];
+    const ggml_tensor * x   = rn->src[0];
+    const ggml_tensor * w   = mul->src[0] == rn ? mul->src[1] : mul->src[0];
+    if (ggml_nrows(x) != 1 || !ggml_is_contiguous(x) || !ggml_is_contiguous(w) || ggml_nelements(w) != x->ne[0] ||
+            !ggml_is_contiguous(mul) || ggml_nelements(mul) != x->ne[0]) {
+        return 0;
+    }
+
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    constexpr int max_mm = 8;
+    int n_mm = 0;
+    for (int j = i + 2; j < cgraph->n_nodes && n_mm < max_mm; ++j) {
+        const ggml_tensor * mm = cgraph->nodes[j];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != mul || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            break;
+        }
+        // the choice of ggml_cuda_mul_mat for this node is mul_mat_vec_q
+        const ggml_tensor * src0 = mm->src[0];
+        const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+        if (!ggml_is_quantized(src0->type) || !ggml_cuda_should_use_mmvq(src0->type, cc, 1) || bad_padding_clear ||
+                ggml_cuda_op_mul_mat_use_fwht(mm) || mm->type != GGML_TYPE_F32 || src0->nb[0] != ggml_type_size(src0->type) ||
+                src0->ne[2] != 1 || src0->ne[3] != 1 || ggml_nrows(mm) != 1) {
+            break;
+        }
+        n_mm++;
+    }
+    if (n_mm == 0) {
+        return 0;
+    }
+
+    // leave the products to other fusions (bias, GLU) when the node right after them uses one of them
+    const int next = i + 2 + n_mm;
+    if (next < cgraph->n_nodes && !ggml_cuda_is_view_or_noop(cgraph->nodes[next])) {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            for (int j = i + 2; j < next; ++j) {
+                if (cgraph->nodes[next]->src[s] != nullptr && cgraph->nodes[next]->src[s] == cgraph->nodes[j]) {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    int outputs[max_mm + 1];
+    for (int k = 0; k <= n_mm; ++k) {
+        outputs[k] = i + 1 + k;
+    }
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_mm + 2, outputs, n_mm + 1) ||
+            !ggml_cuda_nodes_on_one_stream(cuda_ctx, cgraph, i, n_mm + 2)) {
+        return 0;
+    }
+    return n_mm;
+}
+
 // try and fuse nodes and return the number of nodes to skip, or -1 if the node was computed by a fused kernel (or
 // skipped) without the nodes after it
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -5415,6 +5497,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_mm = ggml_cuda_match_rms_norm_mul_mat_vec_q(cuda_ctx, cgraph, i);
+        if (n_mm > 0) {
+            ggml_tensor * mul = cgraph->nodes[i + 1];
+            const int64_t ncols_padded = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
+            ggml_cuda_pool_alloc<char> q8_1(cuda_ctx->pool(), ncols_padded/QK8_1*sizeof(block_q8_1));
+            ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, node, mul, q8_1.get(), ncols_padded);
+            for (int j = i + 2; j < i + 2 + n_mm; ++j) {
+                ggml_tensor * mm = cgraph->nodes[j];
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, nullptr, q8_1.get());
+            }
+            return n_mm + 1;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
