@@ -1,0 +1,101 @@
+#version 450
+
+// Conv of a delta net with its state (llm_build_delta_net_base::build_conv_state, n_rs_seq == 0):
+// CONCAT(state, x^T) -> CPY of the last nc - 1 columns into the state cache -> SSM_CONV -> SILU, one invocation per
+// (channel c, token t, sequence s), with n_t tokens:
+//   win[p] = t + p < nc - 1 ? state[t + p, c, s] : x[c, t + p - (nc - 1), s]
+//   y[c, t, s] = silu(sum_p win[p]*w[p, c])
+//   new_state[q + c*(nc - 1), s] = win[q + 1] of the last token, q < nc - 1
+// ne0 = nc, ne1 = channels
+// a = state (a_nb1 channel, a_nb2 sequence), b = x (b_nb0 token, b_nb1 channel, b_nb2 sequence), c = w (c_nb1 channel),
+// e = new state (e_nb1 sequence), d = y (d_nb1 token, d_nb2 sequence)
+// MULTI_TOKEN: n_t > 1 (prefill); without it one token (decode) and the window reads are fixed per position
+// L2: also the L2 norm of the q | k heads, the channels below ne3 in heads of ne2 (a power of two dividing BLOCK_SIZE):
+//   q[c, t] = y[c, t] / max(|y[head of c, t]|, f0), at o_off + t*o_nb2 (one sequence)
+
+#include "fused_common.glsl"
+
+layout(binding = 0, std430) readonly buffer S { float data_s[]; };
+layout(binding = 1, std430) readonly buffer X { float data_x[]; };
+layout(binding = 2, std430) readonly buffer W { float data_w[]; };
+layout(binding = 3, std430) writeonly buffer E { float data_e[]; };
+layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
+#ifdef L2
+layout(binding = 5, std430) writeonly buffer Q { float data_q[]; };
+#endif
+
+const uint MAX_NC = 8;
+
+void main() {
+    const uint nc  = ne0;
+    const uint c   = gl_GlobalInvocationID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint s   = gl_WorkGroupID.z;
+    const uint n_t = gl_NumWorkGroups.y;
+    const bool in_range = c < ne1;
+    float y = 0.0f;
+
+    if (in_range) {
+        float win[MAX_NC];
+#ifdef MULTI_TOKEN
+        [[unroll]] for (uint p = 0; p < MAX_NC; ++p) {
+            if (p < nc) {
+                const uint pos = t + p;
+                win[p] = pos + 1 < nc ? data_s[a_off + pos + c*a_nb1 + s*a_nb2]
+                                      : data_x[b_off + (pos + 1 - nc)*b_nb0 + c*b_nb1 + s*b_nb2];
+            }
+        }
+#else
+        [[unroll]] for (uint p = 0; p < MAX_NC; ++p) {
+            if (p + 1 < nc) {
+                win[p] = data_s[a_off + p + c*a_nb1 + s*a_nb2];
+            } else if (p + 1 == nc) {
+                win[p] = data_x[b_off + c*b_nb1 + s*b_nb2];
+            }
+        }
+#endif
+
+        const uint wb = c_off + c*c_nb1;
+        float sum = 0.0f;
+        if (nc == 4) {
+            sum = dot(vec4(win[0], win[1], win[2], win[3]),
+                      vec4(data_w[wb], data_w[wb + 1], data_w[wb + 2], data_w[wb + 3]));
+        } else {
+            [[unroll]] for (uint p = 0; p < MAX_NC; ++p) {
+                if (p < nc) {
+                    sum += win[p]*data_w[wb + p];
+                }
+            }
+        }
+
+#ifdef MULTI_TOKEN
+        if (t + 1 == n_t)
+#endif
+        {
+            const uint eb = e_off + c*(nc - 1) + s*e_nb1;
+            [[unroll]] for (uint q = 0; q + 1 < MAX_NC; ++q) {
+                if (q + 1 < nc) {
+                    data_e[eb + q] = win[q + 1];
+                }
+            }
+        }
+        y = sum/(1.0f + exp(-sum));
+        data_d[d_off + c + t*d_nb1 + s*d_nb2] = y;
+    }
+
+#ifdef L2
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = y*y;
+    barrier();
+    for (uint h = ne2/2; h > 0; h >>= 1) {
+        if ((tid & (2*h - 1)) < h) {
+            red[tid] += red[tid + h];
+        }
+        barrier();
+    }
+    if (in_range && c < ne3) {
+        const float scale = 1.0f/max(sqrt(red[tid & ~(ne2 - 1)]), f0);
+        data_q[o_off + c + t*o_nb2] = scale*y;
+    }
+#endif
+}

@@ -3643,6 +3643,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_state_f32,  "ssm_conv_state_f32",  ssm_conv_state_f32_len,  ssm_conv_state_f32_data,  "main", 5, sizeof(vk_op_fused_push_constants), {256, 1, 1}, { 256 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_state_l2_f32, "ssm_conv_state_l2_f32", ssm_conv_state_l2_f32_len, ssm_conv_state_l2_f32_data, "main", 6, sizeof(vk_op_fused_push_constants), {256, 1, 1}, { 256 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_state_mt_f32, "ssm_conv_state_mt_f32", ssm_conv_state_mt_f32_len, ssm_conv_state_mt_f32_data, "main", 5, sizeof(vk_op_fused_push_constants), {256, 1, 1}, { 256 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_state_mt_l2_f32, "ssm_conv_state_mt_l2_f32", ssm_conv_state_mt_l2_f32_len, ssm_conv_state_mt_l2_f32_data, "main", 6, sizeof(vk_op_fused_push_constants), {256, 1, 1}, { 256 }, 1);
 
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
@@ -7407,6 +7411,68 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
+
+// fused ops: the sources are bound in order, then dst; wg = workgroup counts
+static void ggml_vk_fused_op(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline pipeline, ggml_tensor * dst,
+        std::initializer_list<const ggml_tensor *> srcs, vk_op_fused_push_constants pc, const std::array<uint32_t, 3> & wg) {
+    GGML_ASSERT(pipeline != nullptr && srcs.size() >= 2 && srcs.size() <= 4);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer b[5];
+    const ggml_tensor * s[4] = {};
+    size_t n = 0;
+    for (const ggml_tensor * t : srcs) {
+        s[n] = t;
+        b[n++] = ggml_vk_tensor_subbuffer(ctx, t, true);
+    }
+    const vk_subbuffer d = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    init_pushconst_tensor_offsets(ctx, pc, s[0], s[1], s[2], s[3], dst);
+
+    switch (n) {
+        case 2:  ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { b[0], b[1], d }, pc, wg); break;
+        case 3:  ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { b[0], b[1], b[2], d }, pc, wg); break;
+        default: ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { b[0], b[1], b[2], b[3], d }, pc, wg); break;
+    }
+}
+
+// CONCAT(state, x^T) + CPY of its last nc - 1 columns + SSM_CONV + SILU, one token (ggml_vk_fuse_ssm_conv_state),
+// and with l2 the L2_NORM of the q | k heads of the output
+static void ggml_vk_ssm_conv_state(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * cat,
+        const ggml_tensor * cpy, const ggml_tensor * conv, ggml_tensor * dst, ggml_tensor * l2) {
+    const ggml_tensor * st = cat->src[0];
+    const ggml_tensor * x  = cat->src[1];
+    const ggml_tensor * w  = conv->src[1];
+    const ggml_tensor * cache = cpy->src[1];
+    vk_op_fused_push_constants pc {};
+    auto nb = [](const ggml_tensor * t, int i) { return ggml_vk_nb_elem(t, i); };
+    pc.ne0 = (uint32_t) w->ne[0];  // conv width
+    pc.ne1 = (uint32_t) cat->ne[1];
+    pc.a_nb1 = nb(st, 1); pc.a_nb2 = nb(st, 2);
+    pc.b_nb0 = nb(x, 0);  pc.b_nb1 = nb(x, 1);  pc.b_nb2 = nb(x, 2);
+    pc.c_nb1 = nb(w, 1);
+    pc.e_nb1 = nb(cache, 1);
+    pc.d_nb1 = nb(dst, 1); pc.d_nb2 = nb(dst, 2);
+    const std::array<uint32_t, 3> elements = { (uint32_t) cat->ne[1], (uint32_t) x->ne[0], (uint32_t) cat->ne[2] };
+    const bool mt = x->ne[0] > 1;
+    if (!l2) {
+        ggml_vk_fused_op(ctx, subctx, mt ? ctx->device->pipeline_ssm_conv_state_mt_f32 : ctx->device->pipeline_ssm_conv_state_f32,
+                dst, { st, x, w, cache }, pc, elements);
+        return;
+    }
+    vk_pipeline pipeline = mt ? ctx->device->pipeline_ssm_conv_state_mt_l2_f32 : ctx->device->pipeline_ssm_conv_state_l2_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    pc.ne2 = (uint32_t) l2->ne[0];
+    pc.ne3 = (uint32_t) (l2->ne[0]*l2->ne[1]);
+    pc.f0  = ggml_get_op_params_f32(l2, 0);
+    pc.o_nb2 = nb(l2, 2);
+    init_pushconst_tensor_offsets(ctx, pc, st, x, w, cache, dst);
+    pc.o_off = get_misalign_bytes(ctx, l2) / sizeof(float);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+            ggml_vk_tensor_subbuffer(ctx, st, true), ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, w, true),
+            ggml_vk_tensor_subbuffer(ctx, cache, true), ggml_vk_tensor_subbuffer(ctx, dst, true), ggml_vk_tensor_subbuffer(ctx, l2, true) },
+        pc, elements);
+}
+
 
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
@@ -12745,6 +12811,17 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
+        if (ctx->fused_ssm_conv_state) {
+            int i_cpy = node_idx + 1;
+            while (cgraph->nodes[i_cpy]->op != GGML_OP_CPY) {
+                ++i_cpy;
+            }
+            ggml_tensor * last = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+            ggml_tensor * l2   = last->op == GGML_OP_L2_NORM ? last : nullptr;
+            ggml_tensor * silu = l2 ? l2->src[0]->view_src : last;
+            ggml_vk_ssm_conv_state(ctx, compute_ctx, node, cgraph->nodes[i_cpy], silu->src[0], silu, l2);
+            break;
+        }
         ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
 
         break;
@@ -14272,6 +14349,77 @@ static int ggml_vk_fuse_cont_mul(const ggml_backend_vk_context * ctx, const stru
     return j;
 }
 
+// The conv of a delta net (llm_build_delta_net_base::build_conv_state, n_rs_seq == 0), views between:
+// CONCAT(state, x^T) -> CPY of the last nc - 1 columns into the state cache -> SSM_CONV -> SILU.
+// ggml_vk_ssm_conv_state does all four. Returns the silu index (the CPY index in *i_cpy), or -1
+static int ggml_vk_fuse_ssm_conv_state(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int * i_cpy) {
+    const ggml_tensor *cat = cgraph->nodes[node_idx];
+    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || !ctx->device->pipeline_ssm_conv_state_f32 ||
+            cat->type != GGML_TYPE_F32 || cat->src[0]->type != GGML_TYPE_F32 || cat->src[1]->type != GGML_TYPE_F32 ||
+            cat->ne[0] > cat->src[1]->ne[0] + 7 || cat->src[0]->nb[0] != sizeof(float) || !ggml_is_contiguous(cat) ||
+            !ggml_node_has_n_uses(cgraph, node_idx, 2)) {
+        return -1;
+    }
+    const int64_t n_t = cat->src[1]->ne[0];
+    const int64_t nc = cat->ne[0] - n_t + 1;
+    auto next = [&](int j) {
+        int k = j + 1;
+        while (k < cgraph->n_nodes && k <= j + 4 && ggml_op_is_empty(cgraph->nodes[k]->op)) {
+            ++k;
+        }
+        return k < cgraph->n_nodes ? k : -1;
+    };
+    const int j_cpy = next(node_idx);
+    if (j_cpy < 0) {
+        return -1;
+    }
+    const ggml_tensor *cpy = cgraph->nodes[j_cpy];
+    const ggml_tensor *last = cpy->src[0];
+    const ggml_tensor *cache = cpy->src[1];
+    if (cpy->op != GGML_OP_CPY || last->view_src != cat || last->view_offs != n_t*sizeof(float) ||
+            last->ne[0] != nc - 1 || last->ne[1] != cat->ne[1] || last->ne[2] != cat->ne[2] || last->ne[3] != 1 ||
+            last->nb[1] != cat->nb[1] || last->nb[2] != cat->nb[2] ||
+            cache->type != GGML_TYPE_F32 || cache->nb[0] != sizeof(float) || cache->ne[0] != (nc - 1)*cat->ne[1] ||
+            ggml_nrows(cache) != cat->ne[2] || cache->ne[2] != 1 || cache->ne[3] != 1) {
+        return -1;
+    }
+    const int j_conv = next(j_cpy);
+    if (j_conv < 0) {
+        return -1;
+    }
+    const ggml_tensor *conv = cgraph->nodes[j_conv];
+    if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != cat || conv->src[1]->type != GGML_TYPE_F32 ||
+            conv->src[1]->ne[0] != nc || conv->src[1]->nb[0] != sizeof(float) || !ggml_node_has_n_uses(cgraph, j_conv, 1)) {
+        return -1;
+    }
+    const int j_silu = next(j_conv);
+    if (j_silu < 0) {
+        return -1;
+    }
+    const ggml_tensor *silu = cgraph->nodes[j_silu];
+    if (silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != conv ||
+            silu->type != GGML_TYPE_F32 || !ggml_is_contiguous(silu)) {
+        return -1;
+    }
+    *i_cpy = j_cpy;
+    // the L2 norm of the q | k heads (llm_build_raon1 delta net), one sequence: heads of a power-of-two size that
+    // divides the workgroup (256)
+    const int j_l2 = next(j_silu);
+    if (j_l2 > 0 && ctx->device->pipeline_ssm_conv_state_l2_f32) {
+        const ggml_tensor *l2 = cgraph->nodes[j_l2];
+        const ggml_tensor *qk = l2->src[0];
+        const int64_t hd = qk->ne[0];
+        if (l2->op == GGML_OP_L2_NORM && qk->view_src == silu && qk->view_offs == 0 && cat->ne[2] == 1 &&
+                hd > 0 && hd <= 256 && (hd & (hd - 1)) == 0 && qk->nb[0] == sizeof(float) && qk->nb[1] == hd*sizeof(float) &&
+                qk->ne[0]*qk->ne[1] <= silu->ne[0] && qk->ne[2] == n_t && qk->ne[3] == 1 && qk->nb[2] == silu->nb[1] &&
+                l2->type == GGML_TYPE_F32 && ggml_is_contiguous(l2)) {
+            return j_l2;
+        }
+    }
+    return j_silu;
+}
+
+
 // A mat-vec whose output is the branch input x of a 4-stream hc_post (DSV4_HC_POST with comb), one token: the mat-vec
 // writes the streams itself (MAT_VEC_FUSION_FLAGS_HC_POST), reading post and comb from one binding of the buffer that
 // holds both (they come from the same compute buffer). Views may sit between the two. Returns the hc_post index, or -1
@@ -15205,6 +15353,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_select = false;
         ctx->fused_mul_mat_vec_glu = 0;
         ctx->fused_mul_mat_vec_hc_post = false;
+        ctx->fused_ssm_conv_state = false;
         ctx->fused_cont_mul = false;
         ctx->fused_mul_mat_cpy_f16 = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -15252,6 +15401,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 // src1 of the MUL is elementwise
                 op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = true;
+            } else if (int i_cpy = 0, i_silu = ggml_vk_fuse_ssm_conv_state(ctx, cgraph, i, &i_cpy); i_silu > 0) {
+                ctx->num_additional_fused_ops = i_silu - i;
+                ctx->fused_ssm_conv_state = true;
+                // the state cache (CPY) and the conv output are written
+                ctx->fused_ops_write_mask |= 1 << (i_cpy - i);
+                fusion_string = "CONCAT_CPY_SSM_CONV_SILU";
+                if (cgraph->nodes[i_silu]->op == GGML_OP_L2_NORM) {
+                    // the silu output (the v part is read elsewhere) and the L2 norm are written too
+                    const ggml_tensor * silu = cgraph->nodes[i_silu]->src[0]->view_src;
+                    for (int k = i + 1; k < i_silu; ++k) {
+                        if (cgraph->nodes[k] == silu) {
+                            ctx->fused_ops_write_mask |= 1 << (k - i);
+                        }
+                    }
+                    fusion_string = "CONCAT_CPY_SSM_CONV_SILU_L2_NORM";
+                }
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // the CPY node is a view of its destination
+                op_srcs_fused_elementwise[i_cpy - i] = true;
             } else if (const int i_hp = ggml_vk_fuse_mul_mat_hc_post(ctx, cgraph, i); i_hp > 0) {
                 ctx->num_additional_fused_ops = i_hp - i;
                 ctx->fused_mul_mat_vec_hc_post = true;
@@ -15465,19 +15633,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
         if (ctx->num_additional_fused_ops && !ctx->fused_hc_select) {
-            // There are up to two output nodes - topk_moe has two.
+            // The last node is an output; topk_moe has a second one, the delta net conv state up to two more
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
-            ggml_tensor *output_nodes[2] {};
+            ggml_tensor *output_nodes[3] {};
             output_nodes[0] = cgraph->nodes[i + ctx->num_additional_fused_ops];
-            if (bits) {
+            for (int j = 1; bits && j < 3; ++j) {
                 int output_idx = find_first_set(bits);
-                GGML_ASSERT(bits == (1u << output_idx));
-                output_nodes[1] = cgraph->nodes[i + output_idx];
+                output_nodes[j] = cgraph->nodes[i + output_idx];
+                bits &= ~(1u << output_idx);
             }
+            GGML_ASSERT(bits == 0);
 
             bool need_disable = false;
 
-            for (int j = 0; j < 2; ++j) {
+            for (int j = 0; j < 3; ++j) {
                 ggml_tensor *dst = output_nodes[j];
                 if (!dst) {
                     continue;
@@ -15516,6 +15685,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_select = false;
                 ctx->fused_mul_mat_vec_glu = 0;
                 ctx->fused_mul_mat_vec_hc_post = false;
+                        ctx->fused_ssm_conv_state = false;
                 ctx->fused_cont_mul = false;
                 ctx->fused_mul_mat_cpy_f16 = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -15787,6 +15957,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         params->add_alloc_dep(params->user_data, src->view_src ? src->view_src : src, mul);
     }
 
+    // the CONCATs that feed an SSM_CONV (the conv state of a delta net) start their own run (below), so no other node is
+    // pulled in between the pieces of ggml_vk_ssm_conv_state
+    std::set<const ggml_tensor *> conv_state_cats;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i]->op == GGML_OP_SSM_CONV && graph->nodes[i]->src[0]->op == GGML_OP_CONCAT) {
+            conv_state_cats.insert(graph->nodes[i]->src[0]);
+        }
+    }
+
     int first_unused = 0;
 
     // scheduled or zero-compute nodes in [lo, hi)
@@ -15937,6 +16116,99 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 continue;
             }
         }
+        // the one-token conv of a delta net: CONCAT, the CPY of its tail into the state cache, SSM_CONV and SILU
+        // in a row (with the views they need), for ggml_vk_ssm_conv_state; other nodes in between go after
+        if (graph->nodes[first_unused]->op == GGML_OP_CONCAT) {
+            ggml_tensor * cat = graph->nodes[first_unused];
+            int j_cpy = -1, j_conv = -1, j_silu = -1;
+            // prefill puts more nodes between the CONCAT and the SSM_CONV than decode
+            const int end = std::min(first_unused + 32, graph->n_nodes);
+            for (int j = first_unused + 1; j < end; ++j) {
+                const ggml_tensor * n = graph->nodes[j];
+                if (j_cpy < 0 && n->op == GGML_OP_CPY && n->src[0]->view_src == cat) {
+                    j_cpy = j;
+                } else if (j_conv < 0 && n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
+                    j_conv = j;
+                } else if (j_conv >= 0 && n->op == GGML_OP_UNARY && ggml_get_unary_op(n) == GGML_UNARY_OP_SILU && n->src[0] == graph->nodes[j_conv]) {
+                    j_silu = j;
+                    break;
+                }
+            }
+            if (j_cpy > 0 && j_conv > 0 && j_silu > 0 && j_cpy < j_conv) {
+                // views in the window go first when all their sources are ready; the pieces must then be ready too
+                std::vector<int> order = { first_unused };
+                std::set<const ggml_tensor *> ready = { cat };
+                auto src_ready = [&](const ggml_tensor * n) {
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                        const ggml_tensor * src = n->src[s];
+                        if (!src || ready.count(src)) {
+                            continue;
+                        }
+                        for (int k = first_unused + 1; k < end; ++k) {
+                            if (graph->nodes[k] == src && !used[k]) {
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                };
+                for (int j = first_unused + 1; j < j_silu; ++j) {
+                    if (!used[j] && is_empty(graph->nodes[j]) && src_ready(graph->nodes[j])) {
+                        order.push_back(j);
+                        ready.insert(graph->nodes[j]);
+                    }
+                }
+                bool ok = true;
+                for (int j : { j_cpy, j_conv, j_silu }) {
+                    ok = ok && src_ready(graph->nodes[j]);
+                    order.push_back(j);
+                    ready.insert(graph->nodes[j]);
+                }
+                // and the L2 norm of a view of the output (q | k heads) right after, with that view
+                int j_last = j_silu;
+                for (int j = j_silu + 1; ok && j < end; ++j) {
+                    const ggml_tensor * n = graph->nodes[j];
+                    if (n->op == GGML_OP_L2_NORM && n->src[0]->view_src == graph->nodes[j_silu]) {
+                        std::vector<int> views;
+                        for (int k = j_silu + 1; k < j; ++k) {
+                            if (!used[k] && graph->nodes[k] == n->src[0] && src_ready(graph->nodes[k])) {
+                                views.push_back(k);
+                            }
+                        }
+                        if (src_ready(n) || (views.size() == 1)) {
+                            for (int k : views) {
+                                order.push_back(k);
+                                ready.insert(graph->nodes[k]);
+                            }
+                            order.push_back(j);
+                            ready.insert(n);
+                            j_last = j;
+                        }
+                        break;
+                    }
+                }
+                if (ok) {
+                    // the fused pass reads the inputs while it writes the outputs: keep them alive through the last node
+                    for (int j : order) {
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            ggml_tensor * src = graph->nodes[j]->src[s];
+                            if (src && !ready.count(src)) {
+                                params->add_alloc_dep(params->user_data, src, graph->nodes[j_last]);
+                            }
+                        }
+                    }
+                    for (int j : order) {
+                        new_order.push_back(graph->nodes[j]);
+                        used_node_set.insert(graph->nodes[j]);
+                        used[j] = true;
+                    }
+                    while (first_unused < graph->n_nodes && used[first_unused]) {
+                        first_unused++;
+                    }
+                    continue;
+                }
+            }
+        }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
@@ -15987,7 +16259,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rope_view_set_rows_pattern, j) ||
                 match_pattern(hc_post_gate_pattern, j) ||
                 // start their own runs (above)
-                mul_conts.count(graph->nodes[j])) {
+                conv_state_cats.count(graph->nodes[j]) || mul_conts.count(graph->nodes[j])) {
                 continue;
             }
             bool ok = true;

@@ -5,7 +5,7 @@
 #endif
 
 
-// Shared by the fusion shaders (hc_mix, hc_select, hc_pre_norm). Field meaning per shader is listed in each;
+// Shared by the fusion shaders (hc_mix, hc_select, hc_pre_norm, ssm_conv_state). Field meaning per shader is listed in each;
 // strides and offsets are in elements, a/b/c/e are the sources in order, d the destination.
 layout(push_constant) uniform parameter
 {

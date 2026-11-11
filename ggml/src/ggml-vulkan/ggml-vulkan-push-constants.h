@@ -1007,6 +1007,7 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
     p.d_off = dst  ? get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type)  : 0;
 }
 
+
 template <typename T> size_t push_constant_size(const T &t) {
     static_assert(std::is_class<T>::value, "T must be a struct/class");
     GGML_UNUSED(t);
