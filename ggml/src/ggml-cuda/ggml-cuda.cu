@@ -6998,6 +6998,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_2D:
         case GGML_OP_POOL_1D:
+            // the kernel indexes the source as contiguous rows
+            return ggml_is_contiguous(op->src[0]);
         case GGML_OP_POOL_2D:
             return true;
         case GGML_OP_ACC:
