@@ -3703,8 +3703,23 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
     } else if (!use_sparse && !ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // half8x8 kernel
-        const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG; // cache values per simdgroup
+
+        // queries per threadgroup: 16 rows share each K and V tile for the MLA shapes (F16 K and V, no sinks): decode with
+        // the heads as query rows (DK 576, 32 rows) and the expanded prefill (DK 192 / DV 128)
+        int nqptg = OP_FLASH_ATTN_EXT_NQPSG;
+        {
+            const bool kv_f16 = use_kv_f16 || (op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16);
+            if (kv_f16 && !has_sinks && ne01 > 8) {
+                if (ne00 == 576 && ne20 == 512) {
+                    // 16 rows pay off on long caches only; on short ones the fewer threadgroups do not fill the GPU
+                    nqptg = ne11 >= 16384 ? 16 : 8;
+                } else if (ne00 == 192 && ne20 == 128) {
+                    // 16 rows for the expanded MLA prefill; 32 rows were slower
+                    nqptg = 16;
+                }
+            }
+        }
 
         GGML_ASSERT(nqptg <= 32);
         GGML_ASSERT(nqptg  % 8  == 0);
@@ -3790,10 +3805,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // shared memory layout (halfs unless noted):
         //   queries/attn/result: Q*(DK + 2*PAD2(DV,64) + 4*C)
         //   quantized KV scratch: 16*32*NSG (only when is_q)
+        //   row rescale diag(ms): 8x8 floats per 8 queries
+        //   with more than 8 queries the result stays in registers: no 2*PAD2(DV,64) per query
         const int64_t dv_pad = GGML_PAD(ne20, 64);
 
         auto fa_smem = [&](int32_t nsg) -> size_t {
-            const size_t smem_half = nqptg*(ne00 + 2*dv_pad + 4*ncpsg) + is_q*(16*32*nsg);
+            const size_t smem_half = nqptg*(ne00 + (nqptg > 8 ? 0 : 2*dv_pad) + 4*ncpsg) + is_q*(16*32*nsg) + (nqptg/8)*2*8*8;
             return GGML_PAD(smem_half*sizeof(ggml_fp16_t), 16);
         };
 
@@ -3855,7 +3872,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, use_kv_f16, ns10, ns20, nwg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, use_kv_f16, ns10, ns20, nwg, nqptg);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
