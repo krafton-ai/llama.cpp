@@ -25553,7 +25553,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     r3 == 1 && r2 >= 1 && r2 <= 8 &&
                     (ne12 % r2) == 0;
 
-                if (ne11 * ne12 < 4) {
+                // decode with short rows (64..128): the lane-split kernel gives each row 16 lanes instead of a whole subgroup
+                if (ne11 * ne12 < 4 && adreno_use_lane_split && ne00 >= 64 && ne00 <= 128 &&
+                    ((offset0 | nb01 | nb02 | nb03) & 7) == 0) {
+                    kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_dr_lq;
+                    nrows  = 1;
+                } else if (ne11 * ne12 < 4) {
                     // Decode (single token): the legacy _1row runs one 64-lane
                     // subgroup per WG (one output row), under-utilizing BW. Route the
                     // wide f16 weight matmuls (attn proj + lm_head) to the multi-row
