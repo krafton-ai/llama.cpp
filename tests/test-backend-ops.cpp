@@ -4962,6 +4962,70 @@ struct test_rwkv_wkv6 : public test_case {
     }
 };
 
+// one hyper-connection site of the Raon-1 nano graph in graph order (llama_model_raon1_nano::graph::build_hc_pre and
+// build_hc_post with the fused DSV4 ops): the selector (stream projection of the RMS-normed flat streams, sigmoids, pre-weighted
+// stream sum with its RMS norm), a layer stand-in, and the comb chain right before its hc_post. A backend may fuse the selector
+// and compute the comb inside the hc_post (Metal); mixes, the layer input and the new streams are checked.
+struct test_hc_site : public test_case {
+    const ggml_type type_fn;
+    const int64_t n, hc, nmix, nt;
+    ggml_tensor * mixes = nullptr, * y = nullptr, * out = nullptr;
+
+    test_hc_site(ggml_type type_fn = GGML_TYPE_F32, int64_t n = 1536, int64_t hc = 4, int64_t nmix = 17, int64_t nt = 1)
+        : type_fn(type_fn), n(n), hc(hc), nmix(nmix), nt(nt) {}
+
+    std::string vars() override { return VARS_TO_STR5(type_fn, n, hc, nmix, nt); }
+    std::string op_desc(ggml_tensor *) override { return "HC_SITE"; }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { mixes, y, out }; }
+    double max_nmse_err() override { return type_fn == GGML_TYPE_F16 ? 1e-4 : 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_w) override {
+        const int64_t hc2 = hc*hc;
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, hc, nt);
+        ggml_tensor * fn    = ggml_new_tensor_2d(ctx_w, type_fn, n*hc, nmix);
+        ggml_tensor * base  = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, nmix);
+        ggml_tensor * chart = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, nmix*hc2 + 2*hc2);
+        ggml_tensor * w     = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, n);
+        ggml_tensor * wo    = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n, n);
+        ggml_set_name(x, "x");
+        ggml_set_name(fn, "fn");
+        ggml_set_name(chart, "chart");
+
+        ggml_tensor * flat = ggml_reshape_2d(ctx, x, n*hc, nt);
+        mixes = ggml_add(ctx, ggml_mul_mat(ctx, fn, ggml_rms_norm(ctx, flat, 1e-6f)), base);
+        ggml_tensor * sg   = ggml_sigmoid(ctx, ggml_view_2d(ctx, mixes, 2*hc, nt, mixes->nb[1], 0));
+        ggml_tensor * pre  = ggml_view_2d(ctx, sg, hc, nt, sg->nb[1], 0);
+        ggml_tensor * post = ggml_view_2d(ctx, sg, hc, nt, sg->nb[1], hc*sg->nb[0]);
+
+        ggml_tensor * K  = ggml_view_2d(ctx, chart, nmix, hc2, nmix*chart->nb[0], 0);
+        ggml_tensor * r  = ggml_view_1d(ctx, chart, hc2, nmix*hc2*chart->nb[0]);
+        ggml_tensor * c0 = ggml_view_2d(ctx, chart, hc, hc, hc*chart->nb[0], (nmix*hc2 + hc2)*chart->nb[0]);
+        ggml_tensor * e   = ggml_mul_mat(ctx, K, mixes);
+        ggml_tensor * rho = ggml_pool_1d(ctx, ggml_mul(ctx, e, r), GGML_OP_POOL_MAX, hc2, hc2, 0);
+        rho = ggml_reshape_3d(ctx, ggml_scale_bias(ctx, rho, 1.0f, 1.0f), 1, 1, nt);
+        ggml_tensor * comb = ggml_add(ctx, ggml_div(ctx, ggml_reshape_3d(ctx, e, hc, hc, nt), rho), c0);
+
+        y = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_dsv4_hc_pre(ctx, x, pre), 1e-5f), w);
+        ggml_tensor * branch = ggml_mul_mat(ctx, wo, y);
+        out = ggml_dsv4_hc_post(ctx, branch, x, post, comb);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            // a small chart keeps rho = 1 + max(e * r) away from 0, like the folded chart (max(e * r) >= 0); a small projection keeps
+            // the mixes at a few units as in the model (large ones make the sigmoids depend on the F16 rounding of the reference)
+            const bool small = strcmp(t->name, "chart") == 0 || strcmp(t->name, "fn") == 0;
+            init_tensor_uniform(t, small ? -0.05f : -1.0f, small ? 0.05f : 1.0f);
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
@@ -10484,6 +10548,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    for (ggml_type type_fn : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int64_t nt : { 1, 2, 7, 33 }) {
+            test_cases.emplace_back(new test_hc_site(type_fn, 1536, 4, 17, nt));
+        }
+    }
     test_cases.emplace_back(new test_mla_expand_kv(300, 4, 4));
     test_cases.emplace_back(new test_mla_expand_kv(1024, 0, 16));
     test_cases.emplace_back(new test_mla_expand_kv(1, 8, 8));

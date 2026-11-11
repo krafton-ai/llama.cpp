@@ -708,6 +708,157 @@ static bool ggml_metal_fusion_check_mul_mat_add(
 
 // MUL_MAT + GLU: a one-row Q4_K mat-vec whose [gate | up] output feeds only a single-src swiglu computes
 // rows j and j + n_ff in one simdgroup and writes silu(gate)*up; the mat-vec output itself is never stored
+
+// hyper-connection selector (mHC, as llama_model_raon1_nano builds it with standard ops): the stream projection of the
+// RMS-normed flat streams plus a bias (mixes, read later by the comb), the sigmoid of its first 2*hc values (pre | post,
+// post read later by hc_post), and the RMS norm of the pre-weighted stream sum times a weight (the layer input)
+static bool ggml_metal_fusion_check_hc_select(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * rn0  = nodes[0];
+    const ggml_tensor * mm   = nodes[1];
+    const ggml_tensor * add  = nodes[2];
+    const ggml_tensor * sg   = nodes[3];
+    const ggml_tensor * pre  = nodes[4];
+    const ggml_tensor * rn1  = nodes[5];
+    const ggml_tensor * mul  = nodes[6];
+
+    const ggml_tensor * x    = pre->src[0];    // streams [n, hc, nt]
+    const ggml_tensor * fn   = mm->src[0];     // [n*hc, nmix]
+    const ggml_tensor * base = add->src[1];
+    const ggml_tensor * w    = mul->src[1];
+
+    if (ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    if (mm->src[1] != rn0 || add->src[0] != mm || rn1->src[0] != pre || mul->src[0] != rn1) {
+        return false;
+    }
+    const int64_t n = x->ne[0], hc = x->ne[1], nt = x->ne[2], nmix = fn->ne[1];
+    // rn0 normalizes the flat view of x; sg reads the first 2*hc mixes; pre's weights are the first hc sigmoids
+    if (rn0->src[0]->view_src != x && rn0->src[0] != x) {
+        return false;
+    }
+    if (rn0->src[0]->ne[0] != n*hc || rn0->src[0]->ne[1] != nt || !ggml_is_contiguous(x)) {
+        return false;
+    }
+    if (sg->src[0]->view_src != add || sg->src[0]->view_offs != 0 || sg->ne[0] != 2*hc || !ggml_is_contiguous(sg)) {
+        return false;
+    }
+    if (pre->src[1]->view_src != sg || pre->src[1]->view_offs != 0 || pre->src[1]->ne[0] != hc) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || (fn->type != GGML_TYPE_F32 && fn->type != GGML_TYPE_F16) || !ggml_is_contiguous(fn) ||
+            fn->ne[0] != n*hc || nmix > 32 || nmix < 2*hc || hc > 8 || n % 4 != 0) {
+        return false;
+    }
+    if (base->type != GGML_TYPE_F32 || !ggml_is_contiguous(base) || ggml_nelements(base) != nmix || add->ne[0] != nmix ||
+            !ggml_is_contiguous(add)) {
+        return false;
+    }
+    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || ggml_nelements(w) != n || !ggml_is_contiguous(mul) ||
+            mul->ne[0] != n || ggml_nrows(mul) != nt) {
+        return false;
+    }
+
+    // mixes and the sigmoids are read after the group; the intermediates are not
+    const int outs[3] = { node_idxs[idx + 6], node_idxs[idx + 2], node_idxs[idx + 3] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, (int) fusion->ops.size(), fusion->ops.data(), outs, 3);
+}
+
+// hyper-connection comb computed in place right before its hc_post (never written): e = K^T mixes,
+// rho = scale*max(e*r) + bias, comb = e/rho + c0, then DSV4_HC_POST with that comb
+static bool ggml_metal_fusion_check_hc_comb_post(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * e    = nodes[0];
+    const ggml_tensor * er   = nodes[1];
+    const ggml_tensor * pool = nodes[2];
+    const ggml_tensor * sc   = nodes[3];
+    const ggml_tensor * dv   = nodes[4];
+    const ggml_tensor * comb = nodes[5];
+    const ggml_tensor * post = nodes[6];
+
+    const ggml_tensor * K     = e->src[0];
+    const ggml_tensor * mixes = e->src[1];
+    const ggml_tensor * r     = er->src[1];
+    const ggml_tensor * c0    = comb->src[1];
+
+    const int64_t hc = post->src[1]->ne[1];
+    const int64_t hc2 = hc*hc;
+    const int64_t nmix = mixes->ne[0];
+    const int64_t nt = mixes->ne[1];
+
+    if (hc != 4) { // the hc_post kernel's stream count
+        return false;
+    }
+    if (er->src[0] != e || pool->src[0] != er || sc->src[0] != pool || comb->src[0] != dv || post->src[3] != comb) {
+        return false;
+    }
+    if ((dv->src[0] != e && dv->src[0]->view_src != e) || (dv->src[1] != sc && dv->src[1]->view_src != sc)) {
+        return false;
+    }
+    const int32_t * pp = (const int32_t *) pool->op_params;
+    if (pp[0] != GGML_OP_POOL_MAX || pp[1] != hc2 || pp[2] != hc2 || pp[3] != 0) {
+        return false;
+    }
+    if (K->type != GGML_TYPE_F32 || K->ne[0] != nmix || K->ne[1] != hc2 || K->nb[0] != sizeof(float) ||
+            mixes->type != GGML_TYPE_F32 || mixes->nb[0] != sizeof(float) || e->ne[0] != hc2 || e->ne[1] != nt) {
+        return false;
+    }
+    if (r->type != GGML_TYPE_F32 || ggml_nelements(r) != hc2 || r->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (c0->type != GGML_TYPE_F32 || c0->ne[0] != hc || c0->ne[1] != hc || c0->ne[2] != 1 || c0->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (comb->ne[0] != hc || comb->ne[1] != hc || comb->ne[2] != nt || nmix > 64) {
+        return false;
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (post->src[s]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (post->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // e and the scaled max are read through the reshapes in front of the DIV: count them as outputs of the subgraph check,
+    // then require that e has no reader besides the MUL and its reshape, the scaled max none besides its reshape, and the
+    // reshapes none besides the DIV (they sit between e and the DIV in graph order)
+    const int outs[3] = { node_idxs[idx + 6], node_idxs[idx + 0], node_idxs[idx + 3] };
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, (int) fusion->ops.size(), fusion->ops.data(), outs, 3)) {
+        return false;
+    }
+    if (ggml_node_get_use_count(gf, node_idxs[idx + 0]) != 2 || ggml_node_get_use_count(gf, node_idxs[idx + 3]) != 1) {
+        return false;
+    }
+    int n_views = 0;
+    for (int i = node_idxs[idx + 0] + 1; i < node_idxs[idx + 4]; ++i) {
+        const ggml_tensor * v = gf->nodes[i];
+        if (v == dv->src[0] || v == dv->src[1]) {
+            if (ggml_node_get_use_count(gf, i) != 1) {
+                return false;
+            }
+            n_views++;
+        }
+    }
+    return n_views == (dv->src[0] != e) + (dv->src[1] != sc);
+}
+
 static bool ggml_metal_fusion_check_mul_mat_glu(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -798,6 +949,12 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_mul_mat_glu = { GGML_OP_MUL_MAT, GGML_OP_GLU };
+static const std::vector<ggml_op> ops_hc_select = {
+    GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL
+};
+static const std::vector<ggml_op> ops_hc_comb_post = {
+    GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_ADD, GGML_OP_DSV4_HC_POST
+};
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -828,6 +985,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
     { GGML_METAL_FUSION_MUL_MAT_GLU,    ops_mul_mat_glu,            {},     true,  ggml_metal_fusion_check_mul_mat_glu },
+    { GGML_METAL_FUSION_HC_SELECT,      ops_hc_select,              {2, 3}, true,  ggml_metal_fusion_check_hc_select },
+    { GGML_METAL_FUSION_HC_COMB_POST,   ops_hc_comb_post,           {},     true,  ggml_metal_fusion_check_hc_comb_post },
 };
 
 // ---- alloc deps -----------------------------------------------------------

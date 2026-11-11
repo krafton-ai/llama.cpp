@@ -1576,6 +1576,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mla_expand_w(ggm
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_by_name(ggml_metal_library_t lib, const char * name) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mla_expand_kv(ggml_metal_library_t lib) {
     const char * name = "kernel_mla_expand_kv";
 

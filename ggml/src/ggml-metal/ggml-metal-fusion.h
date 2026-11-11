@@ -44,6 +44,8 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
     GGML_METAL_FUSION_MUL_MAT_GLU,  // MUL_MAT + GLU (swiglu, one src): the mat-vec writes silu(gate)*up
+    GGML_METAL_FUSION_HC_SELECT,    // hyper-connection selector: RMS_NORM + MUL_MAT + ADD + SIGMOID + DSV4_HC_PRE + RMS_NORM + MUL
+    GGML_METAL_FUSION_HC_COMB_POST, // hyper-connection comb + post: MUL_MAT + MUL + POOL_1D(max) + SCALE + DIV + ADD + DSV4_HC_POST
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

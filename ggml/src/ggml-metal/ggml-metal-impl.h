@@ -1371,6 +1371,42 @@ typedef struct {
     uint64_t nb_d2;
 } ggml_metal_kargs_dsv4_hc_post;
 
+// GGML_METAL_FUSION_HC_SELECT
+typedef struct {
+    int32_t  n;      // stream width
+    int32_t  hc;     // streams
+    int32_t  nmix;   // projection rows
+    uint64_t nb_x1;  // stream and token strides of x
+    uint64_t nb_x2;
+    uint64_t nb_fn1; // projection row stride
+    uint64_t nb_m1;  // token strides of mixes, of the sigmoids and of the output
+    uint64_t nb_s1;
+    uint64_t nb_y1;
+    float    eps0;   // RMS norm of the flat streams
+    float    eps1;   // RMS norm of the pre-weighted sum
+} ggml_metal_kargs_hc_select;
+
+// GGML_METAL_FUSION_HC_COMB_POST (hc = 4)
+typedef struct {
+    int32_t  n_embd;
+    int32_t  nmix;
+    uint64_t nb_k1;  // K [nmix, hc*hc] column stride
+    uint64_t nb_m1;  // mixes token stride
+    uint64_t nb_c1;  // c0 [hc, hc] row stride
+    float    scale;  // rho = scale*max(e*r) + bias
+    float    bias;
+    uint64_t nb_x0;  // hc_post: x (branch) [n, nt], residual [n, hc, nt], post [hc, nt], dst [n, hc, nt]
+    uint64_t nb_x1;
+    uint64_t nb_r0;
+    uint64_t nb_r1;
+    uint64_t nb_r2;
+    uint64_t nb_p0;
+    uint64_t nb_p1;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+} ggml_metal_kargs_hc_comb_post;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

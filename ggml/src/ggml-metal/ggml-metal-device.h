@@ -149,6 +149,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mla_expand_w     (ggml_metal_library_t lib, enum ggml_type type);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mla_expand_kv    (ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_by_name          (ggml_metal_library_t lib, const char * name);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax_2p         (ggml_metal_library_t lib, const struct ggml_tensor * op, bool join);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);

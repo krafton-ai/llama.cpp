@@ -764,6 +764,197 @@ kernel void kernel_dsv4_hc_pre_gated_f32(
     *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
 }
 
+// GGML_METAL_FUSION_HC_SELECT, step 1: one threadgroup per projection row and token: mixes[m] = fn[m] (x / rms(x)) + base[m]
+// over the flat streams, and its sigmoid for the first 2*hc rows
+template<typename T>
+kernel void kernel_hc_mix(
+        constant ggml_metal_kargs_hc_select & args,
+        device const char * x,
+        device const char * fn,
+        device const char * base,
+        device       char * mixes,
+        device       char * sg,
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint2  tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort2  ntg2[[threads_per_threadgroup]]) {
+    const int ntg = ntg2.x;
+    const int m   = tgpig.x;
+    const int t   = tgpig.y;
+    const int n   = args.n;
+    const int nx  = n*args.hc;
+    const int nsg = ntg/32;
+
+    device const char * xt = x + (uint64_t) t*args.nb_x2;
+    device const T    * fr = (device const T *) (fn + (uint64_t) m*args.nb_fn1);
+
+    float ss = 0.0f;
+    float d  = 0.0f;
+    for (int i = tpitg; i < nx; i += ntg) {
+        const int is = i / n, ii = i - is*n;
+        const float xv = *((device const float *) (xt + (uint64_t) is*args.nb_x1) + ii);
+        ss += xv*xv;
+        d  += (float) fr[i]*xv;
+    }
+    ss = simd_sum(ss);
+    d  = simd_sum(d);
+    if (tiisg == 0) {
+        shmem[2*sgitg + 0] = ss;
+        shmem[2*sgitg + 1] = d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tpitg == 0) {
+        float tss = 0.0f, td = 0.0f;
+        for (int s = 0; s < nsg; ++s) {
+            tss += shmem[2*s + 0];
+            td  += shmem[2*s + 1];
+        }
+        const float v = td/sqrt(tss/nx + args.eps0) + ((device const float *) base)[m];
+        ((device float *) (mixes + (uint64_t) t*args.nb_m1))[m] = v;
+        if (m < 2*args.hc) {
+            ((device float *) (sg + (uint64_t) t*args.nb_s1))[m] = 1.0f/(1.0f + exp(-v));
+        }
+    }
+}
+
+typedef decltype(kernel_hc_mix<float>) kernel_hc_mix_t;
+
+template [[host_name("kernel_hc_mix_f32")]] kernel kernel_hc_mix_t kernel_hc_mix<float>;
+template [[host_name("kernel_hc_mix_f16")]] kernel kernel_hc_mix_t kernel_hc_mix<half>;
+
+// GGML_METAL_FUSION_HC_SELECT, step 2: one threadgroup per token: y = RMS_NORM(sum_s x[:, s]*pre[s])*w with pre the first hc sigmoids
+kernel void kernel_hc_pre_norm(
+        constant ggml_metal_kargs_hc_select & args,
+        device const char * x,
+        device const char * sg,
+        device const char * w,
+        device       char * y,
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    const int t   = tgpig;
+    const int n   = args.n;
+    const int hc  = args.hc;
+    const int nsg = ntg/32;
+
+    device const char  * xt  = x + (uint64_t) t*args.nb_x2;
+    device const float * pre = (device const float *) (sg + (uint64_t) t*args.nb_s1);
+
+    float p[8];
+    for (int s = 0; s < 8; ++s) {
+        p[s] = s < hc ? pre[s] : 0.0f;
+    }
+
+    float ss = 0.0f;
+    for (int i = tpitg; i < n; i += ntg) {
+        float h = 0.0f;
+        for (int s = 0; s < hc; ++s) {
+            h += *((device const float *) (xt + (uint64_t) s*args.nb_x1) + i)*p[s];
+        }
+        ss += h*h;
+    }
+    ss = simd_sum(ss);
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int s = 0; s < nsg; ++s) {
+        tot += shmem[s];
+    }
+    const float inv = 1.0f/sqrt(tot/n + args.eps1);
+    device float * yt = (device float *) (y + (uint64_t) t*args.nb_y1);
+    for (int i = tpitg; i < n; i += ntg) {
+        float h = 0.0f;
+        for (int s = 0; s < hc; ++s) {
+            h += *((device const float *) (xt + (uint64_t) s*args.nb_x1) + i)*p[s];
+        }
+        yt[i] = h*inv*((device const float *) w)[i];
+    }
+}
+
+// GGML_METAL_FUSION_HC_COMB_POST: the comb of 4 streams computed in every simdgroup (e = K^T mixes, rho = scale*max(e*r) + bias,
+// comb = e/rho + c0, lanes 4..19), then the hc_post of kernel_dsv4_hc_post_f32 with it
+kernel void kernel_hc_comb_post_f32(
+        constant ggml_metal_kargs_hc_comb_post & args,
+        device const char * K,
+        device const char * mixes,
+        device const char * r,
+        device const char * c0,
+        device const char * x,
+        device const char * residual,
+        device const char * post,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    constexpr ushort hc = 4;
+
+    const int it = tgpig.y;
+    const int i0 = ((int) tgpig.x*ntg.y + sgitg)*32 + tiisg;
+
+    // lanes 0..15: e and e*r for one comb entry k = dst + hc*src
+    float ek = 0.0f;
+    float er = -INFINITY;
+    if (tiisg < hc*hc) {
+        device const float * kc = (device const float *) (K + (uint64_t) tiisg*args.nb_k1);
+        device const float * mt = (device const float *) (mixes + (uint64_t) it*args.nb_m1);
+        for (int m = 0; m < args.nmix; ++m) {
+            ek += kc[m]*mt[m];
+        }
+        er = ek*((device const float *) r)[tiisg];
+    }
+    const float rho = simd_max(er)*args.scale + args.bias;
+
+    float coeff_lane = 0.0f;
+    const float comb_k = simd_shuffle(ek, (ushort) (tiisg >= hc ? tiisg - hc : 0));
+    if (tiisg < hc) {
+        coeff_lane = *(device const float *) (post + tiisg*args.nb_p0 + it*args.nb_p1);
+    } else if (tiisg < hc + hc*hc) {
+        const ushort k = tiisg - hc;
+        coeff_lane = comb_k/rho + *(device const float *) (c0 + (k % hc)*sizeof(float) + (k / hc)*args.nb_c1);
+    }
+
+    float post_reg[hc];
+    float comb_reg[hc][hc];
+    FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
+        post_reg[idst] = simd_shuffle(coeff_lane, idst);
+    }
+    FOR_UNROLL (ushort isrc = 0; isrc < hc; ++isrc) {
+        FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
+            comb_reg[isrc][idst] = simd_shuffle(coeff_lane, hc + idst + hc*isrc);
+        }
+    }
+
+    if (i0 >= args.n_embd) {
+        return;
+    }
+
+    const float xv = *(device const float *) (x + i0*args.nb_x0 + it*args.nb_x1);
+    float result[hc];
+    FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
+        result[idst] = xv*post_reg[idst];
+    }
+
+    device const char * rb = residual + i0*args.nb_r0 + it*args.nb_r2;
+    FOR_UNROLL (ushort isrc = 0; isrc < hc; ++isrc) {
+        const float rv = *(device const float *) (rb + isrc*args.nb_r1);
+        FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
+            result[idst] = fma(rv, comb_reg[isrc][idst], result[idst]);
+        }
+    }
+
+    FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
+        *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
+    }
+}
+
 kernel void kernel_dsv4_hc_post_nocomb_f32(
         constant ggml_metal_kargs_dsv4_hc_post & args,
         device const char * x,
