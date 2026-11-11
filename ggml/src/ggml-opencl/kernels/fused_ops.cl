@@ -192,6 +192,31 @@ kernel void kernel_sigmoid_div_mul(
 }
 
 //------------------------------------------------------------------------------
+// add_sigmoid_scale: ADD(bias row) -> SIGMOID -> SCALE, y = sigmoid(x + b[j]) * s + c
+//------------------------------------------------------------------------------
+kernel void kernel_add_sigmoid_scale(
+        global const char * x,
+        ulong offset_x,
+        ulong nbx1,
+        global const float * b,
+        ulong offset_b,
+        global char * y,
+        ulong offset_y,
+        int n,
+        int nr,
+        float s,
+        float c) {
+    const int j = get_global_id(0);
+    const int r = get_global_id(1);
+    if (j >= n || r >= nr) {
+        return;
+    }
+    b = (global const float *) ((global const char *) b + offset_b);
+    const float z = *(global const float *) (x + offset_x + r * nbx1 + j * sizeof(float)) + b[j];
+    ((global float *) (y + offset_y))[r * n + j] = (1.0f / (1.0f + exp(-z))) * s + c;
+}
+
+//------------------------------------------------------------------------------
 // rms_norm_mul_mat_add_reduce: second half of RMS_NORM -> MUL_MAT -> ADD(base).
 //   parts [nmix + 1, nsplit, nt] from kernel_rms_norm_mul_mat_add_part_*: rows 0..nmix-1 partial w.x, row nmix partial x.x
 //   y[k, t] = sum_s parts[k, s, t] / sqrt(sum_s parts[nmix, s, t] / n + eps) + base[k]

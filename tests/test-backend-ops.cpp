@@ -8849,6 +8849,43 @@ struct test_sigmoid_div_mul : public test_case {
     }
 };
 
+// GGML_OP_ADD(bias row) + GGML_OP_UNARY(SIGMOID) + GGML_OP_SCALE, e.g. a bounded decay gate
+struct test_add_sigmoid_scale : public test_case {
+    const int64_t n;
+    const int64_t n_rows;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_SIGMOID_SCALE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, n_rows, scale);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_add_sigmoid_scale(int64_t n, int64_t n_rows, float scale)
+        : n(n), n_rows(n_rows), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_rows);
+        ggml_set_name(x, "x");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_add(ctx, x, b)), scale);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_tensor_uniform(ggml_get_tensor(ctx, "x"), -6.0f, 6.0f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "b"), -2.0f, 2.0f);
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12419,6 +12456,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_sigmoid_div_mul(128, 4, 1, 16));
     test_cases.emplace_back(new test_sigmoid_div_mul(64, 8, 5, 32));
+
+    test_cases.emplace_back(new test_add_sigmoid_scale(512, 1, 0.9f));
+    test_cases.emplace_back(new test_add_sigmoid_scale(2048, 7, 0.5f));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

@@ -863,6 +863,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rms_norm_mul_mat_add_reduce   = nullptr;
     cl_kernel kernel_mul_mat_pool_max_div_add      = nullptr;
     cl_kernel kernel_sigmoid_div_mul               = nullptr;
+    cl_kernel kernel_add_sigmoid_scale             = nullptr;
     cl_kernel kernel_dsv4_hc_post_sum              = nullptr;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
@@ -1752,6 +1753,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_mul_mat_pool_max_div_add = clCreateKernel(prog, "kernel_mul_mat_pool_max_div_add", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_mat_add_reduce = clCreateKernel(prog, "kernel_rms_norm_mul_mat_add_reduce", &err), err));
         CL_CHECK((backend_ctx->kernel_sigmoid_div_mul = clCreateKernel(prog, "kernel_sigmoid_div_mul", &err), err));
+        CL_CHECK((backend_ctx->kernel_add_sigmoid_scale = clCreateKernel(prog, "kernel_add_sigmoid_scale", &err), err));
         CL_CHECK((backend_ctx->kernel_dsv4_hc_post_sum = clCreateKernel(prog, "kernel_dsv4_hc_post_sum", &err), err));
         // the fusion kernels use 256-wide work-groups; without them the unfused graph runs
         cl_kernel * fused[] = {
@@ -1760,6 +1762,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             &backend_ctx->kernel_rms_norm_mul_mat_add_reduce,
             &backend_ctx->kernel_mul_mat_pool_max_div_add,
             &backend_ctx->kernel_sigmoid_div_mul,
+            &backend_ctx->kernel_add_sigmoid_scale,
         };
         for (size_t i = 0; i < sizeof(fused)/sizeof(fused[0]); ++i) {
             size_t max_wg = 0;
@@ -8925,6 +8928,11 @@ static ggml_opencl_brange ggml_opencl_range(const ggml_tensor * t) {
     return r;
 }
 
+static bool ggml_opencl_same_buffer(const ggml_tensor * a, const ggml_tensor * b) {
+    const ggml_opencl_brange x = ggml_opencl_range(a), y = ggml_opencl_range(b);
+    return x.mem && x.mem == y.mem && x.lo == y.lo && ggml_are_same_shape(a, b) && ggml_are_same_stride(a, b);
+}
+
 static bool ggml_opencl_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
     const ggml_opencl_brange x = ggml_opencl_range(a), y = ggml_opencl_range(b);
     return !x.mem || !y.mem || (x.mem == y.mem && x.lo < y.hi && y.lo < x.hi);
@@ -9219,6 +9227,45 @@ static void ggml_opencl_fused_sigmoid_div_mul(ggml_backend_t backend, const ggml
     backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, mul);
 }
 
+// ADD(x, bias row) -> SIGMOID -> SCALE
+static bool ggml_opencl_match_add_sigmoid_scale(ggml_backend_opencl_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ctx->kernel_add_sigmoid_scale || !ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE })) {
+        return false;
+    }
+    const ggml_tensor * add = cgraph->nodes[i];
+    const ggml_tensor * sg  = cgraph->nodes[i + 1];
+    const ggml_tensor * sc  = cgraph->nodes[i + 2];
+    const ggml_tensor * x   = add->src[0];
+    const ggml_tensor * b   = add->src[1];
+    return ggml_get_unary_op(sg) == GGML_UNARY_OP_SIGMOID && sg->src[0] == add && sc->src[0] == sg &&
+           x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[2] == 1 && x->ne[3] == 1 &&
+           b->type == GGML_TYPE_F32 && ggml_is_contiguous(b) && ggml_nelements(b) == x->ne[0] &&
+           sc->type == GGML_TYPE_F32 && ggml_is_contiguous(sc) && !ggml_opencl_overlaps(sc, b) &&
+           (!ggml_opencl_overlaps(sc, x) || ggml_opencl_same_buffer(sc, x));
+}
+
+static void ggml_opencl_fused_add_sigmoid_scale(ggml_backend_t backend, const ggml_cgraph * cgraph, int i) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    const ggml_tensor *           add         = cgraph->nodes[i];
+    const ggml_tensor *           sc          = cgraph->nodes[i + 2];
+    cl_kernel                     k           = backend_ctx->kernel_add_sigmoid_scale;
+    const int                     n = (int) add->ne[0], nr = (int) add->ne[1];
+    const float                   s = ggml_get_op_params_f32(sc, 0), c = ggml_get_op_params_f32(sc, 1);
+    const cl_ulong                nbx1 = add->src[0]->nb[1];
+    cl_uint                       idx  = 0;
+    ggml_opencl_arg_tensor(k, idx, add->src[0]);
+    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_ulong), &nbx1));
+    ggml_opencl_arg_tensor(k, idx, add->src[1]);
+    ggml_opencl_arg_tensor(k, idx, sc);
+    CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &n));
+    CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &nr));
+    CL_CHECK(clSetKernelArg(k, idx++, sizeof(float), &s));
+    CL_CHECK(clSetKernelArg(k, idx++, sizeof(float), &c));
+    size_t lws[2] = { 64, 1 };
+    size_t gws[2] = { (size_t) (n + 63) / 64 * 64, (size_t) nr };
+    backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, sc);
+}
+
 // RMS_NORM(x) -> MUL_MAT(fn [n, nmix], .) -> ADD(base) for up to 8 tokens: the long rows are split over work-groups
 // (partial dot products and partial sums of squares), then one small reduce
 static bool ggml_opencl_match_rms_norm_mul_mat_add(ggml_backend_opencl_context * ctx,
@@ -9330,6 +9377,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 i = last;
                 continue;
             }
+        }
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_ADD &&
+            ggml_opencl_match_add_sigmoid_scale(backend_ctx, cgraph, i)) {
+            ggml_opencl_fused_add_sigmoid_scale(backend, cgraph, i);
+            i += 2;
+            continue;
         }
         if (!backend_ctx->disable_fusion && node->op == GGML_OP_MUL_MAT) {
             const int last = ggml_opencl_match_mul_mat_pool_max_div_add(backend_ctx, cgraph, i);
