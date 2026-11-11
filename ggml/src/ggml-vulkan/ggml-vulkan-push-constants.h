@@ -861,6 +861,21 @@ struct vk_quantize_q8_1_push_constants {
     uint32_t num_blocks;
 };
 
+struct vk_op_fa_mla_decode_push_constants {
+    uint32_t n_kv;
+    uint32_t split_kv;
+    uint32_t k_num;
+    uint32_t q_head;
+    uint32_t k_row;
+    uint32_t has_mask;
+    float    scale;
+    uint32_t q_off;
+    uint32_t k_off;
+    uint32_t m_off;
+    uint32_t q_tok;   // Q token stride in floats (MT: workgroup z = query token)
+    uint32_t m_row;   // mask row stride in halves
+};
+
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;

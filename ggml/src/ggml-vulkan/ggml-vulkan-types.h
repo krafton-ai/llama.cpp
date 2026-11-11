@@ -990,6 +990,8 @@ struct vk_device_struct {
     bool fa_sparse_compact_use_subgroups;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
+    vk_pipeline pipeline_fa_mla_decode[3];  // 16, 32, 64 query heads on one 576 / 512 latent head
+    vk_pipeline pipeline_fa_mla_decode_hg2[2];  // 32 query heads in two workgroups along y; [1] without the K tile prefetch
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
     vk_pipeline pipeline_count_experts;
 

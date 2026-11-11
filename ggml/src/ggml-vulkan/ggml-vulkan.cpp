@@ -3172,6 +3172,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+    // 2 keys x HG heads per invocation in the score phase instead of 1 key x 2*HG heads: fewer shared memory reads per
+    // fma on GPUs with many cores
+    const uint32_t mla_kg = device->shader_core_count >= 60 ? 2 : 1;
+    for (uint32_t i = 0; i < 3; ++i) {
+        ggml_vk_create_pipeline(device, device->pipeline_fa_mla_decode[i], "fa_mla_decode_f32_f16", fa_mla_decode_f32_f16_len, fa_mla_decode_f32_f16_data, "main", 4,
+            sizeof(vk_op_fa_mla_decode_push_constants), {1, 1, 1}, {256, 16u << i, 576, 512, 1, 1, mla_kg}, 1, true);
+    }
+    ggml_vk_create_pipeline(device, device->pipeline_fa_mla_decode_hg2[0], "fa_mla_decode_hg2_f32_f16", fa_mla_decode_f32_f16_len, fa_mla_decode_f32_f16_data, "main", 4,
+        sizeof(vk_op_fa_mla_decode_push_constants), {1, 1, 1}, {256, 32, 576, 512, 2, 1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_fa_mla_decode_hg2[1], "fa_mla_decode_hg2_nopf_f32_f16", fa_mla_decode_f32_f16_len, fa_mla_decode_f32_f16_data, "main", 4,
+        sizeof(vk_op_fa_mla_decode_push_constants), {1, 1, 1}, {256, 32, 576, 512, 2, 0}, 1, true);
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->vendor_id == VK_VENDOR_ID_INTEL && (device->architecture == INTEL_XE2 || (device->architecture == INTEL_XE1 && device->coopmat_support && device->uma))) {
@@ -8071,6 +8082,95 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+// MLA decode (DeepSeek / Raon-1 shape): 1 to 8 query tokens (MT: speculative verify), 16 to 64 query heads on one
+// latent head of 576 with V the first 512 of each K row. The scalar flash attention reads every K row once per head there (the heads exceed one GQA
+// workgroup); this kernel reads it once per workgroup for all heads, then reduces the splits like flash attention.
+// AMD only for now
+static bool ggml_vk_fa_mla_decode(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k,
+        const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    if (ctx->device->vendor_id != VK_VENDOR_ID_AMD) {
+        return false;
+    }
+    const int64_t H = q->ne[2];
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    // MT: up to 8 query tokens (speculative verify), one per workgroup z; the split-k reduce takes them as ne2
+    const int64_t T = q->ne[1];
+    if (q->ne[0] != 576 || v->ne[0] != 512 || T < 1 || T > 8 || q->ne[3] != 1 || k->ne[2] != 1 || k->ne[3] != 1 ||
+        !(H == 16 || H == 32 || H == 64) || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        k->buffer != v->buffer || k->data != v->data || k->nb[1] != v->nb[1] || k->nb[0] != sizeof(ggml_fp16_t) ||
+        sinks || max_bias != 0.0f || logit_softcap != 0.0f || (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < k->ne[1] || mask->ne[1] < T || mask->ne[2] != 1 || mask->ne[3] != 1)) ||
+        q->nb[0] != sizeof(float) || dst->ne[1] != H || dst->ne[2] != T) {
+        return false;
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_fa_mla_decode[H == 16 ? 0 : H == 32 ? 1 : 2];
+    if (!pipeline) {
+        return false;
+    }
+    // the kernel reads K as f16 pairs: the K start and row stride must be even in halves
+    // and Q as f32 pairs: the Q start and head stride must be even in floats
+    if ((get_misalign_bytes(ctx, k) / sizeof(ggml_fp16_t)) % 2 != 0 || (k->nb[1] / sizeof(ggml_fp16_t)) % 2 != 0 ||
+        (get_misalign_bytes(ctx, q) / sizeof(float)) % 2 != 0 || (q->nb[2] / sizeof(float)) % 2 != 0 || (q->nb[1] / sizeof(float)) % 2 != 0) {
+        return false;
+    }
+
+    // below about 1K cells the per-head kernel is as fast or faster
+    const uint32_t n_kv = (uint32_t) k->ne[1];
+    if (n_kv < 1024) {
+        return false;
+    }
+    const uint32_t cores = ctx->device->shader_core_count ? ctx->device->shader_core_count : 16;
+    // two workgroups per core, each a multiple of the 32-key step
+    const uint32_t split_kv = std::max(32u, ROUNDUP_POW2(CEIL_DIV(n_kv, 2*cores), 32));
+    const uint32_t k_num = CEIL_DIV(n_kv, split_kv);
+    // 32 heads in two groups along y, a workgroup each per split: more and smaller workgroups, every K row read twice.
+    // Faster on GPUs with many cores up to about 2K cells (without the K tile prefetch above 1792)
+    const bool hg2 = H == 32 && cores >= 48 && n_kv <= 2304 && ctx->device->pipeline_fa_mla_decode_hg2[0];
+    if (hg2) {
+        pipeline = ctx->device->pipeline_fa_mla_decode_hg2[n_kv <= 1792 ? 0 : 1];
+    }
+
+    const uint64_t split_k_size = ((uint64_t) 512*H + 2*H) * k_num * T * sizeof(float);
+    if (ctx->prealloc_size_split_k < split_k_size) {
+        ctx->prealloc_size_split_k = split_k_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q, true);
+    const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k, true);
+    const vk_subbuffer m_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask, true) : k_buf;
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst);  // the reduce writes from element 0
+    const vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+    const vk_op_fa_mla_decode_push_constants pc = {
+        n_kv, split_kv, k_num,
+        (uint32_t) (q->nb[2] / sizeof(float)), (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
+        mask ? 1u : 0u, scale,
+        get_misalign_bytes(ctx, q) / (uint32_t) sizeof(float),
+        get_misalign_bytes(ctx, k) / (uint32_t) sizeof(ggml_fp16_t),
+        mask ? get_misalign_bytes(ctx, mask) / (uint32_t) sizeof(ggml_fp16_t) : 0u,
+        (uint32_t) (q->nb[1] / sizeof(float)),
+        mask ? (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)) : 0u,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, m_buf, split_k_buf }, pc, { k_num, hg2 ? 2u : 1u, (uint32_t) T });
+
+    ggml_vk_sync_buffers(ctx, subctx);
+    const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { 512, (uint32_t) H, (uint32_t) T, 1, k_num, 0 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+                              { split_k_buf, q_buf, d_buf }, pc2, { (uint32_t) H, 512, (uint32_t) T });
+    ctx->prealloc_split_k_need_sync = true;
+    return true;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -8122,6 +8222,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
+
+    if (ggml_vk_fa_mla_decode(ctx, subctx, q, k, v, mask, sinks, dst)) {
+        return;
+    }
     uint32_t gqa_ratio = 1;
     uint32_t qk_ratio = neq2 / nek2;
     uint32_t workgroups_x = (uint32_t)neq1;

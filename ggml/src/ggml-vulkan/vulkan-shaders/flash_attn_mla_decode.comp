@@ -1,0 +1,243 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// Flash attention decode for MLA: one query token, H query heads on a single latent K/V head, V = the first HSV
+// elements of each K row (the same buffer). Each workgroup takes a range of keys and H / NHS heads (workgroup y picks the
+// group), so every K row is read once per workgroup instead of once per head. More head groups cost more K reads and give
+// more, smaller workgroups; every head's arithmetic is the same for any NHS. Steps of BC keys: the scores Q K^T for H x BC
+// from tiles in shared memory, an online softmax per head, and the H x HSV output accumulated in registers. The unnormalized output and
+// the per-head L and M go to the split_k buffer in the layout of flash_attn_split_k_reduce.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint H   = 32;   // query heads
+layout(constant_id = 2) const uint HSK = 576;
+layout(constant_id = 3) const uint HSV = 512;
+
+layout(constant_id = 4) const uint NHS = 1;      // head groups: workgroup y takes heads y*HL .. y*HL + HL - 1
+layout(constant_id = 5) const bool KPF = true;    // K tile through registers, loaded one tile ahead
+layout(constant_id = 6) const uint KG = 1;        // keys per invocation in the score phase, 1 or 2 (1 with two head groups)
+const uint HL = H / NHS;
+const uint BC = 32;        // keys per step
+const uint DT = 64;        // head dims per score tile
+const uint HG = HL * BC / BLOCK_SIZE / KG;     // heads per invocation in the score phase
+const uint DV = HSV / BLOCK_SIZE;             // output dims per invocation
+const uint KPT = BC * DT / 2 / BLOCK_SIZE;    // K tile f16 pairs per invocation
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_kv;
+    uint split_kv;     // keys per workgroup, a multiple of BC
+    uint k_num;        // workgroups (splits)
+    uint q_head;       // Q head stride in floats
+    uint k_row;        // K row stride in halves
+    uint has_mask;
+    float scale;
+    uint q_off; uint k_off; uint m_off;
+    uint q_tok;        // MT: workgroup z is the query token (speculative verify): its Q at q_off + z * q_tok
+    uint m_row;        // and its mask row at m_off + z * m_row
+} p;
+
+layout(binding = 0, std430) readonly buffer Q { float data_q[]; };
+// Q as f32 pairs and V as f16 pairs (Q offset and head stride even, checked by the host): one load per pair
+layout(binding = 0, std430) readonly buffer Q2 { vec2 data_q2[]; };
+layout(binding = 1, std430) readonly buffer K { float16_t data_k[]; };
+// The score phase reads K and Q as f16 pairs (K offset and row stride even, checked by the host), so each pair is one
+// 32-bit shared memory load and one packed f16 dot with f32 accumulation (v_dot2c_f32_f16 on RDNA2); Q is rounded to f16
+layout(binding = 1, std430) readonly buffer K2 { f16vec2 data_k2[]; };
+layout(binding = 2, std430) readonly buffer M { float16_t data_m[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
+
+// Q tiles 0 .. QRT - 1 stay in shared memory after the first step (slots 0 .. QRT - 1); the other tiles are re-read every step
+// into slot QRT. The scores use slot QRT once the last tile is done (as float bits in f16 pairs), so QRT = 5 fits in 32 KB of
+// shared memory (the limit on RDNA2). Needs BC <= DT / 2
+const uint QRT = 5;
+shared f16vec2 qs2[QRT + 1][HL][DT / 2 + 1];
+shared f16vec2 ks2[BC][DT / 2 + 1];
+shared float alpha_s[HL];
+// SGS: running max and sum per head (written by the invocation of key 0)
+shared float m_s[HL];
+shared float l_s[HL];
+// HF3: the probabilities of key pairs (c, c + 1) as f16 pairs for the output phase's packed dots
+shared f16vec2 ps2[HL][BC / 2 + 1];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint s   = gl_WorkGroupID.x;
+    const uint h0  = gl_WorkGroupID.y * HL;
+    const uint j0  = s * p.split_kv;
+    const uint j1  = min(j0 + p.split_kv, p.n_kv);
+
+    // score phase: keys jj, jj + BC/KG, ... of the step, heads hb .. hb + HG - 1 (KG keys x HG heads: fewer shared
+    // memory reads per fma than one key x KG*HG heads)
+    const uint jj = tid % (BC / KG);
+    const uint hb = (tid / (BC / KG)) * HG;
+
+    if (tid < HL) {
+        m_s[tid] = -1.0/0.0;
+        l_s[tid] = 0.0;
+    }
+    float o[HL][DV];
+    [[unroll]] for (uint h = 0; h < HL; ++h) {
+        [[unroll]] for (uint e = 0; e < DV; ++e) {
+            o[h][e] = 0.0;
+        }
+    }
+
+    // the next K tile is loaded into registers (halves) while the fmas of this one run; keeping the Q tile there as well
+    // takes more than 128 VGPRs and halves the workgroups per core
+    const uint DT2 = DT / 2;
+    f16vec2 kn[KPT];
+    if (KPF) {
+        [[unroll]] for (uint r = 0; r < KPT; ++r) {
+            const uint i = tid + r * BLOCK_SIZE;
+            kn[r] = j0 + i / DT2 < j1 ? data_k2[(p.k_off + (j0 + i / DT2) * p.k_row) / 2 + i % DT2] : f16vec2(0.0);
+        }
+    }
+
+    for (uint jb = j0; jb < j1; jb += BC) {
+        float sc[KG][HG];
+        [[unroll]] for (uint g = 0; g < HG; ++g) {
+            [[unroll]] for (uint u = 0; u < KG; ++u) {
+                sc[u][g] = 0.0;
+            }
+        }
+        for (uint d0 = 0; d0 < HSK; d0 += DT) {
+            const uint qt = min(d0 / DT, QRT);
+            if (qt == QRT || jb == j0) {
+                for (uint i = tid; i < HL * DT2; i += BLOCK_SIZE) {
+                    const uint h = i / DT2, c = i % DT2;
+                    qs2[qt][h][c] = f16vec2(data_q2[(p.q_off + gl_WorkGroupID.z * p.q_tok + (h0 + h) * p.q_head + d0) / 2 + c]);
+                }
+            }
+            if (KPF) {
+                [[unroll]] for (uint r = 0; r < KPT; ++r) {
+                    const uint i = tid + r * BLOCK_SIZE;
+                    ks2[i / DT2][i % DT2] = kn[r];
+                }
+            } else {
+                for (uint i = tid; i < BC * DT2; i += BLOCK_SIZE) {
+                    const uint j = i / DT2, c = i % DT2;
+                    ks2[j][c] = jb + j < j1 ? data_k2[(p.k_off + (jb + j) * p.k_row + d0) / 2 + c] : f16vec2(0.0);
+                }
+            }
+            barrier();
+            // next tile: the next dims of this step, else the first dims of the next step
+            const uint nd = d0 + DT < HSK ? d0 + DT : 0;
+            const uint njb = d0 + DT < HSK ? jb : jb + BC;
+            if (KPF && njb < j1) {
+                [[unroll]] for (uint r = 0; r < KPT; ++r) {
+                    const uint i = tid + r * BLOCK_SIZE;
+                    kn[r] = njb + i / DT2 < j1 ? data_k2[(p.k_off + (njb + i / DT2) * p.k_row + nd) / 2 + i % DT2] : f16vec2(0.0);
+                }
+            }
+            [[unroll]] for (uint c = 0; c < DT2; ++c) {
+                f16vec2 kv[KG];
+                [[unroll]] for (uint u = 0; u < KG; ++u) {
+                    kv[u] = ks2[jj + u * (BC / KG)][c];
+                }
+                [[unroll]] for (uint g = 0; g < HG; ++g) {
+                    const f16vec2 qv = qs2[qt][hb + g][c];
+                    [[unroll]] for (uint u = 0; u < KG; ++u) {
+                        sc[u][g] = fma(float(qv.x), float(kv[u].x), fma(float(qv.y), float(kv[u].y), sc[u][g]));
+                    }
+                }
+            }
+            barrier();
+        }
+        [[unroll]] for (uint u = 0; u < KG; ++u) {
+            const uint jl = jj + u * (BC / KG);
+            const uint j = jb + jl;
+            float madd = -1.0/0.0;
+            if (j < j1) {
+                madd = p.has_mask != 0 ? float(data_m[p.m_off + gl_WorkGroupID.z * p.m_row + j]) : 0.0;
+            }
+            [[unroll]] for (uint g = 0; g < HG; ++g) {
+                qs2[QRT][hb + g][jl] = unpackFloat2x16(floatBitsToUint(sc[u][g] * p.scale + madd));   // scores
+            }
+        }
+        barrier();
+
+        // SGS: online softmax with one invocation per (head, key): heads tid / BC + r * (BLOCK_SIZE / BC), key tid % BC. The max
+        // and the sum are clustered subgroup reductions over the BC invocations of a head (subgroup size 32 or 64); each even
+        // key's invocation writes the f16 pair of its key and the next. m_s / l_s are read by all BC invocations of a head
+        // before the clustered operations and written after them by key 0's invocation, in the same subgroup
+        [[unroll]] for (uint r = 0; r < HL * BC / BLOCK_SIZE; ++r) {
+            const uint h = tid / BC + r * (BLOCK_SIZE / BC), c = tid % BC;
+            const float x = uintBitsToFloat(packFloat2x16(qs2[QRT][h][c]));
+            const float mp = m_s[h];
+            const float mx = max(mp, subgroupClusteredMax(x, BC));
+            const bool none = mx == -1.0/0.0;
+            const float e = none ? 0.0 : exp(x - mx);
+            const float ls = subgroupClusteredAdd(e, BC);
+            const float en = subgroupShuffleXor(e, 1);
+            if (c % 2 == 0) {
+                ps2[h][c / 2] = f16vec2(e, en);
+            }
+            if (c == 0) {
+                const float a = none ? 1.0 : exp(mp - mx);
+                alpha_s[h] = a;
+                l_s[h] = l_s[h] * a + ls;
+                m_s[h] = mx;
+            }
+        }
+        barrier();
+
+        // output: dims tid*DV .. tid*DV + DV - 1 for every head
+        [[unroll]] for (uint h = 0; h < HL; ++h) {
+            const float a = alpha_s[h];
+            [[unroll]] for (uint e = 0; e < DV; ++e) {
+                o[h][e] *= a;
+            }
+        }
+        const uint nj = min(BC, j1 - jb);
+        // HF3: keys in pairs (c, c + 1); per output dim the two V values form an f16 pair and each head's update is one packed
+        // dot with f32 accumulation. A missing second key (odd nj) has probability 0 and V 0. The next pair's V rows are loaded
+        // while this pair's dots run
+        // each invocation's DV halves of a V row as DV / 2 f16 pairs (the K offset and row stride are even)
+        const uint vo = (p.k_off + jb * p.k_row) / 2 + tid * (DV / 2);
+        const uint vr = p.k_row / 2;
+        f16vec2 va[DV / 2], vb[DV / 2];
+        [[unroll]] for (uint e = 0; e < DV / 2; ++e) {
+            va[e] = data_k2[vo + e];
+            vb[e] = 1 < nj ? data_k2[vo + vr + e] : f16vec2(0.0);
+        }
+        for (uint c = 0; c < nj; c += 2) {
+            f16vec2 v2[DV];
+            [[unroll]] for (uint e = 0; e < DV / 2; ++e) {
+                v2[2 * e]     = f16vec2(va[e].x, vb[e].x);
+                v2[2 * e + 1] = f16vec2(va[e].y, vb[e].y);
+            }
+            if (c + 2 < nj) {
+                [[unroll]] for (uint e = 0; e < DV / 2; ++e) {
+                    va[e] = data_k2[vo + (c + 2) * vr + e];
+                    vb[e] = c + 3 < nj ? data_k2[vo + (c + 3) * vr + e] : f16vec2(0.0);
+                }
+            }
+            [[unroll]] for (uint h = 0; h < HL; ++h) {
+                const f16vec2 pp = ps2[h][c / 2];
+                [[unroll]] for (uint e = 0; e < DV; ++e) {
+                    o[h][e] = fma(float(pp.x), float(v2[e].x), fma(float(pp.y), float(v2[e].y), o[h][e]));
+                }
+            }
+        }
+        barrier();
+    }
+
+    // split_k layout (flash_attn_split_k_reduce with ne2 = tokens): O [HSV, H, k_num, tokens], then L / M [H, k_num, tokens] (L first)
+    [[unroll]] for (uint h = 0; h < HL; ++h) {
+        [[unroll]] for (uint e = 0; e < DV; ++e) {
+            data_d[((gl_WorkGroupID.z * p.k_num + s) * H + h0 + h) * HSV + tid * DV + e] = o[h][e];
+        }
+    }
+    if (tid < HL) {
+        const uint lm = HSV * H * p.k_num * gl_NumWorkGroups.z + 2 * H * (gl_WorkGroupID.z * p.k_num + s);
+        data_d[lm + h0 + tid]     = l_s[tid];
+        data_d[lm + H + h0 + tid] = m_s[tid];
+    }
+}
