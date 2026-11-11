@@ -8930,6 +8930,44 @@ struct test_dsv4_hc_pre_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + MUL(w) + MUL(SIGMOID(view of g)): a gated output norm
+struct test_rms_norm_mul_sigmoid_mul : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_SIGMOID_MUL";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_dim, n_head, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_rms_norm_mul_sigmoid_mul(int64_t head_dim, int64_t n_head, int64_t n_tokens)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * o = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_set_name(o, "o");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_set_name(w, "w");
+
+        // the gate is the second half of each row of a wider tensor
+        ggml_tensor * gg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*head_dim*n_head, n_tokens);
+        ggml_set_name(gg, "gg");
+        ggml_tensor * g = ggml_view_3d(ctx, gg, head_dim, n_head, n_tokens,
+                head_dim*ggml_element_size(gg), gg->nb[1], head_dim*n_head*ggml_element_size(gg));
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, 1e-6f), w), ggml_sigmoid(ctx, g));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12509,6 +12547,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre_rms_norm(2048, 4, n_tokens));
     }
     test_cases.emplace_back(new test_dsv4_hc_pre_rms_norm(100, 2, 3));
+
+    test_cases.emplace_back(new test_rms_norm_mul_sigmoid_mul(128, 4, 1));
+    test_cases.emplace_back(new test_rms_norm_mul_sigmoid_mul(128, 16, 7));
+    test_cases.emplace_back(new test_rms_norm_mul_sigmoid_mul(64, 3, 2));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

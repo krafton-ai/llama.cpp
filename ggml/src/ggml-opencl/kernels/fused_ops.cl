@@ -9,6 +9,10 @@
 #define FUSED_WG_ROW  1024
 #define FUSED_PRE_PER 8  // dsv4_hc_pre_rms_norm: row elements per item, n <= FUSED_PRE_PER*256
 
+static inline float fused_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
 #if defined(cl_khr_subgroups) || defined(__opencl_c_subgroups)
 #define FUSED_SUBGROUPS 1
 #endif
@@ -315,6 +319,51 @@ kernel void kernel_dsv4_hc_pre_rms_norm(
         if (i < n) {
             y[i] = h[j] * scale * w[i];
         }
+    }
+}
+
+//------------------------------------------------------------------------------
+// rms_norm_mul_sigmoid_mul: group per row. y = x/rms(x)*w*sigmoid(g)
+//------------------------------------------------------------------------------
+kernel void kernel_rms_norm_mul_sigmoid_mul(
+        global const char * src0,
+        ulong offset0,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        global const char * src1,
+        ulong offset1,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        global const float * w,
+        ulong offset_w,
+        global char * dst,
+        ulong offsetd,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int n,
+        int ne1,
+        int ne2,
+        float eps) {
+    local float tmp[FUSED_WG];
+    const int r = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int i1 = r % ne1, i2 = (r / ne1) % ne2, i3 = r / (ne1 * ne2);
+    w = (global const float *) ((global const char *) w + offset_w);
+    global const float * x = (global const float *) (src0 + offset0 + i1 * nb01 + i2 * nb02 + i3 * nb03);
+    global const float * g = (global const float *) (src1 + offset1 + i1 * nb11 + i2 * nb12 + i3 * nb13);
+    global float * y = (global float *) (dst + offsetd + i1 * nb1 + i2 * nb2 + i3 * nb3);
+
+    float ss = 0.0f;
+    for (int i = lid; i < n; i += FUSED_WG) {
+        ss += x[i] * x[i];
+    }
+    ss = fused_wg_sum(ss, tmp);
+    const float scale = 1.0f / sqrt(ss / n + eps);
+    for (int i = lid; i < n; i += FUSED_WG) {
+        y[i] = x[i] * scale * w[i] * fused_sigmoid(g[i]);
     }
 }
 
