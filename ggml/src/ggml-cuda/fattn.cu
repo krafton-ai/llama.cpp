@@ -409,6 +409,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 }
                 // Volta:
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 4>(ctx, dst);
+            } else if (gqa_ratio % 32 == 0 && Q->ne[1] <= 2 && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                    cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+                // decode and short multi-token batches (e.g. speculative verify): all 32 heads of a KV head in one tile, so
+                // each K/V tile is read once instead of once per 16 heads. Faster on Turing and Ampere; from Ada on the large L2
+                // already serves the second read
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 32>(ctx, dst);
             } else if (gqa_ratio % 16 == 0) {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
             } else {
