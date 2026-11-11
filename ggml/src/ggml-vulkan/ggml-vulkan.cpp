@@ -5986,7 +5986,10 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
 
-        if (k >= 2048) {
+        // AMD (RDNA1/2): split from k = 512, e.g. the [1536 -> 256] and [1536 -> 160] projections of a 512-token
+        // ubatch fill only a few tiles
+        const uint32_t k_min = ctx->device->vendor_id == VK_VENDOR_ID_AMD ? 512 : 2048;
+        if (k >= k_min) {
             if (m_tiles * n_tiles <= ctx->device->shader_core_count / 2) {
                 split_k = ctx->device->shader_core_count / (m_tiles * n_tiles);
             } else if (m_tiles * n_tiles <= ctx->device->shader_core_count * 2 / 3) {
