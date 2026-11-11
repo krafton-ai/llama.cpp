@@ -68,6 +68,7 @@ set(GGML_OPENCL_KERNELS
     argsort
     tri
     dsv4_hc
+    pool_1d
     fill
     clamp
     cpy

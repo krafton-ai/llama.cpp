@@ -8643,6 +8643,40 @@ struct test_flash_attn_ext_masked_head : public test_flash_attn_ext {
     }
 };
 
+// GGML_OP_POOL_1D on the rows of a wider tensor (row stride above ne0)
+struct test_pool1d_view : public test_case {
+    const ggml_op_pool pool_type;
+    const std::array<int64_t, 4> ne_input;
+    const int k0;
+    const int s0;
+    const int p0;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "POOL_1D";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(pool_type, ne_input, k0, s0, p0) + ",view=1";
+    }
+
+    test_pool1d_view(ggml_op_pool pool_type, std::array<int64_t, 4> ne_input, int k0, int s0, int p0)
+        : pool_type(pool_type), ne_input(ne_input), k0(k0), s0(s0), p0(p0) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne_input[0] + 7, ne_input[1], ne_input[2], ne_input[3]);
+        ggml_set_name(input, "input");
+
+        ggml_tensor * view = ggml_view_4d(ctx, input, ne_input[0], ne_input[1], ne_input[2], ne_input[3],
+                input->nb[1], input->nb[2], input->nb[3], 0);
+        ggml_set_name(view, "view_of_input");
+
+        ggml_tensor * out = ggml_pool_1d(ctx, view, pool_type, k0, s0, p0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12152,6 +12186,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // masked cells at the start of every kv row
     test_cases.emplace_back(new test_flash_attn_ext_masked_head(128, 128, 8, 512, 32, 64));
     test_cases.emplace_back(new test_flash_attn_ext_masked_head(64, 64, 4, 1024, 16, 300));
+
+    for (ggml_op_pool pool_type : {GGML_OP_POOL_AVG, GGML_OP_POOL_MAX}) {
+        test_cases.emplace_back(new test_pool1d_view(pool_type, {10, 3, 2, 1}, 3, 3, 1));
+        test_cases.emplace_back(new test_pool1d_view(pool_type, {16, 5, 3, 2}, 16, 16, 0));
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
