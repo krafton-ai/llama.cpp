@@ -2277,6 +2277,31 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
 
     const int nw0 = nrptg == 1 ? (nk0 + nth - 1)/nth : 1;
 
+    // F32 <-> F16 between same-shape tensors with contiguous rows aligned to 4 elements: the row kernel (same values)
+    {
+        const bool f32_f16 = (op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16) ||
+                             (op->src[0]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32);
+        const size_t offs_src = ggml_metal_get_buffer_id(op->src[0]).offs;
+        const size_t offs_dst = ggml_metal_get_buffer_id(op).offs;
+        if (f32_f16 && ggml_are_same_shape(op->src[0], op) &&
+                nb00 == ggml_type_size(op->src[0]->type) && nb0 == ggml_type_size(op->type) && ne00 % 4 == 0 &&
+                (offs_src | nb01 | nb02 | nb03) % (4*nb00) == 0 && (offs_dst | nb1 | nb2 | nb3) % (4*nb0) == 0) {
+            auto p4 = ggml_metal_library_get_pipeline_cpy_rows4(lib, op->src[0]->type, op->type);
+
+            const int nth4 = std::min<int>(ne00/4, 256);
+            const int nr4  = std::max(1, 256/nth4);
+
+            ggml_metal_encoder_set_pipeline(enc, p4);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr4 - 1)/nr4, ne02, ne03, nth4, nr4, 1);
+
+            return 1;
+        }
+    }
+
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);

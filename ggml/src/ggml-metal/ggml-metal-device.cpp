@@ -97,6 +97,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_l
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_rows4(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
+    char name[256];
+
+    snprintf(name, 256, "kernel_cpy_rows4_%s_%s", ggml_type_name(tsrc), ggml_type_name(tdst));
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d(ggml_metal_library_t lib, const ggml_tensor * op, ggml_op_pool op_pool) {
     GGML_ASSERT(ggml_is_contiguous(op->src[0]));
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 && op->src[0]->type == op->type);

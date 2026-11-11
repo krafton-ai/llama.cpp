@@ -37,6 +37,37 @@ kernel void kernel_cpy_t_t(
 
 typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
 
+// same shape, rows contiguous and 16-byte aligned: 4 elements per thread and ntg[1] rows per threadgroup (the generic kernel
+// above takes one element per thread and one row per threadgroup, slow for many short rows, e.g. the expanded MLA K/V casts)
+template<typename T04, typename T14>
+kernel void kernel_cpy_rows4_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig[2];
+    const int32_t i02 = tgpig[1];
+    const int32_t i01 = tgpig[0]*ntg[1] + tpitg.y;
+
+    if (i01 >= args.ne01) {
+        return;
+    }
+
+    device const T04 * src = (device const T04 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device       T14 * out = (device       T14 *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    for (int32_t i = tpitg.x; i < args.ne00/4; i += ntg[0]) {
+        out[i] = (T14) src[i];
+    }
+}
+
+typedef decltype(kernel_cpy_rows4_t_t<float4, float4>) kernel_cpy_rows4_t;
+
+template [[host_name("kernel_cpy_rows4_f32_f16")]] kernel kernel_cpy_rows4_t kernel_cpy_rows4_t_t<float4, half4>;
+template [[host_name("kernel_cpy_rows4_f16_f32")]] kernel kernel_cpy_rows4_t kernel_cpy_rows4_t_t<half4,  float4>;
+
 template [[host_name("kernel_cpy_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   float>;
 template [[host_name("kernel_cpy_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   half>;
 template [[host_name("kernel_cpy_f32_i32")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   int32_t>;
