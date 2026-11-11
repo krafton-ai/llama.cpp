@@ -5847,6 +5847,41 @@ struct test_sigmoid_ratio_mul : public test_case {
     }
 };
 
+// SCALE(SIGMOID(x [+ bias])), the decay gate of a gated delta net layer (lower bound * sigmoid(f + dt))
+struct test_bias_sigmoid_scale : public test_case {
+    const int64_t ne0;
+    const int64_t n_rows;
+    const bool    with_bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_SIGMOID_SCALE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne0, n_rows, with_bias);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_bias_sigmoid_scale(int64_t ne0 = 512, int64_t n_rows = 1, bool with_bias = true)
+        : ne0(ne0), n_rows(n_rows), with_bias(with_bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_rows);
+        ggml_set_name(x, "x");
+        ggml_tensor * y = ggml_exp(ctx, x); // keeps x a leaf and the fused input a computed node
+        if (with_bias) {
+            ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0);
+            ggml_set_name(bias, "bias");
+            y = ggml_add(ctx, y, bias);
+        }
+        ggml_tensor * out = ggml_scale(ctx, ggml_sigmoid(ctx, y), -5.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -13666,6 +13701,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sigmoid_ratio_mul(128,  4,   1));
     test_cases.emplace_back(new test_sigmoid_ratio_mul(128, 16,   7));
     test_cases.emplace_back(new test_sigmoid_ratio_mul( 64,  4, 512));
+    test_cases.emplace_back(new test_bias_sigmoid_scale( 512,   1, true));
+    test_cases.emplace_back(new test_bias_sigmoid_scale(2048,   7, true));
+    test_cases.emplace_back(new test_bias_sigmoid_scale( 512, 512, true));
+    test_cases.emplace_back(new test_bias_sigmoid_scale( 512,   7, false));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

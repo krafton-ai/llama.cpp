@@ -3395,6 +3395,36 @@ static bool ggml_cuda_state_rows_can_skip(ggml_backend_cuda_context * cuda_ctx, 
     return false;
 }
 
+// [ADD(x, bias)] -> SIGMOID -> SCALE, the bias broadcast along the rows. Returns the number of nodes or 0
+static int ggml_cuda_match_add_sigmoid_scale(const ggml_cgraph * cgraph, int i) {
+    const bool    with_add  = cgraph->nodes[i]->op == GGML_OP_ADD;
+    const ggml_op ops_add[] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
+    const ggml_op ops[]     = { GGML_OP_UNARY, GGML_OP_SCALE };
+    const int     n         = with_add ? 3 : 2;
+    if (!ggml_can_fuse(cgraph, i, with_add ? ops_add : ops, n)) {
+        return 0;
+    }
+    const ggml_tensor * add   = with_add ? cgraph->nodes[i] : nullptr;
+    const ggml_tensor * sig   = cgraph->nodes[i + n - 2];
+    const ggml_tensor * scale = cgraph->nodes[i + n - 1];
+    const ggml_tensor * x     = with_add ? add->src[0] : sig->src[0];
+    const ggml_tensor * bias  = with_add ? add->src[1] : nullptr;
+    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->src[0] != (with_add ? add : x) ||
+            x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || sig->type != GGML_TYPE_F32 ||
+            scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || !ggml_are_same_shape(x, scale)) {
+        return 0;
+    }
+    if (bias && (bias->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
+            bias->ne[0] != x->ne[0] || (ggml_nrows(bias) != 1 && !ggml_are_same_shape(bias, x)) ||
+            ggml_cuda_tensors_overlap(scale, bias))) {
+        return 0;
+    }
+    if (ggml_cuda_tensors_overlap(scale, x, true)) {
+        return 0;
+    }
+    return n;
+}
+
 // SIGMOID(a) ... SIGMOID(b) -> DIV -> RESHAPE -> MUL(v, ratio), the ratio broadcast along dim 0 of v, with SIGMOID(b)
 // also an output. Returns the index of the MUL or -1
 static int ggml_cuda_match_sigmoid_ratio_mul(const ggml_cgraph * cgraph, int i, int & j_b, int & j_ratio) {
@@ -4567,6 +4597,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_conv_state(*cuda_ctx, m.args);
                 return m.last - i;
             }
+        }
+    }
+
+    // [ADD(bias)] -> SIGMOID -> SCALE
+    if (node->op == GGML_OP_ADD || node->op == GGML_OP_UNARY) {
+        const int n = ggml_cuda_match_add_sigmoid_scale(cgraph, i);
+        if (n > 0) {
+            ggml_cuda_op_add_sigmoid_scale(*cuda_ctx, n == 3 ? node : nullptr, cgraph->nodes[i + n - 2], cgraph->nodes[i + n - 1]);
+            return n - 1;
         }
     }
 

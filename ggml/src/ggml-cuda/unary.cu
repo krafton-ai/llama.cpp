@@ -779,6 +779,37 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
     }
 }
 
+/* fused [add] + sigmoid + scale */
+
+static __global__ void add_sigmoid_scale_f32(const float * x, const float * bias, float * dst, const int64_t k,
+                                             const int64_t bias_n, const float scale, const float offset) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const float v = bias ? x[i] + bias[i % bias_n] : x[i];
+    dst[i] = scale*op_sigmoid(v) + offset;
+}
+
+void ggml_cuda_op_add_sigmoid_scale(
+        ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * sigmoid_node, ggml_tensor * scale_node) {
+    const ggml_tensor * x    = add_node ? add_node->src[0] : sigmoid_node->src[0];
+    const ggml_tensor * bias = add_node ? add_node->src[1] : nullptr;
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(scale_node));
+    GGML_ASSERT(bias == nullptr || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias)));
+
+    const int64_t k = ggml_nelements(scale_node);
+    const float scale  = ggml_get_op_params_f32(scale_node, 0);
+    const float offset = ggml_get_op_params_f32(scale_node, 1);
+
+    const int num_blocks = (k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
+    add_sigmoid_scale_f32<<<num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) x->data, bias ? (const float *) bias->data : nullptr, (float *) scale_node->data, k,
+        bias ? ggml_nelements(bias) : 1, scale, offset);
+}
+
 /* fused sigmoid ratio + mul */
 
 // a and b: [na0, *] with row stride s1; dst = v * (sigmoid(a)/sigmoid(b)), the ratio of row r of dst being element r of a/b
