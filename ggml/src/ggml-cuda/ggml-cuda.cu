@@ -3140,6 +3140,45 @@ static int ggml_cuda_state_rows_reader(const ggml_cgraph * cgraph, int gr_idx) {
     return n_left == 0 ? reader : -1;
 }
 
+// GET_ROWS(state cache, ids) -> [views] -> GATED_DELTA_NET(..., state) for one sequence: the kernel reads the state row
+// from the cache, and the GET_ROWS is skipped
+static bool ggml_cuda_match_gdn_state_rows(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i,
+        ggml_cuda_gated_delta_net_state_rows & rows) {
+    const ggml_tensor * gdn = cgraph->nodes[i];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+            !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return false;
+    }
+    const ggml_tensor * s  = gdn->src[5];
+    const ggml_tensor * gr = s->view_src;
+    const ggml_tensor * v  = gdn->src[2];
+    // one sequence: with several, one could read the row another writes in the same launch. A few tokens: the
+    // chunked kernel for long batches reads src[5]
+    if (gr == nullptr || v->ne[3] != 1 || v->ne[2] > 32 || !ggml_cuda_is_state_row_gather(gr) || s->view_offs != 0 ||
+            !ggml_is_contiguous(s) || ggml_nelements(s) != gr->ne[0]) {
+        return false;
+    }
+    const int gr_idx = ggml_cuda_find_node_before(cgraph, gr, i);
+    if (gr_idx < 0 || ggml_cuda_state_rows_reader(cgraph, gr_idx) != i) {
+        return false;
+    }
+    // the row must not change between the GET_ROWS and the gated delta net
+    const ggml_tensor * cache = ggml_cuda_view_root(gr->src[0]);
+    for (int j = gr_idx + 1; j < i; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (!ggml_cuda_is_view_or_noop(n) && ggml_cuda_view_root(n) == cache) {
+            return false;
+        }
+    }
+    if (ggml_cuda_tensors_overlap(gdn, cache)) {
+        return false;
+    }
+    rows.data       = (const float *) gr->src[0]->data;
+    rows.ids        = (const int32_t *) gr->src[1]->data;
+    rows.row_stride = (int64_t) (gr->src[0]->nb[1] / sizeof(float));
+    return true;
+}
+
 struct ggml_cuda_conv_state_match {
     int last_copy; // the CONCAT and the copies up to here are skipped
     int conv;      // the kernel runs here
@@ -3344,6 +3383,10 @@ static bool ggml_cuda_state_rows_can_skip(ggml_backend_cuda_context * cuda_ctx, 
     const int reader = ggml_cuda_state_rows_reader(cgraph, i);
     if (reader < 0) {
         return false;
+    }
+    if (cgraph->nodes[reader]->op == GGML_OP_GATED_DELTA_NET) {
+        ggml_cuda_gated_delta_net_state_rows rows;
+        return ggml_cuda_match_gdn_state_rows(cuda_ctx, cgraph, reader, rows);
     }
     if (cgraph->nodes[reader]->op == GGML_OP_CONCAT) {
         ggml_cuda_conv_state_match m;
@@ -4477,17 +4520,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+    // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache, and/or read the state from the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
+        ggml_cuda_gated_delta_net_state_rows state_rows;
+        const bool from_rows = ggml_cuda_match_gdn_state_rows(cuda_ctx, cgraph, i, state_rows);
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
-        if (nodes_to_skip > 0) {
+        if (nodes_to_skip > 0 || from_rows) {
 #ifdef GGML_CUDA_DEBUG
-            GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
-                          __func__, node->name, nodes_to_skip);
+            GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes), state from cache row %d\n",
+                          __func__, node->name, nodes_to_skip, from_rows);
 #endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
-            return nodes_to_skip;
+            ggml_cuda_op_gated_delta_net_fused(*cuda_ctx, node, nodes_to_skip > 0 ? &fused_state_cpy : nullptr,
+                                               from_rows ? &state_rows : nullptr);
+            return nodes_to_skip > 0 ? nodes_to_skip : -1;
         }
     }
 
@@ -5587,6 +5633,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_tensor * node   = cgraph->nodes[i];
             ggml_tensor * gather = nullptr;
+            if (node->op == GGML_OP_GATED_DELTA_NET) {
+                gather = node->src[5]->view_src;
+            } else
             if (node->op == GGML_OP_SSM_CONV && node->src[0]->op == GGML_OP_CONCAT) {
                 ggml_tensor * cat = node->src[0];
                 gather = cat->src[0]->view_src;
