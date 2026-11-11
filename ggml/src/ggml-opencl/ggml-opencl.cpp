@@ -864,6 +864,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_pool_max_div_add      = nullptr;
     cl_kernel kernel_sigmoid_div_mul               = nullptr;
     cl_kernel kernel_add_sigmoid_scale             = nullptr;
+    cl_kernel kernel_dsv4_hc_pre_rms_norm          = nullptr;
     cl_kernel kernel_dsv4_hc_post_sum              = nullptr;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
@@ -1754,6 +1755,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_mat_add_reduce = clCreateKernel(prog, "kernel_rms_norm_mul_mat_add_reduce", &err), err));
         CL_CHECK((backend_ctx->kernel_sigmoid_div_mul = clCreateKernel(prog, "kernel_sigmoid_div_mul", &err), err));
         CL_CHECK((backend_ctx->kernel_add_sigmoid_scale = clCreateKernel(prog, "kernel_add_sigmoid_scale", &err), err));
+        CL_CHECK((backend_ctx->kernel_dsv4_hc_pre_rms_norm = clCreateKernel(prog, "kernel_dsv4_hc_pre_rms_norm", &err), err));
         CL_CHECK((backend_ctx->kernel_dsv4_hc_post_sum = clCreateKernel(prog, "kernel_dsv4_hc_post_sum", &err), err));
         // the fusion kernels use 256-wide work-groups; without them the unfused graph runs
         cl_kernel * fused[] = {
@@ -1763,6 +1765,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             &backend_ctx->kernel_mul_mat_pool_max_div_add,
             &backend_ctx->kernel_sigmoid_div_mul,
             &backend_ctx->kernel_add_sigmoid_scale,
+            &backend_ctx->kernel_dsv4_hc_pre_rms_norm,
         };
         for (size_t i = 0; i < sizeof(fused)/sizeof(fused[0]); ++i) {
             size_t max_wg = 0;
@@ -8909,6 +8912,19 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
 
 // work-group sizes of the fused kernels (FUSED_WG, FUSED_WG_ROW in kernels/fused_ops.cl)
 #define GGML_CL_FUSED_WG     256
+#define GGML_CL_FUSED_WG_ROW 1024
+
+// widest power-of-two group (GGML_CL_FUSED_WG..GGML_CL_FUSED_WG_ROW) the kernel can run on the device
+static size_t ggml_cl_fused_row_wg(ggml_backend_opencl_context * backend_ctx, cl_kernel kernel) {
+    size_t max_wg = 0;
+    CL_CHECK(clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg,
+                                      NULL));
+    size_t wg = GGML_CL_FUSED_WG;
+    while (wg * 2 <= max_wg && wg * 2 <= GGML_CL_FUSED_WG_ROW) {
+        wg *= 2;
+    }
+    return wg;
+}
 
 // buffer range of a tensor, for the overlap checks of the chain fusions (a fused kernel writes outputs while
 // it still reads its inputs; the allocator may have given an output the memory of an input that dies inside the chain)
@@ -8956,6 +8972,68 @@ static int32_t ggml_opencl_use_count(const ggml_cgraph * cgraph, const ggml_tens
         return 0;
     }
     return cgraph->use_counts[pos];
+}
+
+// DSV4_HC_PRE(x, pre) -> RMS_NORM -> MUL(w)
+static bool ggml_opencl_match_dsv4_hc_pre_rms_norm(ggml_backend_opencl_context * ctx,
+                                                   const ggml_cgraph *           cgraph,
+                                                   int                           i) {
+    if (!ctx->kernel_dsv4_hc_pre_rms_norm ||
+        !ggml_can_fuse(cgraph, i, { GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        return false;
+    }
+    const ggml_tensor * pre_op = cgraph->nodes[i];
+    const ggml_tensor * rms    = cgraph->nodes[i + 1];
+    const ggml_tensor * mul    = cgraph->nodes[i + 2];
+    const ggml_tensor * x      = pre_op->src[0];
+    const ggml_tensor * pre    = pre_op->src[1];
+    const ggml_tensor * w      = mul->src[1];
+    return rms->src[0] == pre_op && mul->src[0] == rms && ggml_get_op_params_f32(pre_op, 0) == 1.0f &&
+           ggml_get_op_params_i32(pre_op, 1) == 0 && x->type == GGML_TYPE_F32 && pre->type == GGML_TYPE_F32 &&
+           w->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[1] <= 8 &&
+           x->ne[0] <= 8 * 256 && x->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] == x->ne[0] &&
+           ggml_nelements(w) == x->ne[0] && ggml_is_contiguous(mul) && mul->ne[0] == x->ne[0] &&
+           ggml_nrows(mul) == x->ne[2] && !ggml_opencl_overlaps(mul, x) && !ggml_opencl_overlaps(mul, pre) &&
+           !ggml_opencl_overlaps(mul, w);
+}
+
+static void ggml_opencl_fused_dsv4_hc_pre_rms_norm(ggml_backend_t backend, const ggml_cgraph * cgraph, int i) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    const ggml_tensor *           pre_op      = cgraph->nodes[i];
+    const ggml_tensor *           rms         = cgraph->nodes[i + 1];
+    const ggml_tensor *           mul         = cgraph->nodes[i + 2];
+    const ggml_tensor *           x           = pre_op->src[0];
+    const ggml_tensor *           pre         = pre_op->src[1];
+    const ggml_tensor *           w           = mul->src[1];
+    cl_kernel                     kernel      = backend_ctx->kernel_dsv4_hc_pre_rms_norm;
+
+    const int      n    = (int) x->ne[0];
+    const int      hc   = (int) x->ne[1];
+    const float    eps  = ggml_get_op_params_f32(rms, 0);
+    const cl_ulong nbx1 = x->nb[1];
+    const cl_ulong nbx2 = x->nb[2];
+    const cl_ulong nbp0 = pre->nb[0];
+    const cl_ulong nbp1 = pre->nb[1];
+    const cl_ulong nbd1 = mul->nb[1];
+
+    cl_uint idx = 0;
+    ggml_opencl_arg_tensor(kernel, idx, x);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbx1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbx2));
+    ggml_opencl_arg_tensor(kernel, idx, pre);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbp0));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbp1));
+    ggml_opencl_arg_tensor(kernel, idx, w);
+    ggml_opencl_arg_tensor(kernel, idx, mul);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbd1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &n));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &hc));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float), &eps));
+
+    const size_t wg     = ggml_cl_fused_row_wg(backend_ctx, kernel);
+    size_t       lws[1] = { wg };
+    size_t       gws[1] = { (size_t) x->ne[2] * wg };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, mul);
 }
 
 // MUL_MAT -> MUL -> POOL_1D(max) -> SCALE -> DIV -> ADD with constant operands from one tensor (chart):
@@ -9395,6 +9473,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         if (!backend_ctx->disable_fusion && node->op == GGML_OP_RMS_NORM &&
             ggml_opencl_match_rms_norm_mul_mat_add(backend_ctx, cgraph, i)) {
             ggml_opencl_fused_rms_norm_mul_mat_add(backend, cgraph, i);
+            i += 2;
+            continue;
+        }
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_DSV4_HC_PRE &&
+            ggml_opencl_match_dsv4_hc_pre_rms_norm(backend_ctx, cgraph, i)) {
+            ggml_opencl_fused_dsv4_hc_pre_rms_norm(backend, cgraph, i);
             i += 2;
             continue;
         }

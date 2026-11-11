@@ -8886,6 +8886,50 @@ struct test_add_sigmoid_scale : public test_case {
     }
 };
 
+// GGML_OP_DSV4_HC_PRE + GGML_OP_RMS_NORM + GGML_OP_MUL: the mHC stream mix and the norm after it
+struct test_dsv4_hc_pre_rms_norm : public test_case {
+    const int64_t n_embd;
+    const int64_t n_hc;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_RMS_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_hc, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_dsv4_hc_pre_rms_norm(int64_t n_embd, int64_t n_hc, int64_t n_tokens)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        // the pre weights are the first half of the [pre | post] gates
+        ggml_tensor * gates = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_hc, n_tokens);
+        ggml_set_name(gates, "gates");
+        ggml_tensor * pre = ggml_view_2d(ctx, gates, n_hc, n_tokens, gates->nb[1], 0);
+
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_dsv4_hc_pre(ctx, x, pre), 1e-6f), w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_tensor_uniform(ggml_get_tensor(ctx, "x"));
+        init_tensor_uniform(ggml_get_tensor(ctx, "gates"), 0.0f, 1.0f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "w"));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12459,6 +12503,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_add_sigmoid_scale(512, 1, 0.9f));
     test_cases.emplace_back(new test_add_sigmoid_scale(2048, 7, 0.5f));
+
+    for (int64_t n_tokens : {1, 5}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre_rms_norm(512, 4, n_tokens));
+        test_cases.emplace_back(new test_dsv4_hc_pre_rms_norm(2048, 4, n_tokens));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_pre_rms_norm(100, 2, 3));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

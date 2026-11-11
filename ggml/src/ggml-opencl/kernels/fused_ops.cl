@@ -5,6 +5,9 @@
 
 #define FUSED_WG      256
 #define FUSED_MAX_HC  8
+// the per-token row kernels take a whole token in one group, as wide as the device allows (256..FUSED_WG_ROW)
+#define FUSED_WG_ROW  1024
+#define FUSED_PRE_PER 8  // dsv4_hc_pre_rms_norm: row elements per item, n <= FUSED_PRE_PER*256
 
 #if defined(cl_khr_subgroups) || defined(__opencl_c_subgroups)
 #define FUSED_SUBGROUPS 1
@@ -249,6 +252,70 @@ kernel void kernel_rms_norm_mul_mat_add_reduce(
         ss += p[nmix];
     }
     *(global float *) (dst + offsetd + t * nb1 + k * sizeof(float)) = acc / sqrt(ss / n + eps) + base[k];
+}
+
+//------------------------------------------------------------------------------
+// dsv4_hc_pre_rms_norm: group per token. h = sum_s x[:, s, t]*pre[s, t]; y = h/rms(h)*w
+//------------------------------------------------------------------------------
+kernel void kernel_dsv4_hc_pre_rms_norm(
+        global const char * src0,
+        ulong offset0,
+        ulong nb01,
+        ulong nb02,
+        global const char * src1,
+        ulong offset1,
+        ulong nb10,
+        ulong nb11,
+        global const float * w,
+        ulong offset_w,
+        global char * dst,
+        ulong offsetd,
+        ulong nb1,
+        int n,
+        int hc,
+        float eps) {
+    local float tmp[FUSED_WG_ROW];
+    const int t = get_group_id(0);
+    const int lid = get_local_id(0);
+    w = (global const float *) ((global const char *) w + offset_w);
+
+    // every item reads the stream weights itself (a few broadcast loads): no local array, no extra barrier
+    float pw[FUSED_MAX_HC];
+#pragma unroll
+    for (int k = 0; k < FUSED_MAX_HC; ++k) {
+        pw[k] = k < hc ? *(global const float *) (src1 + offset1 + k * nb10 + t * nb11) : 0.0f;
+    }
+
+    // the row stays in registers between the sum and the scaling: n <= FUSED_PRE_PER*wg
+    const int wg = get_local_size(0);
+    global const char * xt = src0 + offset0 + t * nb02;
+    global float * y = (global float *) (dst + offsetd + t * nb1);
+    float h[FUSED_PRE_PER];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < FUSED_PRE_PER; ++j) {
+        const int i = lid + j * wg;
+        h[j] = 0.0f;
+        if (i < n) {
+#pragma unroll
+            for (int s = 0; s < FUSED_MAX_HC; ++s) {
+                if (s < hc) {
+                    h[j] += ((global const float *) (xt + s * nb01))[i] *
+                            pw[s];  // not fma(): OpenCL fma is exact and slow here
+                }
+            }
+        }
+        ss += h[j] * h[j];
+    }
+    ss = fused_wg_sum(ss, tmp);
+    const float scale = 1.0f / sqrt(ss / n + eps);
+#pragma unroll
+    for (int j = 0; j < FUSED_PRE_PER; ++j) {
+        const int i = lid + j * wg;
+        if (i < n) {
+            y[i] = h[j] * scale * w[i];
+        }
+    }
 }
 
 //------------------------------------------------------------------------------
