@@ -936,6 +936,7 @@ void process_shaders() {
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
     string_to_spv("fa_mla_decode_f32_f16", "flash_attn_mla_decode.comp", {});
+    string_to_spv("mla_expand_kv_f16", "mla_expand_kv.comp", {});
     for (const std::string sg : {"", "_sg"}) {
         const std::string sg_add = sg.empty() ? "0" : "1";
         string_to_spv("hc_mix_f32" + sg,      "hc_mix.comp",      {{"FN_TYPE", "float"}, {"USE_SUBGROUP_ADD", sg_add}});

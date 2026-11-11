@@ -885,6 +885,15 @@ struct vk_op_fused_push_constants {
 };
 static_assert(sizeof(vk_op_fused_push_constants) <= 128);
 
+struct vk_op_mla_expand_kv_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t ldk;
+    uint32_t a_sm; uint32_t a_sr; uint32_t a_sh;
+    uint32_t d_ld; uint32_t d_sh;
+    uint32_t w_off; uint32_t kv_off; uint32_t d_off;
+    uint32_t g; uint32_t nr; uint32_t nn; uint32_t nk;
+};
+
 struct vk_op_fa_mla_decode_push_constants {
     uint32_t n_kv;
     uint32_t split_kv;

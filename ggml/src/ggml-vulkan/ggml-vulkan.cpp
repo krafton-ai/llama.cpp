@@ -3198,6 +3198,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef HC_PIPELINE
     ggml_vk_create_pipeline(device, device->pipeline_hc_select_f32, "hc_select_f32", hc_select_f32_len, hc_select_f32_data, "main", 5,
         sizeof(vk_op_fused_push_constants), {1, 1, 1}, { 64 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mla_expand_kv[0], "mla_expand_kv_gemm_f16", mla_expand_kv_f16_len, mla_expand_kv_f16_data, "main", 3,
+        sizeof(vk_op_mla_expand_kv_push_constants), {1, 1, 1}, { 0 }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_mla_expand_kv[1], "mla_expand_kv_rope_f16", mla_expand_kv_f16_len, mla_expand_kv_f16_data, "main", 3,
+        sizeof(vk_op_mla_expand_kv_push_constants), {256, 1, 1}, { 1 }, 1, true);
     // 2 keys x HG heads per invocation in the score phase instead of 1 key x 2*HG heads: fewer shared memory reads per
     // fma on GPUs with many cores
     const uint32_t mla_kg = device->shader_core_count >= 60 ? 2 : 1;
@@ -8263,6 +8267,89 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+// ggml_mla_expand_kv: per-head K = [W_UK latent | RoPE part] and V = W_UV latent of heads h0 .. h0 + g - 1 from the F16 latent
+// cache (expanded MLA prefill): the weights of the group in F16 (dequantized into prealloc_x unless F16), two GEMMs with one
+// head per workgroup z writing K [nk, g, n_kv] and V [nv, g, n_kv] in place, and a copy of the shared RoPE part
+static void ggml_vk_mla_expand_kv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * kv  = dst->src[0];
+    const ggml_tensor * k_b = dst->src[1];
+    const ggml_tensor * v_b = dst->src[2];
+    const uint32_t h0 = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    const uint32_t g  = (uint32_t) ggml_get_op_params_i32(dst, 1);
+    const uint32_t rank = (uint32_t) k_b->ne[1];
+    const uint32_t nn = (uint32_t) k_b->ne[0], nr = (uint32_t) (kv->ne[0] - rank), nk = nn + nr, nv = (uint32_t) v_b->ne[1];
+    const uint32_t n_kv = (uint32_t) kv->ne[1];
+
+    // the weights of the group in F16: K part then V part
+    const uint64_t nwk = (uint64_t) nn*rank*g, nwv = (uint64_t) rank*nv*g;
+    const bool deq = k_b->type != GGML_TYPE_F16 || v_b->type != GGML_TYPE_F16;
+    vk_subbuffer wk_buf, wv_buf;
+    uint32_t wk_off = 0, wv_off = 0;
+    if (deq) {
+        const uint64_t x_sz = (nwk + nwv) * sizeof(ggml_fp16_t);
+        if (ctx->prealloc_size_x < x_sz) {
+            ctx->prealloc_size_x = x_sz;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        auto dequant = [&](const ggml_tensor * w, uint64_t n_per_head, uint64_t dst_off) {
+            const uint64_t blk = ggml_blck_size(w->type);
+            const uint64_t off = h0*n_per_head, n = n_per_head*g;
+            GGML_ASSERT(off % blk == 0 && n % blk == 0);
+            const vk_subbuffer wb = ggml_vk_tensor_subbuffer(ctx, w, true);
+            const uint64_t src_off = wb.offset + get_misalign_bytes(ctx, w) + off/blk*ggml_type_size(w->type);
+            const uint32_t ne0 = (uint32_t) w->ne[0], rows = (uint32_t) (n / ne0);
+            vk_pipeline p = ggml_vk_get_to_fp16(ctx, w->type);
+            GGML_ASSERT(p != nullptr);
+            ggml_pipeline_request_descriptor_sets(ctx, p, 1);
+            const std::vector<uint32_t> pc = { rows, ne0, ne0, ne0, (uint32_t) n };
+            ggml_vk_dispatch_pipeline(ctx, subctx, p, { vk_subbuffer{ wb.buffer, src_off, n/blk*ggml_type_size(w->type) },
+                    vk_subbuffer{ ctx->prealloc_x, dst_off, n * sizeof(ggml_fp16_t) } }, pc, { (uint32_t) n, 1, 1 });
+        };
+        dequant(k_b, (uint64_t) nn*rank, 0);
+        dequant(v_b, (uint64_t) rank*nv, nwk*sizeof(ggml_fp16_t));
+        ggml_vk_sync_buffers(ctx, subctx);
+        wk_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_x, 0);
+        wv_buf = wk_buf;
+        wv_off = (uint32_t) nwk;
+    } else {
+        wk_buf = ggml_vk_tensor_subbuffer(ctx, k_b, true);
+        wv_buf = ggml_vk_tensor_subbuffer(ctx, v_b, true);
+        wk_off = get_misalign_bytes(ctx, k_b)/sizeof(ggml_fp16_t) + h0*nn*rank;
+        wv_off = get_misalign_bytes(ctx, v_b)/sizeof(ggml_fp16_t) + h0*rank*nv;
+    }
+
+    const vk_subbuffer kv_buf = ggml_vk_tensor_subbuffer(ctx, kv, true);
+    const vk_subbuffer d_buf  = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    const uint32_t kv_off = get_misalign_bytes(ctx, kv)/sizeof(ggml_fp16_t);
+    const uint32_t d_off  = get_misalign_bytes(ctx, dst)/sizeof(ggml_fp16_t);
+    const uint32_t ldk = (uint32_t) (kv->nb[1]/sizeof(ggml_fp16_t));
+
+    for (vk_pipeline p : { ctx->device->pipeline_mla_expand_kv[0], ctx->device->pipeline_mla_expand_kv[1] }) {
+        ggml_pipeline_request_descriptor_sets(ctx, p, p == ctx->device->pipeline_mla_expand_kv[0] ? 2 : 1);
+    }
+    // K = W_UK latent: W_UK [nn, rank] per head (m contiguous)
+    const vk_op_mla_expand_kv_push_constants pk = { nn, n_kv, rank, ldk, 1, nn, nn*rank, nk*g, nk, wk_off, kv_off, d_off, g, nr, nn, nk };
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mla_expand_kv[0], { wk_buf, kv_buf, d_buf }, pk,
+            { CEIL_DIV(nn, 64u), CEIL_DIV(n_kv, 64u), g });
+    // V = W_UV^T latent: W_UV [rank, nv] per head (r contiguous)
+    const vk_op_mla_expand_kv_push_constants pv = { nv, n_kv, rank, ldk, rank, 1, rank*nv, nv*g, nv, wv_off, kv_off, d_off + nk*g*n_kv, g, nr, nn, nk };
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mla_expand_kv[0], { wv_buf, kv_buf, d_buf }, pv,
+            { CEIL_DIV(nv, 64u), CEIL_DIV(n_kv, 64u), g });
+    if (nr > 0) {
+        const vk_op_mla_expand_kv_push_constants pr = { 0, n_kv, rank, ldk, 0, 0, 0, 0, 0, 0, kv_off, d_off, g, nr, nn, nk };
+        const uint32_t n = n_kv*g*nr;
+        const uint32_t wgx = std::min(CEIL_DIV(n, 256u), 65535u);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mla_expand_kv[1], { kv_buf, kv_buf, d_buf }, pr,
+                { wgx*256, CEIL_DIV(CEIL_DIV(n, 256u), wgx), 1 });
+    }
+    if (deq) {
+        ctx->prealloc_x_need_sync = true;
+    }
+}
+
 // MLA decode (DeepSeek / Raon-1 shape): 1 to 8 query tokens (MT: speculative verify), 16 to 64 query heads on one
 // latent head of 576 with V the first 512 of each K row. The scalar flash attention reads every K row once per head there (the heads exceed one GQA
 // workgroup); this kernel reads it once per workgroup for all heads, then reduces the splits like flash attention.
@@ -13097,6 +13184,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_dsv4_hc_post(ctx, compute_ctx, src0, src1, src2, src3, node);
 
         break;
+    case GGML_OP_MLA_EXPAND_KV:
+        ggml_vk_mla_expand_kv(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_MEAN:
         ggml_vk_mean(ctx, compute_ctx, src0, node);
 
@@ -17601,6 +17692,29 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]);
                 }
                 return false;
+            }
+        case GGML_OP_MLA_EXPAND_KV:
+            {
+                const ggml_tensor * kv = op->src[0], * k_b = op->src[1], * v_b = op->src[2];
+                if (kv->type != GGML_TYPE_F16 || (kv->nb[1] % sizeof(ggml_fp16_t)) != 0) {
+                    return false;
+                }
+                if (k_b->type == GGML_TYPE_F16 && v_b->type == GGML_TYPE_F16) {
+                    return true;
+                }
+                // quantized weights: the group is dequantized from a sub-range of each tensor
+                const uint64_t align = device->properties.limits.minStorageBufferOffsetAlignment;
+                const int64_t h0 = ggml_get_op_params_i32(op, 0);
+                for (const ggml_tensor * w : { k_b, v_b }) {
+                    if (w->type == GGML_TYPE_F16 || !ggml_is_quantized(w->type) || !device->pipeline_dequant[w->type]) {
+                        return false;
+                    }
+                    const uint64_t per_head = w->nb[2];
+                    if ((h0*per_head) % align != 0 || (w->ne[0]*w->ne[1]) % ggml_blck_size(w->type) != 0) {
+                        return false;
+                    }
+                }
+                return ((uint64_t) k_b->ne[0]*k_b->ne[1]*ggml_get_op_params_i32(op, 1)*sizeof(ggml_fp16_t)) % align == 0;
             }
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:

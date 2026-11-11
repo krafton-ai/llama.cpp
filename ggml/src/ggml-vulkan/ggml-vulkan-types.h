@@ -1003,6 +1003,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_hc_mix_f32, pipeline_hc_mix_f16, pipeline_hc_mix_rows_f32, pipeline_hc_mix_rows_f16;
     vk_pipeline pipeline_hc_select_f32, pipeline_hc_pre_norm_f32;
     vk_pipeline pipeline_hc_mix_add_rms_f32, pipeline_hc_mix_add_rms_f16;   // with x = streams + RMS_NORM(g) * w in front
+    vk_pipeline pipeline_mla_expand_kv[2];   // GEMM, RoPE copy
     vk_pipeline pipeline_fa_mla_decode[3];  // 16, 32, 64 query heads on one 576 / 512 latent head
     vk_pipeline pipeline_fa_mla_decode_hg2[2];  // 32 query heads in two workgroups along y; [1] without the K tile prefetch
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
