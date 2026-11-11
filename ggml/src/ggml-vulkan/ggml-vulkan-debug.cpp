@@ -19,7 +19,8 @@ void vk_memory_logger::log_allocation(vk_buffer_ref buf_ref, size_t size) {
     std::lock_guard<std::mutex> guard(log_mutex);
     vk_buffer buf = buf_ref.lock();
     const bool device = bool(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal);
-    const std::string type = device ? "device" : "host";
+    const bool host_visible = bool(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+    const std::string type = device ? (host_visible ? "device (host-visible)" : "device") : "host";
     allocations[buf->buffer] = size;
     total_device += device ? size : 0;
     total_host += device ? 0 : size;

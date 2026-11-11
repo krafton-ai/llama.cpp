@@ -1013,6 +1013,11 @@ struct vk_device_struct {
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
     bool disable_host_visible_vidmem;
+    // small host-visible VRAM window (no resizable BAR): only small device buffers go there, up to a budget
+    size_t bar_window = 0;
+    size_t bar_max_buffer = 0;
+    size_t bar_budget = 0;
+    std::atomic<size_t> bar_used {0};
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
 
@@ -1047,12 +1052,16 @@ struct vk_buffer_struct {
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+    size_t bar_bytes = 0;  // counted in device->bar_used
 
     ~vk_buffer_struct() {
         if (size == 0) {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+        if (bar_bytes) {
+            device->bar_used.fetch_sub(bar_bytes);
+        }
 
         // bump before destroying, so a thread that sees the buffer gone also sees the new count
         device->buffer_destroy_count.fetch_add(1, std::memory_order_release);

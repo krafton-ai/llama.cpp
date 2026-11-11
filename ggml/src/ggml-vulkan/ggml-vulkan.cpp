@@ -4260,6 +4260,35 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+
+        // Without resizable BAR, the host-visible device-local heap is a small window (usually 256 MiB) beside VRAM.
+        // With the AMD Windows driver, buffers allocated past what the window holds (a weight chunk, KV cache and
+        // recurrent states together) are slow on the GPU side, while a compute buffer there still saves the staging
+        // copy of the graph inputs. So with a
+        // small window, buffers up to half of it go there until 3/4 of it is used; a full-size BAR keeps the default
+        if (device->vendor_id == VK_VENDOR_ID_AMD && !device->uma && !device->disable_host_visible_vidmem) {
+            const vk::PhysicalDeviceMemoryProperties mem = device->physical_device.getMemoryProperties();
+            const vk::MemoryPropertyFlags bar_flags = vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible;
+            vk::DeviceSize vram = 0, bar = 0;
+            for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+                if (mem.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                    vram = std::max(vram, mem.memoryHeaps[i].size);
+                }
+            }
+            for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+                if ((mem.memoryTypes[i].propertyFlags & bar_flags) == bar_flags) {
+                    bar = std::max(bar, mem.memoryHeaps[mem.memoryTypes[i].heapIndex].size);
+                }
+            }
+            if (bar > 0 && bar*4 < vram) {
+                device->bar_window     = bar;
+                device->bar_max_buffer = bar/2;
+                device->bar_budget     = bar*3/4;
+                GGML_LOG_INFO("ggml_vulkan: host-visible VRAM window %zu MiB of %zu MiB: device buffers up to %zu MiB, %zu MiB in all\n",
+                        (size_t) (bar/(1024*1024)), (size_t) (vram/(1024*1024)),
+                        device->bar_max_buffer/(1024*1024), device->bar_budget/(1024*1024));
+            }
+        }
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
