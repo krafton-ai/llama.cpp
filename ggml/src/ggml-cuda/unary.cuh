@@ -121,3 +121,7 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+// MUL(v, SIGMOID(a) / SIGMOID(b)) with the ratio broadcast along dim 0 of v; also writes SIGMOID(b)
+void ggml_cuda_op_sigmoid_ratio_mul(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_a, ggml_tensor * sigmoid_b,
+                                    const ggml_tensor * ratio, ggml_tensor * mul_node);

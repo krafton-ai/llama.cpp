@@ -5797,6 +5797,56 @@ struct test_gated_delta_net_state_rows : public test_case {
     }
 };
 
+// MUL(v, RESHAPE(DIV(SIGMOID(a), SIGMOID(b)))) with a and b rows of one projection and SIGMOID(b) used again (the
+// beta and write/erase ratio of a gated delta net layer, as Raon-1 nano builds them)
+struct test_sigmoid_ratio_mul : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+
+    std::vector<ggml_tensor *> checked;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_RATIO_MUL";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_dim, n_head, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+
+    test_sigmoid_ratio_mul(int64_t head_dim = 128, int64_t n_head = 4, int64_t n_tokens = 1)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+        const int64_t rank = 16;
+        ggml_tensor * fab = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank + 2*n_head, n_tokens);
+        ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*head_dim*n_head, n_tokens);
+        ggml_set_name(fab, "fab");
+        ggml_set_name(x, "x");
+        ggml_tensor * v = ggml_view_4d(ctx, x, head_dim, n_head, n_tokens, 1, ggml_row_size(x->type, head_dim), x->nb[1],
+                x->nb[1]*n_tokens, 2*ggml_row_size(x->type, head_dim*n_head));
+
+        ggml_tensor * beta  = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, n_head, n_tokens, fab->nb[1], rank*fab->nb[0]));
+        ggml_tensor * write = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, n_head, n_tokens, fab->nb[1], (rank + n_head)*fab->nb[0]));
+        ggml_tensor * ratio = ggml_reshape_4d(ctx, ggml_div(ctx, write, beta), 1, n_head, n_tokens, 1);
+        ggml_tensor * out   = ggml_mul(ctx, v, ratio);
+        if (mode == MODE_TEST && gf != nullptr) {
+            ggml_build_forward_expand(gf, out);
+        }
+        checked.push_back(out);
+        checked.push_back(beta);
+        out = ggml_add(ctx, out, ggml_sum(ctx, ggml_reshape_4d(ctx, beta, 1, n_head, n_tokens, 1)));
+        ggml_set_name(out, "out");
+        checked.push_back(out);
+        return out;
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -13613,6 +13663,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_state_rows(4, 128, 4, true,  1, 1));
     test_cases.emplace_back(new test_gated_delta_net_state_rows(4,  64, 1, false, 2, 1));
     test_cases.emplace_back(new test_gated_delta_net_state_rows(4, 128, 40, true, 1, 1));
+    test_cases.emplace_back(new test_sigmoid_ratio_mul(128,  4,   1));
+    test_cases.emplace_back(new test_sigmoid_ratio_mul(128, 16,   7));
+    test_cases.emplace_back(new test_sigmoid_ratio_mul( 64,  4, 512));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

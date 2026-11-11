@@ -3395,6 +3395,56 @@ static bool ggml_cuda_state_rows_can_skip(ggml_backend_cuda_context * cuda_ctx, 
     return false;
 }
 
+// SIGMOID(a) ... SIGMOID(b) -> DIV -> RESHAPE -> MUL(v, ratio), the ratio broadcast along dim 0 of v, with SIGMOID(b)
+// also an output. Returns the index of the MUL or -1
+static int ggml_cuda_match_sigmoid_ratio_mul(const ggml_cgraph * cgraph, int i, int & j_b, int & j_ratio) {
+    const ggml_tensor * sa = cgraph->nodes[i];
+    j_b = ggml_cuda_next_compute_node(cgraph, i);
+    const int j_div = j_b < 0 ? -1 : ggml_cuda_next_compute_node(cgraph, j_b);
+    const int j_mul = j_div < 0 ? -1 : ggml_cuda_next_compute_node(cgraph, j_div);
+    if (sa->op != GGML_OP_UNARY || ggml_get_unary_op(sa) != GGML_UNARY_OP_SIGMOID || j_mul < 0) {
+        return -1;
+    }
+    const ggml_tensor * sb  = cgraph->nodes[j_b];
+    const ggml_tensor * div = cgraph->nodes[j_div];
+    const ggml_tensor * mul = cgraph->nodes[j_mul];
+    if (sb->op != GGML_OP_UNARY || ggml_get_unary_op(sb) != GGML_UNARY_OP_SIGMOID || div->op != GGML_OP_DIV ||
+            div->src[0] != sa || div->src[1] != sb || mul->op != GGML_OP_MUL) {
+        return -1;
+    }
+    const ggml_tensor * ratio = mul->src[1]->view_src == div ? mul->src[1] : mul->src[0];
+    const ggml_tensor * v     = ratio == mul->src[1] ? mul->src[0] : mul->src[1];
+    j_ratio = ggml_cuda_find_node_before(cgraph, ratio, j_mul);
+    const ggml_tensor * a = sa->src[0];
+    const ggml_tensor * b = sb->src[0];
+    if (j_ratio <= j_div || ratio->op != GGML_OP_RESHAPE || ratio->view_src != div || ratio->ne[0] != 1 ||
+            a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
+            sa->type != GGML_TYPE_F32 || sb->type != GGML_TYPE_F32 || div->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) || v->nb[0] != sizeof(float) ||
+            !ggml_are_same_shape(a, b) || a->ne[2] != 1 || a->ne[3] != 1 || !ggml_is_contiguous(sb) ||
+            !ggml_are_same_shape(v, mul) || !ggml_is_contiguous(mul) || ggml_nelements(div) != ggml_nrows(mul) ||
+            ratio->ne[1] != mul->ne[1] || ratio->ne[2] != mul->ne[2] || ratio->ne[3] != mul->ne[3]) {
+        return -1;
+    }
+    const int     idxs[] = { i, j_b, j_div, j_ratio, j_mul };
+    const ggml_op ops[]  = { GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_MUL };
+    const int     outs[] = { j_b, j_mul };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 5, ops, outs, 2)) {
+        return -1;
+    }
+    for (const ggml_tensor * out : { sb, mul }) {
+        for (const ggml_tensor * in : { a, b, v }) {
+            if (ggml_cuda_tensors_overlap(out, in)) {
+                return -1;
+            }
+        }
+    }
+    if (ggml_cuda_tensors_overlap(sb, mul)) {
+        return -1;
+    }
+    return j_mul;
+}
+
 // expert group selection from build_moe_ffn (n_expert_groups > 1)
 // src0/src1 index into this table, -1 is the (biased) probs, -2 is not checked
 static const struct {
@@ -4517,6 +4567,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_conv_state(*cuda_ctx, m.args);
                 return m.last - i;
             }
+        }
+    }
+
+    // SIGMOID(a) ... SIGMOID(b) -> DIV -> RESHAPE -> MUL(v, ratio)
+    if (node->op == GGML_OP_UNARY) {
+        int j_b, j_ratio;
+        const int j_mul = ggml_cuda_match_sigmoid_ratio_mul(cgraph, i, j_b, j_ratio);
+        if (j_mul > 0) {
+            ggml_cuda_op_sigmoid_ratio_mul(*cuda_ctx, node, cgraph->nodes[j_b], cgraph->nodes[j_ratio], cgraph->nodes[j_mul]);
+            return j_mul - i;
         }
     }
 
