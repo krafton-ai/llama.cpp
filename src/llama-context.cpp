@@ -165,6 +165,13 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// one sequence with enough tokens for the expanded MLA prefill
+static const llm_fused_op_probe llm_fused_op_mla_expand_probe = {
+    /*.op               =*/ LLM_FUSED_OP_MLA_EXPAND_KV,
+    /*.name             =*/ "MLA K/V expansion",
+    /*.n_tokens_per_seq =*/ LLAMA_MLA_EXPAND_MIN_TOKENS + 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -327,6 +334,9 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+
+    cparams.mla_expand      = true;
+    cparams.auto_mla_expand = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -598,14 +608,18 @@ llama_context::~llama_context() {
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
-    auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
+    auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled, uint32_t n_seqs_probe = 0) {
         if (!enabled) {
             return;
         }
 
-        const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
+        if (n_seqs_probe == 0) {
+            n_seqs_probe = n_seqs;
+        }
 
-        auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+        const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs_probe;
+
+        auto * gf = graph_reserve(n_tokens_probe, n_seqs_probe, n_tokens_probe, mctx, true);
         if (!gf) {
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
         }
@@ -670,6 +684,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
+    }
+
+    // the expanded MLA prefill is built only for ubatches of one sequence with more than LLAMA_MLA_EXPAND_MIN_TOKENS
+    // tokens and flash attention; without the op on the layer's device the context keeps the absorbed form. The probe is
+    // one sequence with a unified cache (one stream); with one stream per sequence it reserves all of them, like the
+    // other probes. When the probe graph has no expansion node (the model does not use it, or that layout does not
+    // build it) the path stays off
+    if (cparams.auto_mla_expand) {
+        const uint32_t n_seqs_mla = cparams.kv_unified ? 1 : n_seqs;
+        if (!cparams.flash_attn || cparams.n_ubatch < llm_fused_op_mla_expand_probe.n_tokens_per_seq*n_seqs_mla) {
+            cparams.mla_expand = false;
+        } else {
+            resolve(llm_fused_op_mla_expand_probe, cparams.mla_expand, n_seqs_mla);
+
+            bool found = false;
+            for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+                found = found || node.op == LLM_FUSED_OP_MLA_EXPAND_KV;
+            }
+            if (!found) {
+                cparams.mla_expand = false;
+            }
+        }
+        cparams.auto_mla_expand = false;
     }
 }
 

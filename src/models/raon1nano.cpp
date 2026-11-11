@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_raon1_nano::load_arch_hparams(llama_model_loader & ml) {
@@ -333,6 +334,41 @@ ggml_tensor * llama_model_raon1_nano::graph::build_mla_layer(
     latent = ggml_mul(ctx0, ggml_rms_norm(ctx0, latent, eps), layer.attn_kv_a_norm);
     // NoPE: the "rope" dims of q and k are concatenated as they are, without rotation
     ggml_tensor * extra = ggml_view_3d(ctx0, kv, nr, 1, n_tokens, kv->nb[1], kv->nb[1], rank*kv->nb[0]);
+    if (n_tokens > LLAMA_MLA_EXPAND_MIN_TOKENS && ubatch.n_seqs == 1 && cparams.flash_attn && cparams.mla_expand) {
+        // long prefill: attend over per-head K/V expanded from the latent cache, a group of g heads at a time.
+        // g is fixed from the context size (same graph for every ubatch): the most heads, a power of two, whose
+        // F16 K/V of a full cache stay within 96 MiB
+        const int64_t nv  = hparams.n_embd_head_v_mla();
+        const int64_t per_head = (nk + nv)*(int64_t) cparams.n_ctx*(int64_t) sizeof(ggml_fp16_t);
+        int64_t g = 1;
+        while (2*g <= n_head && n_head % (2*g) == 0 && 2*g*per_head <= (int64_t) 96*1024*1024) {
+            g *= 2;
+        }
+        const auto * mctx_k = inp_attn_k->mctx;
+        ggml_tensor * kc = mctx_k->get_k(ctx0, il);                           // [rank + nr, 1, n_kv, 1]
+        if (kc->type == GGML_TYPE_F16 && kc->ne[1] == 1 && kc->ne[3] == 1) {
+            ggml_tensor * k_cur = ggml_concat(ctx0, ggml_reshape_3d(ctx0, latent, rank, 1, n_tokens), extra, 0);
+            ggml_build_forward_expand(gf, q);
+            ggml_build_forward_expand(gf, mctx_k->cpy_k(ctx0, k_cur, inp_attn_k->get_k_idxs(), il));
+            const int64_t n_kv = kc->ne[2];
+            ggml_tensor * kc2 = ggml_view_2d(ctx0, kc, rank + nr, n_kv, kc->nb[2], 0);
+            ggml_tensor * out = nullptr;
+            for (int64_t h0 = 0; h0 < n_head; h0 += g) {
+                ggml_tensor * kvg = ggml_mla_expand_kv(ctx0, kc2, layer.wk_b, layer.wv_b, (int32_t) h0, (int32_t) g);
+                res->add_fused_node({LLM_FUSED_OP_MLA_EXPAND_KV, kvg, il});
+                const size_t e16 = ggml_element_size(kvg);
+                ggml_tensor * kg = ggml_view_3d(ctx0, kvg, nk, g, n_kv, nk*e16, nk*g*e16, 0);
+                ggml_tensor * vg = ggml_view_3d(ctx0, kvg, nv, g, n_kv, nv*e16, nv*g*e16, nk*g*n_kv*e16);
+                ggml_tensor * qg = ggml_view_3d(ctx0, q, nk, g, n_tokens, nk*q->nb[0], q->nb[1], h0*nk*q->nb[0]);
+                ggml_tensor * og = build_attn_mha(qg, kg, vg, nullptr, inp_attn_k->get_kq_mask(), nullptr, nullptr, 0, 1.0f/sqrtf(nk), il);
+                out = out ? ggml_concat(ctx0, out, og, 0) : og;
+            }
+            cb(out, "mla_expanded", il);
+            out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, cur)));
+            cb(out, "mla_gated", il);
+            return build_lora_mm(layer.wo, out);
+        }
+    }
     ggml_tensor * q_nope = ggml_view_3d(ctx0, q, nn, n_head, n_tokens, nk*q->nb[0], q->nb[1], 0);
     ggml_tensor * q_extra = ggml_view_3d(ctx0, q, nr, n_head, n_tokens, nk*q->nb[0], q->nb[1], nn*q->nb[0]);
     q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);

@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <vector>
 
+// MLA ubatches with more tokens than this attend over the expanded per-head K/V instead of the latent (absorbed) form
+#define LLAMA_MLA_EXPAND_MIN_TOKENS 256
+
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
@@ -48,6 +51,8 @@ struct llama_cparams {
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool mla_expand;         // MLA prefill may expand the latent cache to per-head K/V (ggml_mla_expand_kv)
+    bool auto_mla_expand;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

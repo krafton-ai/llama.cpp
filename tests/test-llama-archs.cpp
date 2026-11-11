@@ -1248,6 +1248,76 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok ? 0 : 1;
 }
 
+// contexts with several sequences and large batches, one KV stream per sequence or one unified stream: creating them
+// reserves the graphs of every batch layout, including the fused-op probes, and must work for every architecture
+static int test_multi_seq(const std::string & arch_filter, const size_t seed, const float stdev) {
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+
+    for (const llm_arch & arch : llm_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+            continue;
+        }
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT || arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+            continue;
+        }
+        if (arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch);
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+        if (arch == LLM_ARCH_BAILINGMOE3) {
+            GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
+        }
+
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs = { nullptr };
+        model_params.devices = devs.data();
+
+        tensor_data_params tensor_params = { seed, stdev };
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+        if (!model) {
+            throw std::runtime_error("failed to create llama model");
+        }
+
+        const int32_t n_seq = 4;
+        for (bool unified : { false, true }) {
+            llama_context_params ctx_params = llama_context_default_params();
+            ctx_params.n_ctx           = 4096;
+            ctx_params.n_batch         = 1100;
+            ctx_params.n_ubatch        = 1100;
+            ctx_params.n_seq_max       = n_seq;
+            ctx_params.kv_unified      = unified;
+            ctx_params.n_threads       = 4;
+            ctx_params.n_threads_batch = 4;
+
+            n_tests++;
+            llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+            bool ok = lctx != nullptr;
+            if (ok) {
+                // one batch with a few tokens of every sequence
+                common_batch batch(lctx.get());
+                const std::vector<llama_token> tokens = get_tokens(4*n_seq, 4*n_seq, seed);
+                for (int32_t s = 0; s < n_seq; s++) {
+                    for (int32_t i = 0; i < 4; i++) {
+                        batch.add(tokens[4*s + i], i, s, i == 3);
+                    }
+                }
+                ok = llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+            }
+            if (!ok) {
+                n_failed++;
+            }
+            LOG("%s multi-seq (%d sequences, %s cache): %s\n", llm_arch_name(arch), n_seq, unified ? "unified" : "one stream per sequence",
+                ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m");
+        }
+    }
+
+    LOG("Summary: %zu multi-seq test(s) executed, %zu failed\n", n_tests, n_failed);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1344,7 +1414,8 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        const int ret = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        return test_multi_seq(arch_filter, seed, stdev) != 0 ? 1 : ret;
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
