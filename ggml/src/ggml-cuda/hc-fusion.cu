@@ -241,8 +241,10 @@ void ggml_cuda_op_rms_norm_mat_vec_add(ggml_backend_cuda_context & ctx, const gg
     const float   eps     = ggml_get_op_params_f32(rms_norm, 0);
     const int64_t sw1     = w->nb[1]/ggml_element_size(w);
 
-    // split the input so that a few tokens still fill the GPU; every chunk keeps a multiple of 4 inputs
-    int nsplit = nt <= 8 ? 16 : nt <= 64 ? 4 : nt <= 256 ? 2 : 1;
+    // split the input so that a few tokens still fill the GPU; every chunk keeps a multiple of 4 inputs.
+    // The many-token kernel has only one block per split and 32 tokens, so it keeps 16 splits at any token count
+    const bool pp_rows = nrows_w + 1 <= RMS_MV_PP_WARPS*RMS_MV_PP_ROWS;
+    int nsplit = nt <= 8 || pp_rows ? 16 : nt <= 64 ? 4 : nt <= 256 ? 2 : 1;
     while (nsplit > 1 && (n % (4*nsplit) != 0 || n/nsplit < 256)) {
         nsplit /= 2;
     }
