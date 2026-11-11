@@ -1386,6 +1386,34 @@ typedef struct {
     float    eps1;   // RMS norm of the pre-weighted sum
 } ggml_metal_kargs_hc_select;
 
+// GGML_METAL_FUSION_GATED_NORM: rows i1 < ne1, i2 < ne2 of x, g and dst
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_g1;
+    uint64_t nb_g2;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+    float    eps;
+} ggml_metal_kargs_gated_norm;
+
+// GGML_METAL_FUSION_V_GATE: head i1 < nh of token i2 < nt
+typedef struct {
+    int32_t  ne0;    // head size
+    int32_t  nh;
+    int32_t  nt;
+    uint64_t nb_a1;  // a, b token strides
+    uint64_t nb_b1;
+    uint64_t nb_v1;  // v head and token strides
+    uint64_t nb_v2;
+    uint64_t nb_d1;  // dst head and token strides
+    uint64_t nb_d2;
+    uint64_t nb_s1;  // sigmoid(b) token stride
+} ggml_metal_kargs_v_gate;
+
 // GGML_METAL_FUSION_HC_COMB_POST (hc = 4)
 typedef struct {
     int32_t  n_embd;

@@ -764,6 +764,71 @@ kernel void kernel_dsv4_hc_pre_gated_f32(
     *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
 }
 
+// GGML_METAL_FUSION_GATED_NORM: one simdgroup per row
+kernel void kernel_gated_norm_f32(
+        constant ggml_metal_kargs_gated_norm & args,
+        device const char * x,
+        device const char * w,
+        device const char * g,
+        device       char * dst,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    const int row = tgpig*(ntg/32) + sgitg;
+    if (row >= args.ne1*args.ne2) {
+        return;
+    }
+    const int i1 = row % args.ne1;
+    const int i2 = row / args.ne1;
+
+    device const float * xr = (device const float *) (x + (uint64_t) i1*args.nb_x1 + (uint64_t) i2*args.nb_x2);
+    device const float * gr = (device const float *) (g + (uint64_t) i1*args.nb_g1 + (uint64_t) i2*args.nb_g2);
+    device       float * dr = (device       float *) (dst + (uint64_t) i1*args.nb_d1 + (uint64_t) i2*args.nb_d2);
+
+    float ss = 0.0f;
+    for (int i = tiisg; i < args.ne0; i += 32) {
+        ss += xr[i]*xr[i];
+    }
+    ss = simd_sum(ss);
+    const float scale = 1.0f/sqrt(ss/args.ne0 + args.eps);
+    for (int i = tiisg; i < args.ne0; i += 32) {
+        dr[i] = xr[i]*scale*((device const float *) w)[i]*(1.0f/(1.0f + exp(-gr[i])));
+    }
+}
+
+// GGML_METAL_FUSION_V_GATE: one simdgroup per head and token
+kernel void kernel_v_gate_f32(
+        constant ggml_metal_kargs_v_gate & args,
+        device const char * a,
+        device const char * b,
+        device const char * v,
+        device       char * dst,
+        device       char * sb,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    const int row = tgpig*(ntg/32) + sgitg;
+    if (row >= args.nh*args.nt) {
+        return;
+    }
+    const int i1 = row % args.nh;
+    const int i2 = row / args.nh;
+
+    const float sa = 1.0f/(1.0f + exp(-((device const float *) (a + (uint64_t) i2*args.nb_a1))[i1]));
+    const float sbv = 1.0f/(1.0f + exp(-((device const float *) (b + (uint64_t) i2*args.nb_b1))[i1]));
+    const float r = sa/sbv;
+    if (tiisg == 0) {
+        ((device float *) (sb + (uint64_t) i2*args.nb_s1))[i1] = sbv;
+    }
+    device const float * vr = (device const float *) (v + (uint64_t) i1*args.nb_v1 + (uint64_t) i2*args.nb_v2);
+    device       float * dr = (device       float *) (dst + (uint64_t) i1*args.nb_d1 + (uint64_t) i2*args.nb_d2);
+    for (int i = tiisg; i < args.ne0; i += 32) {
+        dr[i] = vr[i]*r;
+    }
+}
+
 // GGML_METAL_FUSION_HC_SELECT, step 1: one threadgroup per projection row and token: mixes[m] = fn[m] (x / rms(x)) + base[m]
 // over the flat streams, and its sigmoid for the first 2*hc rows
 template<typename T>

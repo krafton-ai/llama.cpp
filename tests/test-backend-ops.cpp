@@ -5026,6 +5026,54 @@ struct test_hc_site : public test_case {
     }
 };
 
+// RMS_NORM(o)*w*sigmoid(g) over heads, as the Raon-1 nano delta-rule output (g a strided view of a wider projection).
+// A backend may fuse it (Metal); the output is checked.
+struct test_gated_norm_fuse : public test_case {
+    const int64_t hd, nh, nt;
+
+    test_gated_norm_fuse(int64_t hd = 128, int64_t nh = 16, int64_t nt = 1) : hd(hd), nh(nh), nt(nt) {}
+
+    std::string vars() override { return VARS_TO_STR3(hd, nh, nt); }
+    std::string op_desc(ggml_tensor *) override { return "GATED_NORM"; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * o    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nh, nt);
+        ggml_tensor * proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*hd*nh, nt);
+        ggml_tensor * w    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        ggml_tensor * g    = ggml_view_3d(ctx, proj, hd, nh, nt, hd*sizeof(float), proj->nb[1], 3*hd*nh*sizeof(float));
+        return ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, 1e-6f), w), ggml_sigmoid(ctx, g));
+    }
+};
+
+// v*sigmoid(a)/sigmoid(b) per head with a, b views of a projection (the Raon-1 nano write/erase ratio), sigmoid(b) read
+// afterwards (the delta net's beta). A backend may fuse it (Metal); both outputs are checked.
+struct test_v_gate_fuse : public test_case {
+    const int64_t hd, nh, rank, nt;
+    ggml_tensor * beta = nullptr, * vs = nullptr;
+
+    test_v_gate_fuse(int64_t hd = 128, int64_t nh = 16, int64_t rank = 32, int64_t nt = 1) : hd(hd), nh(nh), rank(rank), nt(nt) {}
+
+    std::string vars() override { return VARS_TO_STR4(hd, nh, rank, nt); }
+    std::string op_desc(ggml_tensor *) override { return "V_GATE"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { vs, beta }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * fab  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank + 2*nh, nt);
+        ggml_tensor * conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3*hd*nh, nt, 1);
+        const size_t nb1 = conv->nb[1];
+        ggml_tensor * v = ggml_view_4d(ctx, conv, hd, nh, nt, 1, hd*sizeof(float), nb1, nb1*nt, 2*hd*nh*sizeof(float));
+        ggml_tensor * b = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, nh, nt, fab->nb[1], rank*sizeof(float)));
+        ggml_tensor * a = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, nh, nt, fab->nb[1], (rank + nh)*sizeof(float)));
+        ggml_tensor * ratio = ggml_reshape_4d(ctx, ggml_div(ctx, a, b), 1, nh, nt, 1);
+        vs = ggml_mul(ctx, v, ratio);
+        beta = ggml_reshape_4d(ctx, b, 1, nh, nt, 1);
+        // the delta net reads v' and beta after the gate
+        return ggml_add(ctx, ggml_sum(ctx, vs), ggml_sum(ctx, beta));
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
@@ -10552,6 +10600,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nt : { 1, 2, 7, 33 }) {
             test_cases.emplace_back(new test_hc_site(type_fn, 1536, 4, 17, nt));
         }
+    }
+    for (int64_t nt : { 1, 3, 32 }) {
+        test_cases.emplace_back(new test_gated_norm_fuse(128, 16, nt));
+        test_cases.emplace_back(new test_v_gate_fuse(128, 16, 32, nt));
     }
     test_cases.emplace_back(new test_mla_expand_kv(300, 4, 4));
     test_cases.emplace_back(new test_mla_expand_kv(1024, 0, 16));

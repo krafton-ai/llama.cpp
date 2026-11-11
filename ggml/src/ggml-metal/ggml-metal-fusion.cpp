@@ -859,6 +859,104 @@ static bool ggml_metal_fusion_check_hc_comb_post(
     return n_views == (dv->src[0] != e) + (dv->src[1] != sc);
 }
 
+// RMS_NORM(x)*w*sigmoid(g) over rows (a gated output norm)
+static bool ggml_metal_fusion_check_gated_norm(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * rn  = nodes[0];
+    const ggml_tensor * m1  = nodes[1];
+    const ggml_tensor * sg  = nodes[2];
+    const ggml_tensor * m2  = nodes[3];
+    const ggml_tensor * x   = rn->src[0];
+    const ggml_tensor * w   = m1->src[1];
+    const ggml_tensor * g   = sg->src[0];
+
+    if (ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID || m1->src[0] != rn || m2->src[0] != m1 || m2->src[1] != sg) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || m2->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (x->ne[3] != 1 || !ggml_are_same_shape(x, g) || !ggml_are_same_shape(x, m2) || x->ne[0] % 4 != 0 || x->ne[0] > 1024) {
+        return false;
+    }
+    if (x->nb[0] != sizeof(float) || g->nb[0] != sizeof(float) || !ggml_is_contiguous(m2) || !ggml_is_contiguous(w) ||
+            ggml_nelements(w) != x->ne[0]) {
+        return false;
+    }
+
+    const int outs[1] = { node_idxs[idx + 3] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, (int) fusion->ops.size(), fusion->ops.data(), outs, 1);
+}
+
+// v*sigmoid(a)/sigmoid(b) with one a, b per head (the write/erase ratio of a delta rule), sigmoid(b) also written
+static bool ggml_metal_fusion_check_v_gate(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * sa  = nodes[0];
+    const ggml_tensor * sb  = nodes[1];
+    const ggml_tensor * dv  = nodes[2];
+    const ggml_tensor * mul = nodes[3];
+    const ggml_tensor * a   = sa->src[0];
+    const ggml_tensor * b   = sb->src[0];
+    const ggml_tensor * v   = mul->src[0];
+    const ggml_tensor * rt  = mul->src[1];
+
+    if (ggml_get_unary_op(sa) != GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(sb) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    if (dv->src[0] != sa || dv->src[1] != sb || (rt != dv && rt->view_src != dv)) {
+        return false;
+    }
+    // a, b: [nh, nt] with a row stride; v: [hd, nh, nt(, 1)] with strides; ratio broadcast over hd
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (a->ne[2] != 1 || a->ne[3] != 1 || !ggml_are_same_shape(a, b) || a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (rt->ne[0] != 1 || v->ne[1] != a->ne[0] || v->ne[2]*v->ne[3] != a->ne[1] || v->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(mul) || !ggml_is_contiguous(sb) || v->ne[0] > 1024) {
+        return false;
+    }
+    if (v->ne[3] != 1 && v->nb[3] != v->nb[2]*v->ne[2]) {
+        return false;
+    }
+
+    // sigmoid(b) is read later through a reshape (the delta net's beta); the ratio only by the MUL
+    const int outs[2] = { node_idxs[idx + 3], node_idxs[idx + 1] };
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, (int) fusion->ops.size(), fusion->ops.data(), outs, 2)) {
+        if (rt == dv) {
+            return false;
+        }
+        // the ratio reaches the MUL through a reshape: count it as an output, then require its single reader
+        const int outs3[3] = { node_idxs[idx + 3], node_idxs[idx + 1], node_idxs[idx + 2] };
+        if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, (int) fusion->ops.size(), fusion->ops.data(), outs3, 3) ||
+                ggml_node_get_use_count(gf, node_idxs[idx + 2]) != 1) {
+            return false;
+        }
+        for (int i = node_idxs[idx + 2] + 1; i < node_idxs[idx + 3]; ++i) {
+            if (gf->nodes[i] == rt) {
+                return ggml_node_get_use_count(gf, i) == 1;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_metal_fusion_check_mul_mat_glu(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -952,6 +1050,8 @@ static const std::vector<ggml_op> ops_mul_mat_glu = { GGML_OP_MUL_MAT, GGML_OP_G
 static const std::vector<ggml_op> ops_hc_select = {
     GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL
 };
+static const std::vector<ggml_op> ops_gated_norm = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_v_gate = { GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_DIV, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_hc_comb_post = {
     GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_ADD, GGML_OP_DSV4_HC_POST
 };
@@ -987,6 +1087,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MUL_MAT_GLU,    ops_mul_mat_glu,            {},     true,  ggml_metal_fusion_check_mul_mat_glu },
     { GGML_METAL_FUSION_HC_SELECT,      ops_hc_select,              {2, 3}, true,  ggml_metal_fusion_check_hc_select },
     { GGML_METAL_FUSION_HC_COMB_POST,   ops_hc_comb_post,           {},     true,  ggml_metal_fusion_check_hc_comb_post },
+    { GGML_METAL_FUSION_GATED_NORM,     ops_gated_norm,             {},     true,  ggml_metal_fusion_check_gated_norm },
+    { GGML_METAL_FUSION_V_GATE,         ops_v_gate,                 {1},    true,  ggml_metal_fusion_check_v_gate },
 };
 
 // ---- alloc deps -----------------------------------------------------------
