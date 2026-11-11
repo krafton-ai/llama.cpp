@@ -866,6 +866,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_add_sigmoid_scale             = nullptr;
     cl_kernel kernel_dsv4_hc_pre_rms_norm          = nullptr;
     cl_kernel kernel_rms_norm_mul_sigmoid_mul      = nullptr;
+    cl_kernel kernel_rms_norm_mul_add_bcast        = nullptr;
     cl_kernel kernel_dsv4_hc_post_sum              = nullptr;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
@@ -1758,6 +1759,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_add_sigmoid_scale = clCreateKernel(prog, "kernel_add_sigmoid_scale", &err), err));
         CL_CHECK((backend_ctx->kernel_dsv4_hc_pre_rms_norm = clCreateKernel(prog, "kernel_dsv4_hc_pre_rms_norm", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_sigmoid_mul = clCreateKernel(prog, "kernel_rms_norm_mul_sigmoid_mul", &err), err));
+        CL_CHECK((backend_ctx->kernel_rms_norm_mul_add_bcast = clCreateKernel(prog, "kernel_rms_norm_mul_add_bcast", &err), err));
         CL_CHECK((backend_ctx->kernel_dsv4_hc_post_sum = clCreateKernel(prog, "kernel_dsv4_hc_post_sum", &err), err));
         // the fusion kernels use 256-wide work-groups; without them the unfused graph runs
         cl_kernel * fused[] = {
@@ -1769,6 +1771,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             &backend_ctx->kernel_add_sigmoid_scale,
             &backend_ctx->kernel_dsv4_hc_pre_rms_norm,
             &backend_ctx->kernel_rms_norm_mul_sigmoid_mul,
+            &backend_ctx->kernel_rms_norm_mul_add_bcast,
         };
         for (size_t i = 0; i < sizeof(fused)/sizeof(fused[0]); ++i) {
             size_t max_wg = 0;
@@ -9039,6 +9042,73 @@ static void ggml_opencl_fused_dsv4_hc_pre_rms_norm(ggml_backend_t backend, const
     backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, mul);
 }
 
+// RMS_NORM(d) -> MUL(w) -> RESHAPE -> ADD(x), d broadcast over the streams of x
+static bool ggml_opencl_match_rms_norm_mul_add_bcast(ggml_backend_opencl_context * ctx,
+                                                     const ggml_cgraph *           cgraph,
+                                                     int                           i) {
+    if (!ctx->kernel_rms_norm_mul_add_bcast || i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const int     idxs[4] = { i, i + 1, i + 2, i + 3 };
+    const ggml_op ops[4]  = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD };
+    const int     out[1]  = { i + 3 };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, out, 1)) {
+        return false;
+    }
+    const ggml_tensor * rms = cgraph->nodes[i];
+    const ggml_tensor * mul = cgraph->nodes[i + 1];
+    const ggml_tensor * rsh = cgraph->nodes[i + 2];
+    const ggml_tensor * add = cgraph->nodes[i + 3];
+    const ggml_tensor * d   = rms->src[0];
+    const ggml_tensor * w   = mul->src[1];
+    const ggml_tensor * x   = add->src[0];
+    return mul->src[0] == rms && rsh->src[0] == mul && add->src[1] == rsh && ggml_opencl_f32_rows(d) &&
+           ggml_opencl_f32_rows(x) && ggml_opencl_f32_rows(add) && ggml_is_contiguous_rows(d) && d->ne[2] == 1 &&
+           d->ne[3] == 1 && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == d->ne[0] &&
+           ggml_nelements(w) == d->ne[0] && x->ne[0] == d->ne[0] && x->ne[2] == d->ne[1] && x->ne[3] == 1 &&
+           x->ne[1] <= 8 && rsh->ne[0] == d->ne[0] && rsh->ne[1] == 1 && rsh->ne[2] == d->ne[1] &&
+           ggml_are_same_shape(add, x) && (!ggml_opencl_overlaps(add, x) || ggml_opencl_same_buffer(add, x)) &&
+           !ggml_opencl_overlaps(add, d) && !ggml_opencl_overlaps(add, w);
+}
+
+static void ggml_opencl_fused_rms_norm_mul_add_bcast(ggml_backend_t backend, const ggml_cgraph * cgraph, int i) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    const ggml_tensor *           rms         = cgraph->nodes[i];
+    const ggml_tensor *           mul         = cgraph->nodes[i + 1];
+    const ggml_tensor *           add         = cgraph->nodes[i + 3];
+    const ggml_tensor *           x           = add->src[0];
+    const ggml_tensor *           d           = rms->src[0];
+    cl_kernel                     kernel      = backend_ctx->kernel_rms_norm_mul_add_bcast;
+
+    const int      n    = (int) x->ne[0];
+    const int      hc   = (int) x->ne[1];
+    const float    eps  = ggml_get_op_params_f32(rms, 0);
+    const cl_ulong nbx1 = x->nb[1];
+    const cl_ulong nbx2 = x->nb[2];
+    const cl_ulong nbd1 = d->nb[1];
+    const cl_ulong nb1  = add->nb[1];
+    const cl_ulong nb2  = add->nb[2];
+
+    cl_uint idx = 0;
+    ggml_opencl_arg_tensor(kernel, idx, x);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbx1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbx2));
+    ggml_opencl_arg_tensor(kernel, idx, d);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbd1));
+    ggml_opencl_arg_tensor(kernel, idx, mul->src[1]);
+    ggml_opencl_arg_tensor(kernel, idx, add);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &n));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &hc));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float), &eps));
+
+    const size_t wg     = ggml_cl_fused_row_wg(backend_ctx, kernel);
+    size_t       lws[1] = { wg };
+    size_t       gws[1] = { (size_t) x->ne[2] * wg };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, add);
+}
+
 // RMS_NORM(o) -> MUL(w); SIGMOID(g) -> MUL(normed, sigmoid). Node i+2 is the view of g, read in place
 static bool ggml_opencl_match_rms_norm_mul_sigmoid_mul(ggml_backend_opencl_context * ctx,
                                                        const ggml_cgraph *           cgraph,
@@ -9558,6 +9628,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             ggml_opencl_match_rms_norm_mul_mat_add(backend_ctx, cgraph, i)) {
             ggml_opencl_fused_rms_norm_mul_mat_add(backend, cgraph, i);
             i += 2;
+            continue;
+        }
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_RMS_NORM &&
+            ggml_opencl_match_rms_norm_mul_add_bcast(backend_ctx, cgraph, i)) {
+            ggml_opencl_fused_rms_norm_mul_add_bcast(backend, cgraph, i);
+            i += 3;
             continue;
         }
         if (!backend_ctx->disable_fusion && node->op == GGML_OP_RMS_NORM &&

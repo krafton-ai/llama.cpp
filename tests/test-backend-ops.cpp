@@ -8968,6 +8968,41 @@ struct test_rms_norm_mul_sigmoid_mul : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + MUL + RESHAPE + ADD: one normed row added to each of the hc streams of x
+struct test_rms_norm_mul_add_bcast : public test_case {
+    const int64_t n_embd;
+    const int64_t n_hc;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_ADD_BCAST";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_hc, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_rms_norm_mul_add_bcast(int64_t n_embd, int64_t n_hc, int64_t n_tokens)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(d, "d");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * dn  = ggml_mul(ctx, ggml_rms_norm(ctx, d, 1e-6f), w);
+        ggml_tensor * out = ggml_add(ctx, x, ggml_reshape_3d(ctx, dn, n_embd, 1, n_tokens));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12551,6 +12586,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_sigmoid_mul(128, 4, 1));
     test_cases.emplace_back(new test_rms_norm_mul_sigmoid_mul(128, 16, 7));
     test_cases.emplace_back(new test_rms_norm_mul_sigmoid_mul(64, 3, 2));
+
+    test_cases.emplace_back(new test_rms_norm_mul_add_bcast(512, 4, 1));
+    test_cases.emplace_back(new test_rms_norm_mul_add_bcast(2048, 4, 6));
+    test_cases.emplace_back(new test_rms_norm_mul_add_bcast(64, 8, 3));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

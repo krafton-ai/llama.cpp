@@ -368,6 +368,47 @@ kernel void kernel_rms_norm_mul_sigmoid_mul(
 }
 
 //------------------------------------------------------------------------------
+// rms_norm_mul_add_bcast: group per token. y[:, s, t] = x[:, s, t] + d[:, t]/rms(d[:, t])*w
+//------------------------------------------------------------------------------
+kernel void kernel_rms_norm_mul_add_bcast(
+        global const char * src0,
+        ulong offset0,
+        ulong nb01,
+        ulong nb02,
+        global const char * src1,
+        ulong offset1,
+        ulong nb11,
+        global const float * w,
+        ulong offset_w,
+        global char * dst,
+        ulong offsetd,
+        ulong nb1,
+        ulong nb2,
+        int n,
+        int hc,
+        float eps) {
+    local float tmp[FUSED_WG_ROW];
+    const int t = get_group_id(0);
+    const int lid = get_local_id(0);
+    w = (global const float *) ((global const char *) w + offset_w);
+    global const float * dr = (global const float *) (src1 + offset1 + t * nb11);
+
+    float ss = 0.0f;
+    for (int i = lid; i < n; i += get_local_size(0)) {
+        ss += dr[i] * dr[i];
+    }
+    ss = fused_wg_sum(ss, tmp);
+    const float scale = 1.0f / sqrt(ss / n + eps);
+    for (int s = 0; s < hc; ++s) {
+        global const float * xr = (global const float *) (src0 + offset0 + s * nb01 + t * nb02);
+        global float * yr = (global float *) (dst + offsetd + s * nb1 + t * nb2);
+        for (int i = lid; i < n; i += get_local_size(0)) {
+            yr[i] = xr[i] + dr[i] * scale * w[i];
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
 // dsv4_hc_post_sum (DSV4_HC_POST with up to FUSED_MAX_HC streams): item per (i, t)
 //   y[i, d, t] = x[i, t]*post[d, t] + sum_s res[i, s, t]*comb[d, s, t]   (has_comb == 0: + res[i, d, t])
 //   has_sum: y[i, hc, t] = sum_d y[i, d, t]
