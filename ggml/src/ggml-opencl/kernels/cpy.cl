@@ -313,3 +313,60 @@ kernel void kernel_cpy_f32_f32_flat(
         }
     }
 }
+
+// f16 copy of a transposed 2D view (dim 1 of src contiguous, dim 0 strided), e.g. [rank, n_kv] -> [n_kv, rank].
+// A 64x64 block goes through local memory so that lanes read and write consecutive halves.
+// Work-group (64, 4); the tile row is padded to 66 halves to spread the column reads over the banks.
+#define CPY_T2D_TILE 64
+kernel void kernel_cpy_f16_f16_t2d(
+        global char * src0,
+        ulong offset0,
+        global char * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb00,
+        ulong nb02,
+        ulong nb03,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3) {
+    local half tile[CPY_T2D_TILE][CPY_T2D_TILE + 2];
+
+    const int tx = get_local_id(0);  // 0..63
+    const int ty = get_local_id(1);  // 0..3
+    const int b1 = get_group_id(0);  // block along dim 1 (contiguous in src)
+    const int b0 = get_group_id(1);  // block along dim 0 (contiguous in dst)
+    const int i02 = get_group_id(2) % ne02;
+    const int i03 = get_group_id(2) / ne02;
+
+    src0 += offset0 + i02 * nb02 + i03 * nb03;
+    dst += offsetd + i02 * nb2 + i03 * nb3;
+
+    const int i01 = b1 * CPY_T2D_TILE + tx;
+    if (i01 < ne01) {
+#pragma unroll
+        for (int k = 0; k < CPY_T2D_TILE / 4; ++k) {
+            const int j = ty + 4 * k;
+            const int i00 = b0 * CPY_T2D_TILE + j;
+            if (i00 < ne00) {
+                tile[j][tx] = *(global half *) (src0 + i00 * nb00 + i01 * sizeof(half));
+            }
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int i0 = b0 * CPY_T2D_TILE + tx;
+    if (i0 < ne00) {
+#pragma unroll
+        for (int k = 0; k < CPY_T2D_TILE / 4; ++k) {
+            const int d = ty + 4 * k;
+            const int i1 = b1 * CPY_T2D_TILE + d;
+            if (i1 < ne01) {
+                *(global half *) (dst + i1 * nb1 + i0 * sizeof(half)) = tile[tx][d];
+            }
+        }
+    }
+}

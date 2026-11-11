@@ -12229,6 +12229,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_concat_transposed({3, 1536, 1}, 64));
     test_cases.emplace_back(new test_concat_transposed({7, 33, 2}, 40));
 
+    // f16 copy of a transposed 2D view
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {1280, 512, 1, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {67, 129, 3, 2}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));

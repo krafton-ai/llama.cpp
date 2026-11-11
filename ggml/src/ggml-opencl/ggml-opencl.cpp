@@ -883,6 +883,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_i32_i32;
     cl_kernel kernel_cpy_f32_f32_pack = nullptr;
     cl_kernel kernel_cpy_f32_f32_flat = nullptr;
+    cl_kernel kernel_cpy_f16_f16_t2d  = nullptr;   // transposed f16 2D view -> contiguous
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
@@ -1755,6 +1756,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_flat", &err_flat);
             if (err_flat == CL_SUCCESS) {
                 backend_ctx->kernel_cpy_f32_f32_flat = k;
+            }
+        }
+        {   // optional: without it ggml_cl_cpy keeps the row-mapped kernel for a transposed f16 view
+            cl_int err_t2d = CL_SUCCESS;
+            cl_kernel k = clCreateKernel(prog, "kernel_cpy_f16_f16_t2d", &err_t2d);
+            if (err_t2d == CL_SUCCESS) {
+                backend_ctx->kernel_cpy_f16_f16_t2d = k;
             }
         }
         CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
@@ -29271,6 +29279,35 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
         size_t local_work_size[]  = { lsz, 1, 1 };
 
         backend_ctx->enqueue_ndrange_kernel(k, 1, global_work_size, local_work_size, src1);
+        return;
+    }
+
+    // f16 -> f16 of a transposed 2D view (dim 1 contiguous, dim 0 strided) into a contiguous tensor, e.g. an MLA
+    // latent cache view [rank, n_kv] -> [n_kv, rank]: the tiled kernel reads and writes contiguous halves
+    if (backend_ctx->kernel_cpy_f16_f16_t2d != nullptr && src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F16 &&
+        nb01 == sizeof(ggml_fp16_t) && nb00 != sizeof(ggml_fp16_t) && ne00 > 1 && ne01 > 1 &&
+        ggml_is_contiguous(src1) && ne00 == ne10 && ne01 == ne11 && ne02 == ne12 && ne03 == ne13) {
+        cl_kernel k = backend_ctx->kernel_cpy_f16_f16_t2d;
+        CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem), &extra0->data_device));
+        CL_CHECK(clSetKernelArg(k, 1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(k, 2, sizeof(cl_mem), &extra1->data_device));
+        CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(k, 4, sizeof(int), &ne00));
+        CL_CHECK(clSetKernelArg(k, 5, sizeof(int), &ne01));
+        CL_CHECK(clSetKernelArg(k, 6, sizeof(int), &ne02));
+        CL_CHECK(clSetKernelArg(k, 7, sizeof(cl_ulong), &nb00));
+        CL_CHECK(clSetKernelArg(k, 8, sizeof(cl_ulong), &nb02));
+        CL_CHECK(clSetKernelArg(k, 9, sizeof(cl_ulong), &nb03));
+        CL_CHECK(clSetKernelArg(k, 10, sizeof(cl_ulong), &nb11));
+        CL_CHECK(clSetKernelArg(k, 11, sizeof(cl_ulong), &nb12));
+        CL_CHECK(clSetKernelArg(k, 12, sizeof(cl_ulong), &nb13));
+
+        const size_t tile         = 64;  // CPY_T2D_TILE in cpy.cl
+        size_t global_work_size[] = { ((size_t) ne01 + tile - 1) / tile * tile, ((size_t) ne00 + tile - 1) / tile * 4,
+                                      (size_t) ne02 * ne03 };
+        size_t local_work_size[]  = { tile, 4, 1 };
+
+        backend_ctx->enqueue_ndrange_kernel(k, 3, global_work_size, local_work_size, src1);
         return;
     }
 
