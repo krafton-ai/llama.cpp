@@ -9506,6 +9506,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     op->src[0]->ne[1] >= 32768) {   // vocab-scale weight; no FFN/attn weight is this tall
                     return false;
                 }
+                const bool is_k_quant = op->src[0]->type == GGML_TYPE_Q4_K || op->src[0]->type == GGML_TYPE_Q5_K ||
+                                        op->src[0]->type == GGML_TYPE_Q6_K;
                 // The generic mul_mv (GEMV) kernels are wrong for large-batch prefill on
                 // Adreno. A quant mul_mat only avoids the GEMV when it reaches the Adreno
                 // trans-weight GEMM, which needs both a GEMM kernel for the type and
@@ -9518,11 +9520,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                 t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  ||
                                                 t == GGML_TYPE_Q6_K);
                     const bool uses_gemm = type_has_gemm && use_adreno_kernels(backend_ctx, op->src[0]);
-                    if (!uses_gemm && op->src[1]->ne[1] >= 512) {
+                    // K-quants without the Adreno GEMM still reach the tiled local-memory GEMM (l4_lm) for large N when K % 16 == 0
+                    const bool      uses_l4_lm    = is_k_quant && op->src[0]->ne[0] % 16 == 0;
+                    if (!uses_gemm && !uses_l4_lm && op->src[1]->ne[1] >= 512) {
                         return false;
                     }
                 }
-                return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                // ggml_cl_mul_mat copies a strided src1 to a contiguous buffer for the K-quants
+                return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                       (ggml_is_contiguous(op->src[1]) || is_k_quant);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
                 // ggml_cl_mul_mat_q8_0_f32_adreno now honors src1/dst view_offs (the
                 // activation sub-buffer starts at offset1 and the kernels take offsetd),
@@ -24250,6 +24256,29 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     const enum ggml_type src1t = src1->type;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // the K-quant kernels read src1 as contiguous rows: copy a strided src1 to a contiguous buffer first.
+    // Same for a Q8_0 prefill (else it misses the tiled GEMMs and runs the GEMV per token) and for Q4_0 at
+    // any row count (its batched flat GEMV gives wrong results on a strided src1)
+    if (((src0t == GGML_TYPE_Q4_K || src0t == GGML_TYPE_Q5_K || src0t == GGML_TYPE_Q6_K) ||
+         (src0t == GGML_TYPE_Q8_0 && src1->ne[1] >= 32 && ggml_is_contiguous(src0)) ||
+         (src0t == GGML_TYPE_Q4_0 && ggml_is_contiguous(src0))) &&
+        src1t == GGML_TYPE_F32 && !ggml_is_contiguous(src1)) {
+        backend_ctx->prealloc_src1.allocate(backend_ctx->context, ggml_nelements(src1) * sizeof(float));
+
+        ggml_tensor          fake_src1  = *src1;
+        ggml_tensor_extra_cl fake_extra = {};
+        fake_extra.data_device          = backend_ctx->prealloc_src1.buffer;
+        fake_extra.offset               = 0;
+        ggml_cl_copy_to_contiguous(backend, src1, fake_extra.data_device, fake_src1.nb[0], fake_src1.nb[1],
+                                   fake_src1.nb[2], fake_src1.nb[3]);
+        fake_src1.extra     = &fake_extra;
+        fake_src1.view_src  = nullptr;
+        fake_src1.view_offs = 0;
+
+        ggml_cl_mul_mat(backend, src0, &fake_src1, dst);
+        return;
+    }
 
     // quant kv without FA
     // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
