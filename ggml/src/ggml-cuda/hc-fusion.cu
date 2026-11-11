@@ -555,8 +555,10 @@ void ggml_cuda_op_rms_norm_mat_vec_pre_norm(ggml_backend_cuda_context & ctx, con
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// comb selector -> DSV4_HC_POST [-> stream sum]: one thread per (channel, token); the first warp of every block
-// computes the comb weights of its token: e = K^T mixes, rho = scale*max(e*r) + bias, comb(d, s) = e[d + hc*s]/rho + c0(d, s)
+// comb selector -> DSV4_HC_POST [-> stream sum]: one thread per (channel, token); every block computes the comb weights
+// of its token: e = K^T mixes, rho = scale*max(e*r) + bias, comb(d, s) = e[d + hc*s]/rho + c0(d, s).
+// All global loads of a thread are issued before the first barrier, so their latencies overlap; e is computed with
+// one warp per output (the products of the mixes summed by warp_reduce_sum), the comb by the first warp
 
 struct hc_select_kparams {
     const float * mixes;
@@ -579,32 +581,57 @@ static __global__ void hc_select_post_f32(
         const int64_t sx0, const int64_t sx1, const int64_t sr0, const int64_t sr1, const int64_t sr2,
         const int64_t sp0, const int64_t sp1,
         const int64_t sd0, const int64_t sd1, const int64_t sd2, const int64_t ss0, const int64_t ss1) {
-    const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
+    const int i       = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t       = blockIdx.y;
+    const int lane    = threadIdx.x % WARP_SIZE;
+    const int warp    = threadIdx.x / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+    const int hc2     = hc*hc;
 
     __shared__ float s_post[HC_MAX];
+    __shared__ float s_e[WARP_SIZE];
     __shared__ float s_comb[WARP_SIZE];
 
     ggml_cuda_pdl_sync();
 
-    if (threadIdx.x < WARP_SIZE) {
-        const int lane = threadIdx.x;
-        const int hc2  = hc*hc;
-        float e  = 0.0f;
-        float mx = -FLT_MAX;
-        if (lane < hc2) {
-            for (int k = 0; k < sel.nmix; ++k) {
-                e += sel.K[k*sel.sk0 + lane*sel.sk1]*sel.mixes[k*sel.sm0 + t*sel.sm1];
-            }
-            mx = e*sel.r[lane*sel.sr0];
+    float r[HC_MAX];
+    float xv = 0.0f;
+#pragma unroll
+    for (int s = 0; s < HC_MAX; ++s) {
+        r[s] = s < hc && i < n ? res[i*sr0 + s*sr1 + t*sr2] : 0.0f;
+    }
+    if (i < n) {
+        xv = x[i*sx0 + t*sx1];
+    }
+
+    float rr = 0.0f;
+    float cc = 0.0f;
+    if (warp == 0 && lane < hc2) {
+        rr = sel.r[lane*sel.sr0];
+        cc = sel.c0[(lane % hc)*sel.sc00 + (lane / hc)*sel.sc01];
+    }
+    if ((int) threadIdx.x < hc) {
+        s_post[threadIdx.x] = post[threadIdx.x*sp0 + t*sp1];
+    }
+
+    for (int o = warp; o < hc2; o += n_warps) {
+        float e = 0.0f;
+        for (int k = lane; k < sel.nmix; k += WARP_SIZE) {
+            e += sel.K[k*sel.sk0 + o*sel.sk1]*sel.mixes[k*sel.sm0 + t*sel.sm1];
         }
-        mx = warp_reduce_max(mx);
+        e = warp_reduce_sum(e);
+        if (lane == 0) {
+            s_e[o] = e;
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        const float e = lane < hc2 ? s_e[lane] : 0.0f;
+        const float mx = warp_reduce_max(lane < hc2 ? e*rr : -FLT_MAX);
         if (lane < hc2) {
             const float rho = mx*sel.scale + sel.bias;
-            s_comb[lane] = e/rho + sel.c0[(lane % hc)*sel.sc00 + (lane / hc)*sel.sc01];
-        }
-        if (lane < hc) {
-            s_post[lane] = post[lane*sp0 + t*sp1];
+            s_comb[lane] = e/rho + cc;
         }
     }
     __syncthreads();
@@ -613,16 +640,14 @@ static __global__ void hc_select_post_f32(
         return;
     }
 
-    float r[HC_MAX];
-    for (int s = 0; s < hc; ++s) {
-        r[s] = res[i*sr0 + s*sr1 + t*sr2];
-    }
-    const float xv = x[i*sx0 + t*sx1];
     float tot = 0.0f;
     for (int d = 0; d < hc; ++d) {
         float v = xv*s_post[d];
-        for (int s = 0; s < hc; ++s) {
-            v += r[s]*s_comb[d + hc*s];
+#pragma unroll
+        for (int s = 0; s < HC_MAX; ++s) {
+            if (s < hc) {
+                v += r[s]*s_comb[d + hc*s];
+            }
         }
         dst[i*sd0 + d*sd1 + t*sd2] = v;
         tot = d == 0 ? v : tot + v;
@@ -705,6 +730,50 @@ static __global__ void rms_norm_mul_add_streams_f32(
     }
 }
 
+// the same for n % 4 == 0, hc <= HC_MAX and 16-byte aligned rows: one float4 of the row per thread (n/4 threads),
+// the row, the weight and all streams of a thread are loaded once, before the reduction
+static __global__ void rms_norm_mul_add_streams_f32_vec4(
+        const float * g, const float * w, const float * streams, float * dst, const int n, const int hc, const float eps,
+        const int64_t sg1, const int64_t sx1, const int64_t sx2, const int64_t sd1, const int64_t sd2) {
+    const int t = blockIdx.x;
+    const int i = 4*threadIdx.x;
+
+    __shared__ float s_sum[32];
+
+    ggml_cuda_pdl_sync();
+
+    float4 gv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 wv = gv;
+    float4 xv[HC_MAX];
+#pragma unroll
+    for (int s = 0; s < HC_MAX; ++s) {
+        xv[s] = gv;
+        if (s < hc && i < n) {
+            xv[s] = *(const float4 *) (streams + s*sx1 + t*sx2 + i);
+        }
+    }
+    if (i < n) {
+        gv = *(const float4 *) (g + t*sg1 + i);
+        wv = *(const float4 *) (w + i);
+    }
+    float ss = gv.x*gv.x;
+    ss += gv.y*gv.y;
+    ss += gv.z*gv.z;
+    ss += gv.w*gv.w;
+    ss = block_reduce<block_reduce_method::SUM>(ss, s_sum);
+    const float scale = rsqrtf(ss/n + eps);
+    if (i >= n) {
+        return;
+    }
+    const float4 a = make_float4(gv.x*scale*wv.x, gv.y*scale*wv.y, gv.z*scale*wv.z, gv.w*scale*wv.w);
+#pragma unroll
+    for (int s = 0; s < HC_MAX; ++s) {
+        if (s < hc) {
+            *(float4 *) (dst + s*sd1 + t*sd2 + i) = make_float4(xv[s].x + a.x, xv[s].y + a.y, xv[s].z + a.z, xv[s].w + a.w);
+        }
+    }
+}
+
 void ggml_cuda_op_rms_norm_mul_add_streams(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
         const ggml_tensor * mul, ggml_tensor * add) {
     const ggml_tensor * g       = rms_norm->src[0];
@@ -717,11 +786,28 @@ void ggml_cuda_op_rms_norm_mul_add_streams(ggml_backend_cuda_context & ctx, cons
     GGML_ASSERT(add->type == GGML_TYPE_F32 && add->nb[0] == sizeof(float));
 
     constexpr size_t f = sizeof(float);
+    const int     n   = add->ne[0];
+    const int     hc  = add->ne[1];
+    const int64_t sg1 = g->nb[1]/f;
+    const int64_t sx1 = streams->nb[1]/f;
+    const int64_t sx2 = streams->nb[2]/f;
+    const int64_t sd1 = add->nb[1]/f;
+    const int64_t sd2 = add->nb[2]/f;
+    const float   eps = ggml_get_op_params_f32(rms_norm, 0);
+
+    const int nth4 = (n/4 + WARP_SIZE - 1)/WARP_SIZE*WARP_SIZE;
+    if (n > 0 && n % 4 == 0 && nth4 <= 1024 && hc <= HC_MAX && ggml_cuda_is_aligned(g, 16) && ggml_cuda_is_aligned(w, 16) &&
+            ggml_cuda_is_aligned(streams, 16) && ggml_cuda_is_aligned(add, 16)) {
+        const ggml_cuda_kernel_launch_params lp(dim3(add->ne[2]), dim3(nth4), 0, ctx.stream());
+        ggml_cuda_kernel_launch(rms_norm_mul_add_streams_f32_vec4, lp,
+                (const float *) g->data, (const float *) w->data, (const float *) streams->data, (float *) add->data,
+                n, hc, eps, sg1, sx1, sx2, sd1, sd2);
+        return;
+    }
+
     constexpr int block_size = 256;
     const ggml_cuda_kernel_launch_params lp(dim3(add->ne[2]), dim3(block_size), 0, ctx.stream());
     ggml_cuda_kernel_launch(rms_norm_mul_add_streams_f32<block_size>, lp,
             (const float *) g->data, (const float *) w->data, (const float *) streams->data, (float *) add->data,
-            (int) add->ne[0], (int) add->ne[1], ggml_get_op_params_f32(rms_norm, 0),
-            (int64_t) (g->nb[1]/f), (int64_t) (streams->nb[1]/f), (int64_t) (streams->nb[2]/f),
-            (int64_t) (add->nb[1]/f), (int64_t) (add->nb[2]/f));
+            n, hc, eps, sg1, sx1, sx2, sd1, sd2);
 }
