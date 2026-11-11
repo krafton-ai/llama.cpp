@@ -640,6 +640,18 @@ struct ggml_cl_adreno_xmem_attn_state {
 #endif
 
 // backend context
+// variants of kernel_mul_mat_f16t_f32_ncol_split, by index of their kernel in the backend context
+enum ggml_cl_ncol_split_variant {
+    NCOL_SPLIT_D2,
+    NCOL_SPLIT_D2_C16,
+    NCOL_SPLIT_D2_C16_U4,
+    NCOL_SPLIT_D2_C8_U4,
+    NCOL_SPLIT_D2_C8_VP,
+    NCOL_SPLIT_D2_C8_VP_J128,
+    NCOL_SPLIT_D2_C8_VP_J64,
+    NCOL_SPLIT_COUNT,
+};
+
 struct ggml_backend_opencl_context {
     int ref_count;
 
@@ -860,6 +872,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_ncol                    = nullptr;
     cl_kernel kernel_mul_mat_f16t_f32_ncol_split             = nullptr;
     cl_kernel kernel_mul_mat_ncol_split_reduce               = nullptr;
+    cl_kernel kernel_mul_mat_f16t_f32_ncol_split_var[NCOL_SPLIT_COUNT] = {};
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2                 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576            = nullptr;
     cl_kernel kernel_mul_mat_ncol_pack_q                     = nullptr;
@@ -1356,6 +1369,12 @@ struct ggml_backend_opencl_context {
                 *kernels[i] = nullptr;
             }
         }
+        for (int i = 0; i < NCOL_SPLIT_COUNT; ++i) {
+            if (kernel_mul_mat_f16t_f32_ncol_split_var[i]) {
+                CL_CHECK(clReleaseKernel(kernel_mul_mat_f16t_f32_ncol_split_var[i]));
+                kernel_mul_mat_f16t_f32_ncol_split_var[i] = nullptr;
+            }
+        }
         if (ncol_q_packed_image) {
             CL_CHECK(clReleaseMemObject(ncol_q_packed_image));
             ncol_q_packed_image = nullptr;
@@ -1803,6 +1822,26 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_ncol        = clCreateKernel(prog, "kernel_mul_mat_f16_f32_ncol", &err), err));
             CL_CHECK((backend_ctx->kernel_mul_mat_f16t_f32_ncol_split = clCreateKernel(prog, "kernel_mul_mat_f16t_f32_ncol_split", &err), err));
             CL_CHECK((backend_ctx->kernel_mul_mat_ncol_split_reduce   = clCreateKernel(prog, "kernel_mul_mat_ncol_split_reduce", &err), err));
+        }
+        if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+            cl_program variants = build_program_from_source_ex(backend_ctx->context, backend_ctx->device, kernel_src.c_str(),
+                compile_opts + " -DNCOL_SPLIT_VARIANTS", false, "mul_mat_f16t_f32_ncol_split variants");
+            if (variants) {
+                const char * names[NCOL_SPLIT_COUNT] = {
+                    "kernel_mul_mat_f16t_f32_ncol_split_d2",
+                    "kernel_mul_mat_f16t_f32_ncol_split_d2_c16",
+                    "kernel_mul_mat_f16t_f32_ncol_split_d2_c16_u4",
+                    "kernel_mul_mat_f16t_f32_ncol_split_d2_c8_u4",
+                    "kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp",
+                    "kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_j128",
+                    "kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_j64",
+                };
+                for (int i = 0; i < NCOL_SPLIT_COUNT; ++i) {
+                    backend_ctx->kernel_mul_mat_f16t_f32_ncol_split_var[i] =
+                        ggml_cl_create_optional_kernel(backend_ctx, variants, names[i], 64);
+                }
+                CL_CHECK(clReleaseProgram(variants));
+            }
         }
         if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO && backend_ctx->has_subgroup_shuffle) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -25726,6 +25765,18 @@ static const ggml_tensor * ggml_opencl_ncol_split_mul_mat_node(const ggml_cgraph
     return mm;
 }
 
+// the split variants address the cache, P and dst directly: all three must be in buffers of this backend and dst
+// must not overlap the inputs
+static bool ggml_cl_ncol_split_ranges_ok(ggml_backend_opencl_context * backend_ctx,
+                                         const ggml_tensor *           v,
+                                         const ggml_tensor *           p,
+                                         const ggml_tensor *           dst) {
+    ggml_cl_range rv, rp, rd;
+    return ggml_cl_buffer_range(backend_ctx, v, rv) && ggml_cl_buffer_range(backend_ctx, p, rp) &&
+           ggml_cl_buffer_range(backend_ctx, dst, rd) && !ggml_cl_ranges_overlap(rv, rd) &&
+           !ggml_cl_ranges_overlap(rp, rd);
+}
+
 static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor * cont, ggml_tensor * mm) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     const ggml_tensor *           view        = cont->src[0];
@@ -25742,14 +25793,45 @@ static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor
     const cl_ulong         nbd1       = mm->ne[1] == 1 ? mm->nb[2] : mm->nb[1];
     const int              J          = (int) view->ne[0];
     const int              D          = (int) view->ne[1];
+    const bool             transposed = cont->src[0]->op == GGML_OP_TRANSPOSE;
+    cl_kernel *            variants   = backend_ctx->kernel_mul_mat_f16t_f32_ncol_split_var;
 
-    const int JC      = J >= 4096 ? 128 : J >= 1024 ? 64 : 32;
+    // JC = 256 variants for caches from 8K: each one is used only when the ones before it exist
+    const bool c16       = variants[NCOL_SPLIT_D2_C16] != nullptr;
+    const bool c16_u4    = c16 && variants[NCOL_SPLIT_D2_C16_U4];
+    const bool c8_u4     = c16_u4 && variants[NCOL_SPLIT_D2_C8_U4];
+    const bool c8_vp     = c8_u4 && variants[NCOL_SPLIT_D2_C8_VP];
+    const int  long_idx  = c8_vp  ? NCOL_SPLIT_D2_C8_VP :
+                           c8_u4  ? NCOL_SPLIT_D2_C8_U4 :
+                           c16_u4 ? NCOL_SPLIT_D2_C16_U4 :
+                           c16    ? NCOL_SPLIT_D2_C16 :
+                                    NCOL_SPLIT_D2;
+    const bool p_rows_ok = nbp1 == (cl_ulong) J * sizeof(float) || nbp1 == (cl_ulong) J * sizeof(float) + 64;
+    const bool long_kv = variants[long_idx] && view->ne[0] >= 8192 && view->ne[0] <= 65536 && view->ne[0] % 256 == 0 &&
+                         view->ne[1] == 512 && view->nb[0] == 1152 && p_rows_ok && nbd1 == 2048 && transposed &&
+                         ggml_cl_ncol_split_ranges_ok(backend_ctx, view, p, mm);
+
+    // two exact shorter cache lengths have their own split size (JC = 128 and 64)
+    const bool short_shape = !long_kv && D == 512 && view->nb[0] == 1152 && nbp1 == (cl_ulong) J * sizeof(float) &&
+                             nbd1 == 2048 && offv % 4 == 0 && offp % 16 == 0 && offd % 4 == 0 && transposed;
+    const bool short_4352  = short_shape && J == 4352 && variants[NCOL_SPLIT_D2_C8_VP_J128] &&
+                             ggml_cl_ncol_split_ranges_ok(backend_ctx, view, p, mm);
+    const bool short_2304  = short_shape && J == 2304 && variants[NCOL_SPLIT_D2_C8_VP_J64] &&
+                             ggml_cl_ncol_split_ranges_ok(backend_ctx, view, p, mm);
+    const bool short_kv    = short_4352 || short_2304;
+
+    const int JC      = long_kv ? 256 : J >= 4096 ? 128 : J >= 1024 ? 64 : 32;
     const int n_split = CEIL_DIV(J, JC);
 
     backend_ctx->prealloc_ncol_part.allocate(backend_ctx->context, (size_t) n_split * 32 * D * sizeof(float));
 
     {
         cl_kernel kernel = backend_ctx->kernel_mul_mat_f16t_f32_ncol_split;
+        if (short_kv) {
+            kernel = variants[short_2304 ? NCOL_SPLIT_D2_C8_VP_J64 : NCOL_SPLIT_D2_C8_VP_J128];
+        } else if (long_kv) {
+            kernel = variants[long_idx];
+        }
 
         cl_uint idx = 0;
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &extrav->data_device));
@@ -25761,10 +25843,14 @@ static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &backend_ctx->prealloc_ncol_part.buffer));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &J));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &D));
-        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &JC));
+        if (!long_kv && !short_kv) {
+            CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &JC));
+        }
 
-        size_t lws[2] = { 64, 1 };
-        size_t gws[2] = { (size_t) CEIL_DIV(D, 64) * 64, (size_t) n_split };
+        // the variants take two d per lane; c8 / c16 split the 32 heads over 4 / 2 groups
+        const int gws0   = short_kv ? 2 * D : !long_kv ? CEIL_DIV(D, 64) * 64 : c8_u4 ? 2 * D : c16 ? D : D / 2;
+        size_t    lws[2] = { 64, 1 };
+        size_t    gws[2] = { (size_t) gws0, (size_t) n_split };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, mm);
     }
     {

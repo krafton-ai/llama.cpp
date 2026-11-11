@@ -207,3 +207,399 @@ kernel void kernel_mul_mat_ncol_split_reduce(
     }
     *(global float *) (d + offd + (ulong) n * nbd1 + (ulong) dd * sizeof(float)) = sum;
 }
+
+#ifdef NCOL_SPLIT_VARIANTS
+//------------------------------------------------------------------------------
+// Variants of kernel_mul_mat_f16t_f32_ncol_split with two d per lane, without the JC argument (fixed split
+// size, full splits only). Built as their own program on Adreno; the host picks one by cache length.
+//------------------------------------------------------------------------------
+// 64 lanes process 128 adjacent d, all 32 heads; splits of 256 rows
+kernel void kernel_mul_mat_f16t_f32_ncol_split_d2(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D) {
+    local float Pl[64][36];
+    const int lane = get_local_id(0);
+    const int d = 2 * (get_group_id(0) * 64 + lane);
+    const int split = get_group_id(1);
+    const int j0 = 256 * split;
+    float8 even[4] = { 0 }, odd[4] = { 0 };
+    for (int strip = 0; strip < 256; strip += 64) {
+        const int left = clamp(J - j0 - strip, 0, 64);
+        for (int h = 0; h < 32; ++h) {
+            Pl[lane][h] =
+                    lane < left ? ((global const float *) (p + offp + (ulong) h * nbp1))[j0 + strip + lane] : 0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int u = 0; u < left; ++u) {
+            const global half * vp = (global const half *) (v + offv + (ulong) (j0 + strip + u) * nbvj) + d;
+            const float2 pair = vload_half2(0, vp);
+#pragma unroll
+            for (int h8 = 0; h8 < 4; ++h8) {
+                const float8 w = vload8(h8, &Pl[u][0]);
+                even[h8] = mad((float8) pair.x, w, even[h8]);
+                odd[h8] = mad((float8) pair.y, w, odd[h8]);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    global float * out = part + (ulong) split * 32 * D + d;
+#pragma unroll
+    for (int h8 = 0; h8 < 4; ++h8) {
+        global float * out_odd = out + 1;
+        NCOL_STORE8(even[h8], out, D)
+        NCOL_STORE8(odd[h8], out_odd, D)
+        out += 8 * D;
+    }
+}
+kernel void kernel_mul_mat_f16t_f32_ncol_split_d2_c16(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D) {
+    local float Pl[64][20];
+    const int lane = get_local_id(0);
+    const int head0 = (get_group_id(0) % 2) * 16;
+    const int d = 2 * ((get_group_id(0) / 2) * 64 + lane);
+    const int split = get_group_id(1);
+    const int j0 = 256 * split;
+    float8 even[2] = { 0 }, odd[2] = { 0 };
+    for (int strip = 0; strip < 256; strip += 64) {
+        const int left = clamp(J - j0 - strip, 0, 64);
+        for (int h = 0; h < 16; ++h) {
+            Pl[lane][h] = lane < left ?
+                    ((global const float *) (p + offp + (ulong) (head0 + h) * nbp1))[j0 + strip + lane] :
+                    0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int u = 0; u < left; ++u) {
+            const global half * vp = (global const half *) (v + offv + (ulong) (j0 + strip + u) * nbvj) + d;
+            const float2 pair = vload_half2(0, vp);
+#pragma unroll
+            for (int h8 = 0; h8 < 2; ++h8) {
+                const float8 w = vload8(h8, &Pl[u][0]);
+                even[h8] = mad((float8) pair.x, w, even[h8]);
+                odd[h8] = mad((float8) pair.y, w, odd[h8]);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    global float * out = part + ((ulong) split * 32 + head0) * D + d;
+#pragma unroll
+    for (int h8 = 0; h8 < 2; ++h8) {
+        global float * out_odd = out + 1;
+        NCOL_STORE8(even[h8], out, D)
+        NCOL_STORE8(odd[h8], out_odd, D)
+        out += 8 * D;
+    }
+}
+kernel void kernel_mul_mat_f16t_f32_ncol_split_d2_c16_u4(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D) {
+    local float Pl[64][20];
+    const int lane = get_local_id(0);
+    const int head0 = (get_group_id(0) % 2) * 16;
+    const int d = 2 * ((get_group_id(0) / 2) * 64 + lane);
+    const int split = get_group_id(1);
+    const int j0 = 256 * split;
+    float8 even[2] = { 0 }, odd[2] = { 0 };
+    for (int strip = 0; strip < 256; strip += 64) {
+        const int left = clamp(J - j0 - strip, 0, 64);
+        for (int h = 0; h < 16; ++h) {
+            Pl[lane][h] = lane < left ?
+                    ((global const float *) (p + offp + (ulong) (head0 + h) * nbp1))[j0 + strip + lane] :
+                    0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        // The selector only admits full 256-key splits.
+        for (int u = 0; u < left; u += 4) {
+            float2 values[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const global half * ptr = (global const half *) (v + offv + (ulong) (j0 + strip + u + i) * nbvj) + d;
+                values[i] = vload_half2(0, ptr);
+            }
+#pragma unroll
+            for (int h8 = 0; h8 < 2; ++h8) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float8 w = vload8(h8, &Pl[u + i][0]);
+                    even[h8] = mad((float8) values[i].x, w, even[h8]);
+                    odd[h8] = mad((float8) values[i].y, w, odd[h8]);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    global float * out = part + ((ulong) split * 32 + head0) * D + d;
+#pragma unroll
+    for (int h8 = 0; h8 < 2; ++h8) {
+        global float * out_odd = out + 1;
+        NCOL_STORE8(even[h8], out, D)
+        NCOL_STORE8(odd[h8], out_odd, D)
+        out += 8 * D;
+    }
+}
+kernel void kernel_mul_mat_f16t_f32_ncol_split_d2_c8_u4(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D) {
+    local float Pl[64][12];
+    const int lane = get_local_id(0);
+    const int head0 = (get_group_id(0) % 4) * 8;
+    const int d = 2 * ((get_group_id(0) / 4) * 64 + lane);
+    const int split = get_group_id(1);
+    const int j0 = 256 * split;
+    float8 even[1] = { 0 }, odd[1] = { 0 };
+    for (int strip = 0; strip < 256; strip += 64) {
+        const int left = clamp(J - j0 - strip, 0, 64);
+        for (int h = 0; h < 8; ++h) {
+            Pl[lane][h] = lane < left ?
+                    ((global const float *) (p + offp + (ulong) (head0 + h) * nbp1))[j0 + strip + lane] :
+                    0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        // The selector only admits full 256-key splits.
+        for (int u = 0; u < left; u += 4) {
+            float2 values[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const global half * ptr = (global const half *) (v + offv + (ulong) (j0 + strip + u + i) * nbvj) + d;
+                values[i] = vload_half2(0, ptr);
+            }
+#pragma unroll
+            for (int h8 = 0; h8 < 1; ++h8) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float8 w = vload8(h8, &Pl[u + i][0]);
+                    even[h8] = mad((float8) values[i].x, w, even[h8]);
+                    odd[h8] = mad((float8) values[i].y, w, odd[h8]);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    global float * out = part + ((ulong) split * 32 + head0) * D + d;
+#pragma unroll
+    for (int h8 = 0; h8 < 1; ++h8) {
+        global float * out_odd = out + 1;
+        NCOL_STORE8(even[h8], out, D)
+        NCOL_STORE8(odd[h8], out_odd, D)
+        out += 8 * D;
+    }
+}
+
+kernel void kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D) {
+    local float Pl[64][12];
+    const int lane = get_local_id(0);
+    const int head0 = (get_group_id(0) % 4) * 8;
+    const int d = 2 * ((get_group_id(0) / 4) * 64 + lane);
+    const int split = get_group_id(1);
+    const int j0 = 256 * split;
+    float8 even[1] = { 0 }, odd[1] = { 0 };
+    for (int strip = 0; strip < 256; strip += 64) {
+        const int left = clamp(J - j0 - strip, 0, 64);
+        const int row = (lane % 16) * 4;
+        for (int h = lane / 16; h < 8; h += 4) {
+            const global float * weights = (global const float *) (p + offp + (ulong) (head0 + h) * nbp1);
+            float4 w = vload4(0, weights + j0 + strip + row);
+            Pl[row][h] = w.s0;
+            Pl[row + 1][h] = w.s1;
+            Pl[row + 2][h] = w.s2;
+            Pl[row + 3][h] = w.s3;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        // The selector only admits full 256-key splits.
+        for (int u = 0; u < left; u += 4) {
+            float2 values[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const global half * ptr = (global const half *) (v + offv + (ulong) (j0 + strip + u + i) * nbvj) + d;
+                values[i] = vload_half2(0, ptr);
+            }
+#pragma unroll
+            for (int h8 = 0; h8 < 1; ++h8) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float8 w = vload8(h8, &Pl[u + i][0]);
+                    even[h8] = mad((float8) values[i].x, w, even[h8]);
+                    odd[h8] = mad((float8) values[i].y, w, odd[h8]);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    global float * out = part + ((ulong) split * 32 + head0) * D + d;
+#pragma unroll
+    for (int h8 = 0; h8 < 1; ++h8) {
+        global float * out_odd = out + 1;
+        NCOL_STORE8(even[h8], out, D)
+        NCOL_STORE8(odd[h8], out_odd, D)
+        out += 8 * D;
+    }
+}
+
+kernel void kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_j128(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D) {
+    local float Pl[64][12];
+    const int lane = get_local_id(0);
+    const int head0 = (get_group_id(0) % 4) * 8;
+    const int d = 2 * ((get_group_id(0) / 4) * 64 + lane);
+    const int split = get_group_id(1);
+    const int j0 = 128 * split;
+    float8 even[1] = { 0 }, odd[1] = { 0 };
+    for (int strip = 0; strip < 128; strip += 64) {
+        const int left = clamp(J - j0 - strip, 0, 64);
+        const int row = (lane % 16) * 4;
+        for (int h = lane / 16; h < 8; h += 4) {
+            const global float * weights = (global const float *) (p + offp + (ulong) (head0 + h) * nbp1);
+            float4 w = vload4(0, weights + j0 + strip + row);
+            Pl[row][h] = w.s0;
+            Pl[row + 1][h] = w.s1;
+            Pl[row + 2][h] = w.s2;
+            Pl[row + 3][h] = w.s3;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        // The selector only admits full 128-key splits.
+        for (int u = 0; u < left; u += 4) {
+            float2 values[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const global half * ptr = (global const half *) (v + offv + (ulong) (j0 + strip + u + i) * nbvj) + d;
+                values[i] = vload_half2(0, ptr);
+            }
+#pragma unroll
+            for (int h8 = 0; h8 < 1; ++h8) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float8 w = vload8(h8, &Pl[u + i][0]);
+                    even[h8] = mad((float8) values[i].x, w, even[h8]);
+                    odd[h8] = mad((float8) values[i].y, w, odd[h8]);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    global float * out = part + ((ulong) split * 32 + head0) * D + d;
+#pragma unroll
+    for (int h8 = 0; h8 < 1; ++h8) {
+        global float * out_odd = out + 1;
+        NCOL_STORE8(even[h8], out, D)
+        NCOL_STORE8(odd[h8], out_odd, D)
+        out += 8 * D;
+    }
+}
+
+static inline int pv_j0(int split) {
+    return split * 64;
+}
+static inline int pv_head0(int group) {
+    return (group % 4) * 8;
+}
+static inline int pv_d(int group, int lane) {
+    return 2 * ((group / 4) * 64 + lane);
+}
+static inline int pv_partial(int split, int head, int d) {
+    return (split * 32 + head) * 512 + d;
+}
+
+kernel void kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_j64(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D) {
+    local float Pl[64][12];
+    const int lane = get_local_id(0);
+    const int head0 = pv_head0(get_group_id(0));
+    const int d = pv_d(get_group_id(0), lane);
+    const int split = get_group_id(1);
+    const int j0 = pv_j0(split);
+    float8 even[1] = { 0 }, odd[1] = { 0 };
+    for (int strip = 0; strip < 64; strip += 64) {
+        const int left = clamp(J - j0 - strip, 0, 64);
+        const int row = (lane % 16) * 4;
+        for (int h = lane / 16; h < 8; h += 4) {
+            const global float * weights = (global const float *) (p + offp + (ulong) (head0 + h) * nbp1);
+            float4 w = vload4(0, weights + j0 + strip + row);
+            Pl[row][h] = w.s0;
+            Pl[row + 1][h] = w.s1;
+            Pl[row + 2][h] = w.s2;
+            Pl[row + 3][h] = w.s3;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        // The selector only admits full 64-key splits.
+        for (int u = 0; u < left; u += 4) {
+            float2 values[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const global half * ptr = (global const half *) (v + offv + (ulong) (j0 + strip + u + i) * nbvj) + d;
+                values[i] = vload_half2(0, ptr);
+            }
+#pragma unroll
+            for (int h8 = 0; h8 < 1; ++h8) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float8 w = vload8(h8, &Pl[u + i][0]);
+                    even[h8] = mad((float8) values[i].x, w, even[h8]);
+                    odd[h8] = mad((float8) values[i].y, w, odd[h8]);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    global float * out = part + pv_partial(split, head0, d);
+#pragma unroll
+    for (int h8 = 0; h8 < 1; ++h8) {
+        global float * out_odd = out + 1;
+        NCOL_STORE8(even[h8], out, D)
+        NCOL_STORE8(odd[h8], out_odd, D)
+        out += 8 * D;
+    }
+}
+#endif  // NCOL_SPLIT_VARIANTS

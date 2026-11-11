@@ -12854,6 +12854,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_kq_shared(n_kv));
     }
 
+    for (int64_t n_kv : {2304, 4352, 8192, 8448}) {
+        test_cases.emplace_back(new test_mul_mat_vt_shared(n_kv));
+    }
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));
