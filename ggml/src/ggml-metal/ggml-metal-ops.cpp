@@ -3396,7 +3396,8 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
     if (true) {
         const int64_t nwg = 32;
-        const int64_t ne01_max = std::min(ne01, 32);
+        // single-head ops (MLA heads as query rows) may split up to 256 rows: a short MTP verify batch is 32*n_tokens rows
+        const int64_t ne01_max = std::min(ne01, ne02 == 1 ? 256 : 32);
 
         // temp buffer for writing the results from each workgroup
         // - ne20: the size of the Value head
@@ -3893,7 +3894,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         {
             const int64_t ntg  = ((ne01 + nqptg - 1)/nqptg)*ne02*ne03;
             const int64_t nblk = (ne11 + ncpsg - 1)/ncpsg;
-            if (ne01 <= 32) {
+            if (ne01 <= (ne02 == 1 ? 256 : 32)) {
                 // double the workgroups while there are enough KV blocks per workgroup and the GPU is not yet filled
                 while (nwg < 32 && ntg*nwg*2 <= 128 && nblk >= 4*nwg*2) {
                     nwg *= 2;
