@@ -2610,6 +2610,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             sg_create({GGML_TYPE_F16, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f16",            SPV_DOT2(matmul_f16),            sizeof(vk_mat_mat_push_constants), 3);
             sg_create({GGML_TYPE_F16, GGML_TYPE_F32, false, true},  tc_mm, "matmul_f16_f32_f16acc", SPV_DOT2_F16ACC(matmul_f16_f32), sizeof(vk_mat_mat_push_constants), 3);
             sg_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f16_f32",        SPV_DOT2(matmul_f16_f32),        sizeof(vk_mat_mat_push_constants), 3);
+            // f16 output, for a multiply fused with the copy of its result to f16 (fused_mul_mat_cpy_f16)
+            sg_create({GGML_TYPE_F16, GGML_TYPE_F32, false, true, true},  tc_mm, "matmul_f16_f32_d16_f16acc", SPV_DOT2_F16ACC(matmul_f16_f32_d16), sizeof(vk_mat_mat_push_constants), 3);
+            sg_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false, true}, tc_mm, "matmul_f16_f32_d16",        SPV_DOT2(matmul_f16_f32_d16),        sizeof(vk_mat_mat_push_constants), 3);
             // BF16 - no dot2
             sg_create({GGML_TYPE_BF16, GGML_TYPE_BF16, false, false}, tc_mm, "matmul_bf16", matmul_bf16_len, matmul_bf16_data, sizeof(vk_mat_mat_push_constants), 3);
 
@@ -6100,9 +6103,9 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
 }
 
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
-        ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false) {
+        ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false, bool d16 = false) {
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
-    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc};
+    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc, d16};
     auto it = ctx->device->pipeline_matmul.find(key);
     if (it == ctx->device->pipeline_matmul.end() || it->second.empty()) {
         // Try without f16acc
@@ -6414,7 +6417,7 @@ static ggml_type ggml_vk_mul_mat_b_type(
     return f16_type;
 }
 
-static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
+static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, ggml_tensor * dst_f16 = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
@@ -6432,14 +6435,16 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t ne12 = src1->ne[2];
     const uint64_t ne13 = src1->ne[3];
 
+    // dst_f16: the multiply writes f16 into this tensor (the CPY of its result to f16, fused) instead of dst
+    ggml_tensor * dst_w = dst_f16 ? dst_f16 : dst;
     const uint64_t ne21 = dst->ne[1];
-    const uint32_t stride_d = dst->nb[1] / ggml_type_size(dst->type);
+    const uint32_t stride_d = dst_w->nb[1] / ggml_type_size(dst_w->type);
     const uint32_t stride_batch_d = stride_d*ne21;
 
     const uint64_t r2 = ne12 / ne02;
     const uint64_t r3 = ne13 / ne03;
 
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst_w->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
 
@@ -6483,7 +6488,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
-        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0]);
+        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], false, dst_f16 != nullptr);
+    GGML_ASSERT(dst_f16 == nullptr || (mmp_map != nullptr && !x_non_contig && !quantize_y));
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     const bool qy_needs_dequant = y_needs_reformat;
@@ -6511,13 +6517,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || dst_f16 != nullptr, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
-    const uint64_t d_sz = sizeof(float) * d_ne;
+    const uint64_t d_sz = ggml_type_size(dst_w->type) * d_ne;
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -6577,7 +6583,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    const uint64_t d_buf_offset = vk_tensor_offset(dst_w) + dst_w->view_offs;
     GGML_ASSERT(d_D != nullptr);
     GGML_ASSERT(d_D->size >= d_buf_offset + d_sz);
     vk_buffer d_X;
@@ -6684,7 +6690,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ne01, ne11, ne10,
         stride_x, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
         split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
-        b_col_bytes, (uint64_t)dst->nb[1]
+        b_col_bytes, (uint64_t)dst_w->nb[1]
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -7380,6 +7386,11 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
+
+    if (ctx->fused_mul_mat_cpy_f16) {
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, true, cgraph->nodes[node_idx + 1]);
+        return;
+    }
 
     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
     // where the M dimension is very large.
@@ -14155,6 +14166,44 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_are_same_shape(scale_in->src[0], scale_out);
 }
 
+// A MUL_MAT of an f16 matrix by a contiguous f32 one (a mat-mat multiply, 2D) followed by the CPY of its result to a
+// contiguous f16 tensor of the same shape, the only use of that result: one multiply writing f16 (matmul *_d16). The
+// graph optimizer puts such a CPY right after its MUL_MAT and keeps the multiply's inputs alive through it.
+static bool ggml_vk_fuse_mul_mat_cpy_f16(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[node_idx];
+    const ggml_tensor * cpy = cgraph->nodes[node_idx + 1];
+    if (mm->op != GGML_OP_MUL_MAT || cpy->op != GGML_OP_CPY || cpy->src[0] != mm || cpy->type != GGML_TYPE_F16 ||
+        (cpy->src[1] != nullptr && cpy->src[1] != cpy) || !ggml_is_contiguous(cpy) || !ggml_are_same_shape(cpy, mm)) {
+        return false;
+    }
+    const ggml_tensor * a = mm->src[0];
+    const ggml_tensor * b = mm->src[1];
+    if (a->type != GGML_TYPE_F16 || b->type != GGML_TYPE_F32 || !ggml_vk_dim01_contiguous(a) || !ggml_is_contiguous(b) ||
+        !ggml_is_contiguous(mm) || mm->ne[2] != 1 || mm->ne[3] != 1 || mm->ne[1] <= (int64_t) mul_mat_vec_max_cols ||
+        ggml_nbytes(a) > ctx->device->properties.limits.maxStorageBufferRange || ctx->device->coopmat2) {
+        return false;
+    }
+    if (ggml_vk_get_mul_mat_mat_pipeline_map(const_cast<ggml_backend_vk_context *>(ctx), a->type, b->type, (ggml_prec) mm->op_params[0], false, true) == nullptr) {
+        return false;
+    }
+    // the CPY is the only reader of the multiply's result
+    for (int j = node_idx + 2; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->view_src == mm) {
+            return false;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] == mm) {
+                return false;
+            }
+        }
+    }
+    return (mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+}
+
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -15008,6 +15057,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_hc_select = false;
+        ctx->fused_mul_mat_cpy_f16 = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -15038,6 +15088,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ADD";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_fuse_mul_mat_cpy_f16(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_mul_mat_cpy_f16 = true;
+                fusion_string = "MUL_MAT_CPY_F16";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
@@ -15263,7 +15319,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 for (int k = 0; k <= ctx->num_additional_fused_ops; ++k) {
                     for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
                         ggml_tensor *src = cgraph->nodes[i + k]->src[s];
-                        if (!src || src->op == GGML_OP_NONE) {
+                        if (!src || src->op == GGML_OP_NONE || src == cgraph->nodes[i + k]) {
                             continue;
                         }
                         if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
@@ -15289,6 +15345,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_hc_select = false;
+                ctx->fused_mul_mat_cpy_f16 = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -15894,6 +15951,29 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     GGML_ASSERT((int) new_order.size() == graph->n_nodes);
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
+    }
+
+    // the CPY to f16 of an f16 x f32 MUL_MAT result runs as one multiply writing f16 (ggml_vk_fuse_mul_mat_cpy_f16):
+    // move it right after its MUL_MAT (nothing in between reads it) and keep the multiply's inputs alive through it,
+    // so that its output is not placed over them
+    for (int i = 0; i + 1 < graph->n_nodes; ++i) {
+        ggml_tensor * mm = graph->nodes[i];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_F16 || mm->src[1]->type != GGML_TYPE_F32) {
+            continue;
+        }
+        for (int j = i + 1; j < graph->n_nodes; ++j) {
+            ggml_tensor * cpy = graph->nodes[j];
+            if (cpy->op != GGML_OP_CPY || cpy->src[0] != mm || cpy->type != GGML_TYPE_F16) {
+                continue;
+            }
+            for (int k = j; k > i + 1; --k) {
+                graph->nodes[k] = graph->nodes[k - 1];
+            }
+            graph->nodes[i + 1] = cpy;
+            params->add_alloc_dep(params->user_data, mm->src[0], cpy);
+            params->add_alloc_dep(params->user_data, mm->src[1], cpy);
+            break;
+        }
     }
 }
 

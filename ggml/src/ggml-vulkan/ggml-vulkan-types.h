@@ -259,10 +259,11 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    bool d16 = false; // writes f16 (a multiply fused with the copy of its result to f16)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16);
     }
 };
 
@@ -1310,6 +1311,7 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_gate {};
     bool fused_hc_select {};   // mHC selector: the run's node indices are in hc_select_run
     int  hc_select_run[16] {};
+    bool fused_mul_mat_cpy_f16 = false; // a MUL_MAT and the CPY of its result to f16 as one multiply writing f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
