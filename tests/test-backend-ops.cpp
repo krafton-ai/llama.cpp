@@ -11851,6 +11851,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3})); // cpy not-contiguous
         }
     }
+    // dequantizing copies of whole rows, e.g. rows gathered from a quantized table on the host
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_K, GGML_TYPE_F32, {6144, 7, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q6_K, GGML_TYPE_F32, {6144, 3, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, {512, 5, 1, 1}));
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
