@@ -13,6 +13,11 @@
 
 #include "mul_mat_vec_iface.glsl"
 
+#ifndef MUL_MAT_ID
+// MAT_VEC_FUSION_FLAGS_HC_POST: comb (post is fuse1)
+layout (binding = 5) readonly buffer Fuse2 {D_TYPE data_fuse2[];};
+#endif
+
 layout (push_constant) uniform parameter
 {
     uint ncols;
@@ -37,7 +42,7 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
-    uint fuse1_off0;   // MAT_VEC_FUSION_FLAGS_HC_POST: post and comb element offsets in fuse1
+    uint fuse1_off0;   // MAT_VEC_FUSION_FLAGS_HC_POST: element offsets of post in fuse1 and of comb in fuse2
     uint fuse1_off1;
 #endif
 } p;
@@ -122,7 +127,7 @@ void store_hc_post(const uint base, const uint i, const FLOAT_TYPE v) {
     [[unroll]] for (uint d = 0; d < 4; ++d) {
         float o = float(v) * float(data_fuse1[p.fuse1_off0 + d]);
         [[unroll]] for (uint s = 0; s < 4; ++s) {
-            o = fma(r[s], float(data_fuse1[p.fuse1_off1 + d + 4*s]), o);
+            o = fma(r[s], float(data_fuse2[p.fuse1_off1 + d + 4*s]), o);
         }
         data_d[base + i + d*n] = D_TYPE(o);
         tot += o;

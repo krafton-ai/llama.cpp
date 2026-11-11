@@ -9,8 +9,8 @@
 #define MAT_VEC_FUSION_FLAGS_GLU 0x10
 // the output is geglu(row, fuse0) = gelu_tanh(row) * fuse0[row] (a split GEGLU with a second, external input)
 #define MAT_VEC_FUSION_FLAGS_GEGLU_MUL 0x20
-// the output feeds an mHC hc_post with 4 streams (dsv4_hc_post): fuse0 = the residual streams [n, 4] and fuse1 = the
-// selector row [pre (4) | post (4) | comb (16)]; row i writes stream d: v*post[d] + sum_s res[i, s]*comb[d + 4s]
+// the output feeds an mHC hc_post with 4 streams (dsv4_hc_post): fuse0 = the residual streams [n, 4], fuse1 = post (4)
+// and fuse2 = comb (4 x 4); row i writes stream d: v*post[d] + sum_s res[i, s]*comb[d + 4s]
 #define MAT_VEC_FUSION_FLAGS_HC_POST 0x40
 // ... and the stream sum after the 4 streams (raon_hc_post_sum)
 #define MAT_VEC_FUSION_FLAGS_HC_POST_SUM 0x80

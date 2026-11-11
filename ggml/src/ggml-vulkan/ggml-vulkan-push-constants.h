@@ -29,7 +29,7 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
-    uint32_t fuse1_off0;   // MAT_VEC_FUSION_FLAGS_HC_POST: post and comb element offsets in fuse1
+    uint32_t fuse1_off0;   // MAT_VEC_FUSION_FLAGS_HC_POST: element offsets of post in fuse1 and of comb in fuse2
     uint32_t fuse1_off1;
 };
 

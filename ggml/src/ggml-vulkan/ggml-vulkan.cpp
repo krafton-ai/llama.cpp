@@ -2905,8 +2905,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     const uint32_t force_subgroup_size = use_subgroups ? subgroup_size : 0;
     const uint32_t force_subgroup_size16 = use_subgroups16 ? subgroup_size16 : 0;
-    static constexpr uint32_t mul_mat_vec_num_bindings = 5;
+    // A, B, D, fuse0, fuse1 and fuse2 (comb of MAT_VEC_FUSION_FLAGS_HC_POST)
+    static constexpr uint32_t mul_mat_vec_num_bindings = 6;
     static constexpr uint32_t mul_mat_vec_id_num_bindings = 6;
+    static constexpr uint32_t mul_mat_vec_p021_nc_num_bindings = 5;
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
 #define OCP_DMMV_LEN(NAME, REDUC)  (device->ocp_fp4 ? NAME ## _ocp_len[REDUC]  : NAME ## _len[REDUC])
@@ -3285,12 +3287,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
         if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
-            ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_f16_f32[i], "mul_mat_vec_p021_f16_f32"+std::to_string(i+1), mul_mat_vec_p021_f16_f32_subgroup_add_len, mul_mat_vec_p021_f16_f32_subgroup_add_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_p021_push_constants), {1, 1, 1}, {device->subgroup_size, i + 1}, 1, true, true);
+            ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_f16_f32[i], "mul_mat_vec_p021_f16_f32"+std::to_string(i+1), mul_mat_vec_p021_f16_f32_subgroup_add_len, mul_mat_vec_p021_f16_f32_subgroup_add_data, "main", mul_mat_vec_p021_nc_num_bindings, sizeof(vk_mat_vec_p021_push_constants), {1, 1, 1}, {device->subgroup_size, i + 1}, 1, true, true);
         } else {
-            ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_f16_f32[i], "mul_mat_vec_p021_f16_f32"+std::to_string(i+1), mul_mat_vec_p021_f16_f32_len,              mul_mat_vec_p021_f16_f32_data,              "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_p021_push_constants), {1, 1, 1}, {device->subgroup_size, i + 1}, 1, true);
+            ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_f16_f32[i], "mul_mat_vec_p021_f16_f32"+std::to_string(i+1), mul_mat_vec_p021_f16_f32_len,              mul_mat_vec_p021_f16_f32_data,              "main", mul_mat_vec_p021_nc_num_bindings, sizeof(vk_mat_vec_p021_push_constants), {1, 1, 1}, {device->subgroup_size, i + 1}, 1, true);
         }
     }
-    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_p021_nc_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
@@ -7024,19 +7026,15 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     vk_subbuffer d_F1 = d_D;
+    vk_subbuffer d_F2 = d_D;
     uint32_t fuse1_off0 = 0, fuse1_off1 = 0;
     if (fuse_hc_post) {
-        // post and comb: one binding from the lower one (aligned down) to the end of the higher one
+        // post and comb in their own bindings (they may sit in different buffers), aligned down
         const ggml_tensor * hp = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
-        const vk_subbuffer sp = ggml_vk_tensor_subbuffer(ctx, hp->src[2], true);
-        const vk_subbuffer sc = ggml_vk_tensor_subbuffer(ctx, hp->src[3], true);
-        const uint64_t op = sp.offset + get_misalign_bytes(ctx, hp->src[2]), oc = sc.offset + get_misalign_bytes(ctx, hp->src[3]);
-        const uint64_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
-        const uint64_t lo = std::min(op, oc) / align * align;
-        const uint64_t hi = std::max(op + 4*sizeof(float), oc + 16*sizeof(float));
-        d_F1 = { sp.buffer, lo, hi - lo };
-        fuse1_off0 = (uint32_t) ((op - lo) / sizeof(float));
-        fuse1_off1 = (uint32_t) ((oc - lo) / sizeof(float));
+        d_F1 = ggml_vk_tensor_subbuffer(ctx, hp->src[2], true);
+        d_F2 = ggml_vk_tensor_subbuffer(ctx, hp->src[3], true);
+        fuse1_off0 = (uint32_t) (get_misalign_bytes(ctx, hp->src[2]) / sizeof(float));
+        fuse1_off1 = (uint32_t) (get_misalign_bytes(ctx, hp->src[3]) / sizeof(float));
     } else if (!fuse_glu && !fuse_geglu && ctx->num_additional_fused_ops == 2) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 2];
         const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
@@ -7065,6 +7063,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
                                     d_D,
                                     d_F0,
                                     d_F1,
+                                    d_F2,
                                   },
                                   pc, { groups_x, groups_y, groups_z });
         base_work_group_y += groups_y;
@@ -14847,8 +14846,8 @@ static int ggml_vk_fuse_ssm_conv_state(const ggml_backend_vk_context * ctx, cons
 
 
 // A mat-vec whose output is the branch input x of a 4-stream hc_post (DSV4_HC_POST with comb), one token: the mat-vec
-// writes the streams itself (MAT_VEC_FUSION_FLAGS_HC_POST), reading post and comb from one binding of the buffer that
-// holds both (they come from the same compute buffer). Views may sit between the two. Returns the hc_post index, or -1
+// writes the streams itself (MAT_VEC_FUSION_FLAGS_HC_POST), reading post and comb from their own bindings (they may sit
+// in different buffers, e.g. chunks of the compute buffer). Views may sit between the two. Returns the hc_post index, or -1
 static int ggml_vk_fuse_mul_mat_hc_post(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor *mul = cgraph->nodes[node_idx];
     if (mul->op != GGML_OP_MUL_MAT || (mul->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_node_has_n_uses(cgraph, node_idx, 1) ||
@@ -14873,8 +14872,7 @@ static int ggml_vk_fuse_mul_mat_hc_post(const ggml_backend_vk_context * ctx, con
     if (res->ne[0] != n || res->ne[1] != 4 || res->ne[2] != 1 || !ggml_is_contiguous(res) || res->type != GGML_TYPE_F32 ||
             get_misalign_bytes(ctx, res) != 0 ||
             post->type != GGML_TYPE_F32 || post->ne[0] != 4 || ggml_nelements(post) != 4 || post->nb[0] != sizeof(float) ||
-            comb->type != GGML_TYPE_F32 || ggml_nelements(comb) != 16 || comb->nb[0] != sizeof(float) || comb->nb[1] != 4*sizeof(float) ||
-            !post->buffer || post->buffer != comb->buffer) {
+            comb->type != GGML_TYPE_F32 || ggml_nelements(comb) != 16 || comb->nb[0] != sizeof(float) || comb->nb[1] != 4*sizeof(float)) {
         return -1;
     }
     return j;
@@ -16593,6 +16591,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
         params->add_alloc_dep(params->user_data, glu->src[0]->src[1], glu);
+    }
+    // the same for a one-token mat-vec and the DSV4_HC_POST of its output (ggml_vk_fuse_mul_mat_hc_post): every workgroup
+    // reads the whole mat-vec input while the streams are written, so they must not be placed over it
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * hp = graph->nodes[i];
+        if (hp->op != GGML_OP_DSV4_HC_POST || hp->src[0]->op != GGML_OP_MUL_MAT || ggml_nrows(hp->src[0]) != 1) {
+            continue;
+        }
+        params->add_alloc_dep(params->user_data, hp->src[0]->src[1], hp);
     }
 
     // a CONT read only by a MUL (ggml_vk_fuse_cont_mul): the MUL reads the CONT source, keep it alive through the MUL;

@@ -5501,26 +5501,34 @@ struct test_gated_delta_net : public test_case {
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 // A one-token mat-vec followed by the 4-stream DSV4_HC_POST of its output, with post a view of the selector sigmoids and
 // comb its own tensor (Raon-1 nano layer outputs). A backend may write the streams in the mat-vec (Vulkan).
+// split: comb in another buffer than post (as when they fall in different chunks of the compute buffer)
 struct test_mul_mat_hc_post : public test_case {
     const ggml_type type_w;
     const int64_t n, k;
+    const bool split;
 
-    std::string vars() override { return VARS_TO_STR3(type_w, n, k); }
+    std::string vars() override {
+        return split ? VARS_TO_STR4(type_w, n, k, split) : VARS_TO_STR3(type_w, n, k);
+    }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_HC_POST"; }
     bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return split; }
 
-    test_mul_mat_hc_post(ggml_type type_w = GGML_TYPE_F16, int64_t n = 1536, int64_t k = 6144) : type_w(type_w), n(n), k(k) {}
+    test_mul_mat_hc_post(ggml_type type_w = GGML_TYPE_F16, int64_t n = 1536, int64_t k = 6144, bool split = false)
+        : type_w(type_w), n(n), k(k), split(split) {}
 
     // quantized weights: the backends may quantize the activations differently (as test_mul_mat)
     double max_nmse_err() override { return ggml_is_quantized(type_w) ? 5e-4 : 1e-7; }
 
-    ggml_tensor * build_graph(ggml_context * ctx) override {
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_w) override {
         ggml_tensor * w    = ggml_new_tensor_2d(ctx, type_w, k, n);
         ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
         ggml_tensor * res  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 4, 1);
         // inputs here, so only views sit between the mat-vec and the hc_post (in the model they come from the selector)
         ggml_tensor * sg   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 1);
-        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 1);
+        ggml_tensor * comb = ggml_new_tensor_3d(split ? ctx_w : ctx, GGML_TYPE_F32, 4, 4, 1);
         ggml_tensor * post = ggml_view_2d(ctx, sg, 4, 1, sg->nb[1], 4*sizeof(float));
         ggml_tensor * mm   = ggml_mul_mat(ctx, w, x);
         return ggml_dsv4_hc_post(ctx, mm, res, post, comb);
@@ -13713,6 +13721,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
         test_cases.emplace_back(new test_mul_mat_hc_post(t, 1536, 6144));
     }
+    // post and comb in different buffers
+    test_cases.emplace_back(new test_mul_mat_hc_post(GGML_TYPE_Q4_K, 1536, 6144, true));
     // delta net gates computed by the delta net (Raon-1 nano, one token)
     test_cases.emplace_back(new test_gdn_gates(16, 128, 32));
     test_cases.emplace_back(new test_gdn_gates(4, 64, 8));
