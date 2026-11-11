@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_MLA_EXPAND_KV,
 
         GGML_OP_UNARY,
 
@@ -2731,6 +2732,20 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // MLA: per-head K and V of a head group, expanded from the latent KV cache (prefill attention on expanded K/V)
+    //   kv     [rank + n_rope, n_kv] F16 rows of the latent cache (row stride kv->nb[1]): latent | shared RoPE part
+    //   k_b    [n_nope, rank, n_head] (W_UK per head, any type with a dequantization to F16)
+    //   v_b    [rank, n_v, n_head]    (W_UV per head, any type with a dequantization to F16)
+    //   result F16, 1-D: K [n_nope + n_rope, n_heads, n_kv] (W_UK latent | RoPE part) followed by V [n_v, n_heads, n_kv],
+    //          for heads head0 .. head0 + n_heads - 1; products accumulate in F32 and round to F16 once
+    GGML_API struct ggml_tensor * ggml_mla_expand_kv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv,
+            struct ggml_tensor  * k_b,
+            struct ggml_tensor  * v_b,
+            int32_t               head0,
+            int32_t               n_heads);
 
     // custom operators
 

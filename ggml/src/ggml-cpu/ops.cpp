@@ -9,6 +9,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <vector>
 #include <cfloat>
 #include <cmath>
 
@@ -12519,6 +12520,69 @@ void ggml_compute_forward_lightning_indexer(
                 }
                 // apply mask
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_mla_expand_kv (reference: weights rounded to F16 as the GPU path, F32 accumulation, one F16 rounding)
+
+void ggml_compute_forward_mla_expand_kv(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * kv  = dst->src[0];
+    const ggml_tensor * k_b = dst->src[1];
+    const ggml_tensor * v_b = dst->src[2];
+    const int32_t h0   = ggml_get_op_params_i32(dst, 0);
+    const int32_t g    = ggml_get_op_params_i32(dst, 1);
+    const int64_t rank = k_b->ne[1];
+    const int64_t nn = k_b->ne[0], nr = kv->ne[0] - rank, nk = nn + nr, nv = v_b->ne[1], n_kv = kv->ne[1];
+    auto load = [&](const ggml_tensor * w, int64_t n_per_head) {
+        std::vector<float> f(n_per_head*g);
+        const int64_t off = h0*n_per_head;
+        if (w->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * p = (const ggml_fp16_t *) w->data + off;
+            for (int64_t i = 0; i < n_per_head*g; ++i) f[i] = GGML_FP16_TO_FP32(p[i]);
+        } else {
+            const int64_t blk = ggml_blck_size(w->type);
+            GGML_ASSERT(off % blk == 0 && (n_per_head*g) % blk == 0);
+            ggml_get_type_traits(w->type)->to_float((const char *) w->data + off/blk*ggml_type_size(w->type), f.data(), n_per_head*g);
+            for (auto & x : f) x = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(x));
+        }
+        return f;
+    };
+    const std::vector<float> wkf = load(k_b, nn*rank);  // [nn, rank] per head
+    const std::vector<float> wvf = load(v_b, rank*nv);  // [rank, nv] per head
+    ggml_fp16_t * K = (ggml_fp16_t *) dst->data;
+    ggml_fp16_t * V = K + nk*g*n_kv;
+    std::vector<float> lat(rank);
+    for (int64_t t = params->ith; t < n_kv; t += params->nth) {
+        const ggml_fp16_t * row = (const ggml_fp16_t *) ((const char *) kv->data + t*kv->nb[1]);
+        for (int64_t r = 0; r < rank; ++r) {
+            lat[r] = GGML_FP16_TO_FP32(row[r]);
+        }
+        for (int32_t h = 0; h < g; ++h) {
+            ggml_fp16_t * kt = K + (t*g + h)*nk;
+            ggml_fp16_t * vt = V + (t*g + h)*nv;
+            const float * wkh = wkf.data() + h*nn*rank;
+            const float * wvh = wvf.data() + h*rank*nv;
+            for (int64_t d = 0; d < nn; ++d) {
+                float acc = 0.0f;
+                for (int64_t r = 0; r < rank; ++r) {
+                    acc += wkh[r*nn + d]*lat[r];
+                }
+                kt[d] = GGML_FP32_TO_FP16(acc);
+            }
+            for (int64_t j = 0; j < nr; ++j) {
+                kt[nn + j] = row[rank + j];
+            }
+            for (int64_t d = 0; d < nv; ++d) {
+                const float * w = wvh + d*rank;
+                float acc = 0.0f;
+                for (int64_t r = 0; r < rank; ++r) {
+                    acc += w[r]*lat[r];
+                }
+                vt[d] = GGML_FP32_TO_FP16(acc);
             }
         }
     }

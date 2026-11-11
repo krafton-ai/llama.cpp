@@ -4483,6 +4483,46 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_MLA_EXPAND_KV: per-head K = [W_UK latent | RoPE part] and V = W_UV latent of a head group from an F16 latent
+// cache row view (row stride wider than rank + n_rope), with F16 or quantized k_b / v_b as stored
+struct test_mla_expand_kv : public test_case {
+    const int64_t n_kv;
+    const int64_t head0;
+    const int64_t n_heads;
+    const ggml_type type_k;
+    const ggml_type type_v;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_kv, head0, n_heads, type_k, type_v);
+    }
+
+    test_mla_expand_kv(int64_t n_kv = 300, int64_t head0 = 4, int64_t n_heads = 4,
+            ggml_type type_k = GGML_TYPE_F16, ggml_type type_v = GGML_TYPE_F16)
+        : n_kv(n_kv), head0(head0), n_heads(n_heads), type_k(type_k), type_v(type_v) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t rank = 512, n_rope = 64, n_nope = 128, n_v = 128, n_head = 16;
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, rank + n_rope + 8, n_kv);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * kv  = ggml_view_2d(ctx, cache, rank + n_rope, n_kv, cache->nb[1], 0);
+        ggml_tensor * k_b = ggml_new_tensor_3d(ctx, type_k, n_nope, rank, n_head);
+        ggml_set_name(k_b, "k_b");
+        ggml_tensor * v_b = ggml_new_tensor_3d(ctx, type_v, rank, n_v, n_head);
+        ggml_set_name(v_b, "v_b");
+        ggml_tensor * out = ggml_mla_expand_kv(ctx, kv, k_b, v_b, (int32_t) head0, (int32_t) n_heads);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.25f, 0.25f);
+        }
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -10444,6 +10484,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_mla_expand_kv(300, 4, 4));
+    test_cases.emplace_back(new test_mla_expand_kv(1024, 0, 16));
+    test_cases.emplace_back(new test_mla_expand_kv(1, 8, 8));
+    test_cases.emplace_back(new test_mla_expand_kv(300, 4, 4, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K));
+    test_cases.emplace_back(new test_mla_expand_kv(1024, 2, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K));
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));

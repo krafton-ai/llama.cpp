@@ -1095,6 +1095,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "MLA_EXPAND_KV",
 
     "UNARY",
 
@@ -1112,7 +1113,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1210,6 +1211,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "mla_expand_kv(kv, k_b, v_b)",
 
     "unary(x)",
 
@@ -1227,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6583,6 +6585,35 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
 }
 
 // ggml_dsv4_hc_post
+
+struct ggml_tensor * ggml_mla_expand_kv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv,
+        struct ggml_tensor  * k_b,
+        struct ggml_tensor  * v_b,
+        int32_t               head0,
+        int32_t               n_heads) {
+    const int64_t rank = k_b->ne[1];
+    GGML_ASSERT(kv->type == GGML_TYPE_F16 && kv->nb[0] == ggml_type_size(GGML_TYPE_F16));
+    GGML_ASSERT(ggml_is_contiguous(k_b) && ggml_is_contiguous(v_b));
+    GGML_ASSERT(v_b->ne[0] == rank && kv->ne[0] >= rank && kv->ne[2] == 1 && kv->ne[3] == 1);
+    GGML_ASSERT(head0 >= 0 && n_heads > 0 && head0 + n_heads <= k_b->ne[2] && k_b->ne[2] == v_b->ne[2]);
+    const int64_t nk   = k_b->ne[0] + (kv->ne[0] - rank);
+    const int64_t nv   = v_b->ne[1];
+    const int64_t n_kv = kv->ne[1];
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (nk + nv)*n_heads*n_kv);
+
+    ggml_set_op_params_i32(result, 0, head0);
+    ggml_set_op_params_i32(result, 1, n_heads);
+
+    result->op     = GGML_OP_MLA_EXPAND_KV;
+    result->src[0] = kv;
+    result->src[1] = k_b;
+    result->src[2] = v_b;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_dsv4_hc_post(
         struct ggml_context * ctx,
