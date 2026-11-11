@@ -1739,7 +1739,9 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
+        // one row per thread: a threadgroup per row leaves the GPU mostly idle at decode
+        const int nth = std::min(256, ne01);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nth - 1)/nth, ne1, ne02, nth, 1, 1);
     }
 
     if (n_fuse > 1 && ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
