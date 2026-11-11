@@ -5573,6 +5573,32 @@ struct test_gdn_gates : public test_case {
     }
 };
 
+// RMS_NORM -> MUL (weight) -> MUL with SIGMOID of a strided view of a wider tensor (the gated output norm of the
+// Raon-1 nano delta net layer)
+struct test_rms_norm_gate : public test_case {
+    const int64_t head_dim, n_head, n_tokens;
+
+    std::string vars() override { return VARS_TO_STR3(head_dim, n_head, n_tokens); }
+    std::string op_desc(ggml_tensor *) override { return "RMS_NORM_GATE"; }
+    bool run_whole_graph() override { return true; }
+
+    test_rms_norm_gate(int64_t head_dim = 128, int64_t n_head = 16, int64_t n_tokens = 1)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d = head_dim*n_head;
+        ggml_tensor * o = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        // q | k | v | g per token, with a few more columns so that the rows of g are not packed
+        ggml_tensor * qkvg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*d + 3, n_tokens);
+        ggml_tensor * g = ggml_view_3d(ctx, qkvg, head_dim, n_head, n_tokens,
+                head_dim*sizeof(float), qkvg->nb[1], 3*d*sizeof(float));
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, 1e-6f), w), ggml_sigmoid(ctx, g));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -13584,6 +13610,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // delta net gates computed by the delta net (Raon-1 nano, one token)
     test_cases.emplace_back(new test_gdn_gates(16, 128, 32));
     test_cases.emplace_back(new test_gdn_gates(4, 64, 8));
+    // the gated RMS norm of the delta net output (Raon-1 nano): decode, speculative verify
+    for (int64_t nt : { 1, 3, 8 }) {
+        test_cases.emplace_back(new test_rms_norm_gate(128, 16, nt));
+        test_cases.emplace_back(new test_rms_norm_gate(64, 4, nt));
+    }
     // mHC selector (Raon-1 nano): decode, speculative verify and prefill token counts
     for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         for (int64_t nt : { 1, 2, 3, 4, 8, 9, 33 }) {

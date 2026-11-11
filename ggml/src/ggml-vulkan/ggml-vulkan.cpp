@@ -3311,6 +3311,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f16, "rms_norm_mul_rope_f32_f16", rms_norm_mul_rope_f32_f16_len, rms_norm_mul_rope_f32_f16_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     }
 
+    // RMS_NORM -> MUL -> SIGMOID -> MUL (ggml_vk_fuse_rms_norm_gate)
+    if (device->subgroup_arithmetic) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_gate_f32, "rms_norm_gate_f32", rms_norm_gate_f32_sg_len, rms_norm_gate_f32_sg_data, "main", 4,
+            sizeof(vk_op_fused_push_constants), {1, 1, 1}, { 128 }, 1);
+    } else {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_gate_f32, "rms_norm_gate_f32", rms_norm_gate_f32_len, rms_norm_gate_f32_data, "main", 4,
+            sizeof(vk_op_fused_push_constants), {1, 1, 1}, { 128 }, 1);
+    }
+
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_short_f32, "l2_norm_short_f32", l2_norm_short_f32_len, l2_norm_short_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
@@ -11245,6 +11254,25 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
 
+    if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_SIGMOID_MUL) {
+        // y = RMS_NORM(x) * w * SIGMOID(g), one workgroup per row (ggml_vk_fuse_rms_norm_gate)
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+        ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+        const ggml_tensor * sig = dst->src[0] == mul ? dst->src[1] : dst->src[0];
+        const ggml_tensor * w = mul->src[1];
+        const ggml_tensor * g = sig->src[0];
+        vk_op_fused_push_constants pc {};
+        pc.ne0 = (uint32_t) src0->ne[0];
+        pc.f0 = op_params[0];
+        pc.a_nb1 = ggml_vk_nb_elem(src0, 1); pc.a_nb2 = ggml_vk_nb_elem(src0, 2);
+        pc.b_nb1 = ggml_vk_nb_elem(g, 1);    pc.b_nb2 = ggml_vk_nb_elem(g, 2);
+        pc.d_nb1 = ggml_vk_nb_elem(dst, 1);  pc.d_nb2 = ggml_vk_nb_elem(dst, 2);
+        ggml_vk_fused_op(ctx, subctx, ctx->device->pipeline_rms_norm_gate_f32, dst, { src0, g, w }, pc,
+            { (uint32_t) src0->ne[1], (uint32_t) src0->ne[2], 1 });
+        ggml_vk_rms_norm_finish(ctx, src0);
+        return;
+    }
+
     if (ctx->fused_rms_norm_mode == RMS_NORM_VIEW_SET_ROWS) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 2);
         ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
@@ -15372,6 +15400,56 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
     return false;
 }
 
+// RMS_NORM -> MUL (weight) -> MUL with SIGMOID(g) from the RMS_NORM at node_idx (the gated output norm of the Raon-1 nano delta net
+// layer), g maybe a strided view whose node comes right before the SIGMOID: returns the index of the last MUL, or 0
+static int ggml_vk_fuse_rms_norm_gate(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ctx->device->pipeline_rms_norm_gate_f32 || node_idx + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * rms = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    int i_sig = node_idx + 2;
+    if (ggml_op_is_empty(cgraph->nodes[i_sig]->op) && i_sig + 2 < cgraph->n_nodes) {
+        ++i_sig;
+    }
+    const ggml_tensor * sig = cgraph->nodes[i_sig];
+    const ggml_tensor * out = cgraph->nodes[i_sig + 1];
+    if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || sig->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || out->op != GGML_OP_MUL) {
+        return 0;
+    }
+    // a node skipped above must be the gate view
+    if (i_sig != node_idx + 2 && sig->src[0] != cgraph->nodes[node_idx + 2]) {
+        return 0;
+    }
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mul->src[1];
+    const ggml_tensor * g = sig->src[0];
+    if (mul->src[0] != rms || !((out->src[0] == mul && out->src[1] == sig) || (out->src[0] == sig && out->src[1] == mul))) {
+        return 0;
+    }
+    for (const ggml_tensor * t : { x, w, g, rms, mul, sig, out }) {
+        if (t->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+    // x contiguous (the output may be written over it), g with contiguous rows, w one row
+    if (!ggml_is_contiguous(x) || x->ne[3] != 1 || !ggml_are_same_shape(g, x) || g->nb[0] != sizeof(float) ||
+        g->nb[1] % sizeof(float) != 0 || g->nb[2] % sizeof(float) != 0 ||
+        !ggml_is_contiguous(w) || w->ne[0] != x->ne[0] || ggml_nrows(w) != 1 || !ggml_are_same_shape(out, x) ||
+        x->ne[1] > ctx->device->properties.limits.maxComputeWorkGroupCount[0] ||
+        x->ne[2] > ctx->device->properties.limits.maxComputeWorkGroupCount[1]) {
+        return 0;
+    }
+    const int idxs[4] = { node_idx, node_idx + 1, i_sig, i_sig + 1 };
+    const ggml_op ops[4] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+    const int outputs[1] = { i_sig + 1 };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, outputs, 1)) {
+        return 0;
+    }
+    return i_sig + 1;
+}
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -15805,6 +15883,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_VIEW_SET_ROWS;
                 fusion_string = "RMS_NORM_VIEW_SET_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (const int i_gate = ggml_vk_fuse_rms_norm_gate(ctx, cgraph, i); i_gate > 0) {
+                ctx->num_additional_fused_ops = i_gate - i;
+                ctx->fused_rms_norm_mode = RMS_NORM_MUL_SIGMOID_MUL;
+                fusion_string = "RMS_NORM_MUL_SIGMOID_MUL";
+                // a row is summed before any of it is written, then each element is read and written by one invocation
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL;
@@ -16949,6 +17033,82 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         }
         new_order.swap(order);
+    }
+    // The gated RMS norm (ggml_vk_fuse_rms_norm_gate): the gate view, RMS_NORM, MUL (weight) and SIGMOID move down to right
+    // before the final MUL, when no other node before it reads them or writes what they read
+    if (!ctx->device->disable_fusion && ctx->device->pipeline_rms_norm_gate_f32) {
+        auto const & base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        for (size_t oi = 0; oi < new_order.size(); ++oi) {
+            ggml_tensor * out = new_order[oi];
+            if (out->op != GGML_OP_MUL) {
+                continue;
+            }
+            ggml_tensor * mul = out->src[0];
+            ggml_tensor * sig = out->src[1];
+            if (sig->op != GGML_OP_UNARY) {
+                std::swap(mul, sig);
+            }
+            if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || mul->op != GGML_OP_MUL ||
+                mul->src[0]->op != GGML_OP_RMS_NORM || !ggml_are_same_shape(sig, mul->src[0])) {
+                continue;
+            }
+            std::vector<ggml_tensor *> run;
+            if (sig->src[0]->op != GGML_OP_NONE && ggml_op_is_empty(sig->src[0]->op)) {
+                run.push_back(sig->src[0]);
+            }
+            run.insert(run.end(), { mul->src[0], mul, sig });
+            const std::set<const ggml_tensor *> in_run(run.begin(), run.end());
+            std::set<const ggml_tensor *> ext_srcs;
+            for (const ggml_tensor * t : run) {
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (t->src[s] && !in_run.count(t->src[s])) {
+                        ext_srcs.insert(t->src[s]);
+                    }
+                }
+            }
+            // every node of the run comes before out (a gate view from another split is not a node here); a node between
+            // one of them and out may neither read it nor write (through a view) what it reads
+            bool ok = true;
+            for (const ggml_tensor * r : run) {
+                const size_t p = std::find(new_order.begin(), new_order.begin() + oi, r) - new_order.begin();
+                if (p == oi) {
+                    ok = ok && ggml_op_is_empty(r->op);
+                    continue;
+                }
+                for (size_t k = p + 1; ok && k < oi; ++k) {
+                    const ggml_tensor * t = new_order[k];
+                    if (in_run.count(t)) {
+                        continue;
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC && ok; ++s) {
+                        ok = !(t->src[s] && in_run.count(t->src[s]));
+                        ok = ok && (ggml_op_is_empty(t->op) || !t->view_src || !r->src[s] || base(t) != base(r->src[s]));
+                    }
+                }
+            }
+            if (!ok) {
+                continue;
+            }
+            std::vector<ggml_tensor *> order;
+            order.reserve(new_order.size());
+            for (ggml_tensor * t : new_order) {
+                if (t == out) {
+                    for (ggml_tensor * r : run) {
+                        if (std::find(new_order.begin(), new_order.begin() + oi, r) != new_order.begin() + oi) {
+                            order.push_back(r);
+                        }
+                    }
+                    order.push_back(t);
+                } else if (!in_run.count(t)) {
+                    order.push_back(t);
+                }
+            }
+            new_order.swap(order);
+            // the fused pass reads the sources while it writes out
+            for (const ggml_tensor * e : ext_srcs) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(e), out);
+            }
+        }
     }
     // Replace the graph with the new order.
     GGML_ASSERT((int) new_order.size() == graph->n_nodes);

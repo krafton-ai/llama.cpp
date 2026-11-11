@@ -1,0 +1,35 @@
+#version 450
+
+// RMS norm with a weight and a sigmoid gate (fusion of RMS_NORM -> MUL -> SIGMOID -> MUL), one workgroup per row (i1, i2):
+//   y = x / sqrt(mean(x^2) + eps) * w * sigmoid(g)
+// ne0 = n, f0 = eps; a = x (a_nb1, a_nb2), b = g (b_nb1, b_nb2), c = w; d (d_nb1, d_nb2)
+
+#include "fused_common.glsl"
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer G { float data_g[]; };
+layout(binding = 2, std430) readonly buffer W { float data_w[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint i1  = gl_WorkGroupID.x;
+    const uint i2  = gl_WorkGroupID.y;
+    const uint n   = ne0;
+
+    const uint xb = a_off + i1*a_nb1 + i2*a_nb2;
+    const uint gb = b_off + i1*b_nb1 + i2*b_nb2;
+    const uint db = d_off + i1*d_nb1 + i2*d_nb2;
+
+    float ss = 0.0f;
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        const float v = data_x[xb + i];
+        ss = fma(v, v, ss);
+    }
+    // the whole row is read before any element of it is written (x may be the destination)
+    ss = block_sum(ss);
+    const float scale = inversesqrt(ss/float(n) + f0);
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        data_d[db + i] = data_x[xb + i]*scale*data_w[c_off + i]*sigmoid_f(data_g[gb + i]);
+    }
+}
