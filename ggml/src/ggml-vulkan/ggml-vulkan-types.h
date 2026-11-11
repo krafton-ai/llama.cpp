@@ -972,7 +972,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_linear_attn_f32;
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
-    vk_pipeline pipeline_gated_delta_net[4][2];
+    // [S_v][0: GDA, 1: KDA, 2: KDA with the Raon delta net gates computed in it]
+    vk_pipeline pipeline_gated_delta_net[4][3];   // GDA, KDA, KDA with the delta net gates
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1255,6 +1256,17 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// inputs of the delta net gates that a KDA GATED_DELTA_NET computes itself (ggml_vk_match_gdn_gates):
+// g = lower*sigmoid(fbo + dt), beta = sigmoid(fab[rank + h]), v' = v*sigmoid(fab[rank + H + h])/beta
+struct vk_gdn_gates {
+    const ggml_tensor * fab = nullptr;   // [rank + 2H, n_tokens]
+    const ggml_tensor * fbo = nullptr;   // [H*S_v, n_tokens]
+    const ggml_tensor * dt  = nullptr;   // [H*S_v]
+    const ggml_tensor * v   = nullptr;   // unscaled v [S_v, H, n_tokens, n_seqs]
+    uint32_t rank = 0;
+    float lower = 0.0f;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1324,6 +1336,10 @@ struct ggml_backend_vk_context {
     int  fused_mul_mat_vec_glu {};  // 1: [gate | up] swiglu, 2: geglu with an external second input
     bool fused_mul_mat_vec_hc_post {};
     bool fused_ssm_conv_state {};
+    bool fused_gdn_state_cpy {};
+    bool fused_gdn_gates {};
+    vk_gdn_gates gdn_gates {};          // fused_gdn_gates: the gate inputs; gdn_gates_idx the delta net
+    int gdn_gates_idx {};
     bool fused_cont_mul {};
     bool fused_mul_mat_cpy_f16 = false; // a MUL_MAT and the CPY of its result to f16 as one multiply writing f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

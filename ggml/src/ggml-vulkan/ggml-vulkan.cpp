@@ -3705,11 +3705,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     {
         const uint32_t gdn_sizes[] = {16, 32, 64, 128};
-        const char * gdn_names[][2] = {
-            {"gated_delta_net_f32_d16",     "gated_delta_net_f32_d16_kda"},
-            {"gated_delta_net_f32_d32",     "gated_delta_net_f32_d32_kda"},
-            {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
-            {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
+        const char * gdn_names[][3] = {
+            {"gated_delta_net_f32_d16",     "gated_delta_net_f32_d16_kda",  "gated_delta_net_f32_d16_kda_gates"},
+            {"gated_delta_net_f32_d32",     "gated_delta_net_f32_d32_kda",  "gated_delta_net_f32_d32_kda_gates"},
+            {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda",  "gated_delta_net_f32_d64_kda_gates"},
+            {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda", "gated_delta_net_f32_d128_kda_gates"},
         };
         for (uint32_t si = 0; si < 4; si++) {
             const uint32_t S_V = gdn_sizes[si];
@@ -3771,10 +3771,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
             const std::array<uint32_t, 3> wg_denoms = {1u, 1u, cols_per_wg};
 
-            for (uint32_t kda = 0; kda < 2; kda++) {
-                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
-                    wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+            // 0: GDA, 1: KDA, 2: KDA computing the delta net gates itself
+            for (uint32_t v = 0; v < 3; v++) {
+                const uint32_t kda = v > 0 ? 1 : 0, gates = v > 1 ? 1 : 0;
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][v],
+                    gdn_names[si][v], gdn_len, gdn_data, "main", 10, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column, gates}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
         }
     }
@@ -10578,9 +10580,12 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
         pc, {n_tiles_kv, n_tiles_t, n_streams});
 }
 
-void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+// cpy: the CPY of the final state into the state cache, fused (ggml_vk_fuse_gdn_state_cpy).
+// gates: the delta net gate inputs, the gates computed here instead of by the nodes before (ggml_vk_match_gdn_gates)
+void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * cpy,
+        const vk_gdn_gates * gates) {
     const ggml_tensor * src_q     = dst->src[0];
-    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_v     = gates ? gates->v : dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
 
     GGML_ASSERT(dst->buffer != nullptr);
@@ -10597,6 +10602,15 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
+    if (gates) {
+        // the KDA pipeline of this head size with the gates variant
+        for (int si = 0; si < 4; si++) {
+            if (ctx->device->pipeline_gated_delta_net[si][1] == pipeline) {
+                pipeline = ctx->device->pipeline_gated_delta_net[si][2];
+                break;
+            }
+        }
+    }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -10604,6 +10618,12 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_subbuffer src_buf[6] = {};
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    }
+    if (gates) {
+        // v unscaled, g <- fbo, beta <- fab
+        src_buf[2] = ggml_vk_tensor_subbuffer(ctx, gates->v);
+        src_buf[3] = ggml_vk_tensor_subbuffer(ctx, gates->fbo);
+        src_buf[4] = ggml_vk_tensor_subbuffer(ctx, gates->fab);
     }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
@@ -10620,18 +10640,31 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
-    const vk_op_gated_delta_net_push_constants pc = {
+    vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        dst->src[6] ? 1u : 0u,
+        cpy ? 1u : 0u,
+        cpy ? (uint32_t) (get_misalign_bytes(ctx, cpy->src[1]) / sizeof(float)) : 0u,
+        gates ? gates->rank : 0u,
+        gates ? gates->lower : 0.0f,
+        gates ? (uint32_t) (gates->fab->nb[1] / sizeof(float)) : 0u,
+        gates ? (uint32_t) (gates->fbo->nb[1] / sizeof(float)) : 0u,
     };
 
+    // ids (ggml_gated_delta_net_ids): src[5] is the whole state cache; without ids the slot is bound to dst, unused
+    const vk_subbuffer ids_buf = dst->src[6] ? ggml_vk_tensor_subbuffer(ctx, dst->src[6]) : dst_buf;
+
+    const vk_subbuffer sout_buf = cpy ? ggml_vk_tensor_subbuffer(ctx, cpy->src[1], true) : dst_buf;
+    const vk_subbuffer dt_buf = gates ? ggml_vk_tensor_subbuffer(ctx, gates->dt) : dst_buf;
+
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, ids_buf, sout_buf, dt_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -12754,7 +12787,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     // closed explicitly below, and by the destructor on the early returns
     ggml_vk_debug_label dbg(compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops);
 
-    switch (node->op) {
+    if (ctx->fused_gdn_gates) {
+        // the run of delta net gate nodes and their delta net (and the state CPY): one delta net computing the gates
+        ggml_vk_gated_delta_net(ctx, compute_ctx, cgraph->nodes[ctx->gdn_gates_idx],
+                ctx->fused_gdn_state_cpy ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr, &ctx->gdn_gates);
+    } else switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
 
@@ -13164,7 +13201,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        ggml_vk_gated_delta_net(ctx, compute_ctx, node,
+                ctx->fused_gdn_state_cpy ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr, nullptr);
 
         break;
 
@@ -14349,6 +14387,161 @@ static int ggml_vk_fuse_cont_mul(const ggml_backend_vk_context * ctx, const stru
     return j;
 }
 
+// GATED_DELTA_NET with one final state (K == 1) and one sequence, then (views between) the CPY of that state out of
+// its output into the state cache: the delta net writes the state there itself. Returns the CPY index, or -1
+// delta net gates (Raon-1 nano) in front of a KDA GATED_DELTA_NET of one token: the graph computes
+//   g = RESHAPE(SCALE(SIGMOID(ADD(fbo, dt)), lower)); beta = SIGMOID(VIEW(fab, rank)); write = SIGMOID(VIEW(fab, rank + H))
+//   v' = MUL(v, RESHAPE(DIV(write, beta))); GATED_DELTA_NET(q, k, v', g, RESHAPE(beta), state)
+// The delta net computes the gates itself instead (gated_delta_net.comp GATES == 1). Finds the gate nodes of the delta net
+// at gdn_idx; members gets their node indices (and those of the views of fab among them).
+static bool ggml_vk_find_gdn_gates(const struct ggml_cgraph * cgraph, int gdn_idx, vk_gdn_gates * gates, std::vector<const ggml_tensor *> * members) {
+    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) != 1) {
+        return false;
+    }
+    const ggml_tensor * v2 = gdn->src[2], * g = gdn->src[3], * bt = gdn->src[4];
+    const int64_t S_v = v2->ne[0], H = v2->ne[1];
+    if (g->ne[0] != S_v || v2->ne[2] != 1 || v2->ne[3] != 1 || g->op != GGML_OP_RESHAPE || bt->op != GGML_OP_RESHAPE || v2->op != GGML_OP_MUL) {
+        return false;
+    }
+    const ggml_tensor * sc = g->src[0];
+    if (sc->op != GGML_OP_SCALE || ggml_get_op_params_f32(sc, 1) != 0.0f) return false;
+    const ggml_tensor * sg = sc->src[0];
+    if (sg->op != GGML_OP_UNARY || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID) return false;
+    const ggml_tensor * add = sg->src[0];
+    if (add->op != GGML_OP_ADD || !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1]) ||
+        ggml_nelements(add->src[1]) != S_v*H || add->src[0]->ne[0] != S_v*H || add->src[0]->type != GGML_TYPE_F32) return false;
+    const ggml_tensor * sb = bt->src[0];
+    if (sb->op != GGML_OP_UNARY || ggml_get_unary_op(sb) != GGML_UNARY_OP_SIGMOID) return false;
+    const ggml_tensor * vb = sb->src[0];
+    const ggml_tensor * mv = v2;
+    const ggml_tensor * ratio = mv->src[1];
+    if (ratio->op != GGML_OP_RESHAPE) return false;
+    const ggml_tensor * dv = ratio->src[0];
+    if (dv->op != GGML_OP_DIV || dv->src[1] != sb) return false;
+    const ggml_tensor * sw = dv->src[0];
+    if (sw->op != GGML_OP_UNARY || ggml_get_unary_op(sw) != GGML_UNARY_OP_SIGMOID) return false;
+    const ggml_tensor * vw = sw->src[0];
+    if (vb->op != GGML_OP_VIEW || vw->op != GGML_OP_VIEW || !vb->view_src || vb->view_src != vw->view_src) return false;
+    const ggml_tensor * fab = vb->view_src;
+    if (fab->type != GGML_TYPE_F32 || fab->nb[0] != sizeof(float) || vb->ne[0] != H || vw->ne[0] != H ||
+        vb->view_offs % sizeof(float) != 0 || vw->view_offs != vb->view_offs + H*sizeof(float)) return false;
+    const ggml_tensor * vv = mv->src[0];
+    if (vv->type != GGML_TYPE_F32 || vv->ne[0] != S_v || vv->ne[1] != H) return false;
+    gates->fab = fab;
+    gates->fbo = add->src[0];
+    gates->dt = add->src[1];
+    gates->v = vv;
+    gates->rank = (uint32_t) (vb->view_offs / sizeof(float));
+    gates->lower = ggml_get_op_params_f32(sc, 0);
+    if (members) {
+        *members = { add, sg, sc, g, vb, sb, bt, vw, sw, dv, ratio, mv };
+    }
+    return true;
+}
+
+// the gate nodes in one run right before their delta net from node_idx (ggml_vk_graph_optimize puts them there); *gdn_idx
+// gets the delta net's index
+static bool ggml_vk_match_gdn_gates(const struct ggml_cgraph * cgraph, int node_idx, vk_gdn_gates * gates, int * gdn_idx) {
+    // called for every node on every graph run: a run starts at a computed gate node (ADD, SIGMOID, SCALE, DIV or MUL)
+    switch (cgraph->nodes[node_idx]->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_UNARY:
+        case GGML_OP_SCALE:
+        case GGML_OP_DIV:
+        case GGML_OP_MUL:
+            break;
+        default:
+            return false;
+    }
+    const int end = std::min(cgraph->n_nodes, node_idx + 24);
+    int gi = -1;
+    for (int j = node_idx; j < end; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_GATED_DELTA_NET) {
+            gi = j;
+            break;
+        }
+    }
+    if (gi <= node_idx) {
+        return false;
+    }
+    static thread_local std::vector<const ggml_tensor *> members;
+    if (!ggml_vk_find_gdn_gates(cgraph, gi, gates, &members)) {
+        return false;
+    }
+    const auto is_member = [&](const ggml_tensor * t) {
+        return std::find(members.begin(), members.end(), t) != members.end();
+    };
+    int found = 0;
+    for (int j = node_idx; j < gi; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (is_member(t)) {
+            ++found;
+        } else if (!(t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE)) {
+            return false;
+        }
+        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+    }
+    // every gate node except the views of fab is in the run and read only by gate nodes and the delta net
+    for (const ggml_tensor * t : members) {
+        if (t->op == GGML_OP_VIEW) {
+            continue;
+        }
+        int j = node_idx;
+        while (j < gi && cgraph->nodes[j] != t) {
+            ++j;
+        }
+        if (j == gi) {
+            return false;
+        }
+        int uses = 0;
+        for (const ggml_tensor * r : members) {
+            for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                uses += r->src[si] == t;
+            }
+        }
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            uses += cgraph->nodes[gi]->src[si] == t;
+        }
+        if (uses != ggml_node_get_use_count(cgraph, j)) {
+            return false;
+        }
+    }
+    GGML_UNUSED(found);
+    *gdn_idx = gi;
+    // the run starts at a computed gate node: graph building skips a run that starts at a view without dispatching anything
+    return is_member(cgraph->nodes[node_idx]);
+}
+
+static int ggml_vk_fuse_gdn_state_cpy(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED(ctx);
+    const ggml_tensor *gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || ggml_get_op_params_i32(gdn, 0) != 1 || gdn->src[2]->ne[3] != 1 ||
+            gdn->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    int j = node_idx + 1;
+    while (j < cgraph->n_nodes && j <= node_idx + 6 && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor *cpy = cgraph->nodes[j];
+    const ggml_tensor *v = gdn->src[2];
+    const int64_t S_v = v->ne[0], H = v->ne[1];
+    const size_t s_off = (size_t) S_v*H*v->ne[2]*v->ne[3]*sizeof(float);
+    if (cpy->op != GGML_OP_CPY || cpy->src[0]->view_src != gdn || cpy->src[0]->view_offs != s_off ||
+            ggml_nelements(cpy->src[0]) != S_v*S_v*H || !ggml_is_contiguous(cpy->src[0]) ||
+            cpy->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(cpy->src[1])) {
+        return -1;
+    }
+    return j;
+}
+
+
 // The conv of a delta net (llm_build_delta_net_base::build_conv_state, n_rs_seq == 0), views between:
 // CONCAT(state, x^T) -> CPY of the last nc - 1 columns into the state cache -> SSM_CONV -> SILU.
 // ggml_vk_ssm_conv_state does all four. Returns the silu index (the CPY index in *i_cpy), or -1
@@ -15354,6 +15547,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mul_mat_vec_glu = 0;
         ctx->fused_mul_mat_vec_hc_post = false;
         ctx->fused_ssm_conv_state = false;
+        ctx->fused_gdn_state_cpy = false;
+        ctx->fused_gdn_gates = false;
         ctx->fused_cont_mul = false;
         ctx->fused_mul_mat_cpy_f16 = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -15361,7 +15556,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             int hc_last = 0;
-            if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_vk_match_hc_select(ctx, cgraph, i, ctx->hc_select_run, &hc_last) &&
+            int gates_gdn = 0;
+            if (ggml_vk_match_gdn_gates(cgraph, i, &ctx->gdn_gates, &gates_gdn) &&
+                ctx->device->pipeline_gated_delta_net[0][2] != nullptr) {
+                ctx->num_additional_fused_ops = gates_gdn - i;
+                ctx->fused_gdn_gates = true;
+                ctx->gdn_gates_idx = gates_gdn;
+                fusion_string = "GDN_GATES_GATED_DELTA_NET";
+                if (const int i_scpy = ggml_vk_fuse_gdn_state_cpy(ctx, cgraph, gates_gdn); i_scpy > 0) {
+                    ctx->num_additional_fused_ops = i_scpy - i;
+                    ctx->fused_gdn_state_cpy = true;
+                    ctx->fused_ops_write_mask |= 1 << (gates_gdn - i);
+                    fusion_string = "GDN_GATES_GATED_DELTA_NET_CPY";
+                }
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // a fused CPY node is a view of its destination
+                op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = ctx->fused_gdn_state_cpy;
+            } else if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_vk_match_hc_select(ctx, cgraph, i, ctx->hc_select_run, &hc_last) &&
                 hc_last - i < 31) {
                 ctx->num_additional_fused_ops = hc_last - i;
                 ctx->fused_hc_select = true;
@@ -15400,6 +15611,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "CONT_MUL";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 // src1 of the MUL is elementwise
+                op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = true;
+            } else if (const int i_scpy = ggml_vk_fuse_gdn_state_cpy(ctx, cgraph, i); i_scpy > 0) {
+                ctx->num_additional_fused_ops = i_scpy - i;
+                ctx->fused_gdn_state_cpy = true;
+                // the delta net output (attention part) and the cache
+                ctx->fused_ops_write_mask |= 1;
+                fusion_string = "GATED_DELTA_NET_CPY";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // the CPY node is a view of its destination
                 op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = true;
             } else if (int i_cpy = 0, i_silu = ggml_vk_fuse_ssm_conv_state(ctx, cgraph, i, &i_cpy); i_silu > 0) {
                 ctx->num_additional_fused_ops = i_silu - i;
@@ -15660,6 +15880,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         if (!src || src->op == GGML_OP_NONE || src == cgraph->nodes[i + k]) {
                             continue;
                         }
+                        // the delta net reads each state element it writes into the cache itself, before the write
+                        if (ctx->fused_gdn_state_cpy && cgraph->nodes[i + k]->op == GGML_OP_GATED_DELTA_NET && s == 5) {
+                            continue;
+                        }
                         if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                             bool found = false;
                             for (int n = 0; n < k; ++n) {
@@ -15686,6 +15910,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_mul_mat_vec_glu = 0;
                 ctx->fused_mul_mat_vec_hc_post = false;
                         ctx->fused_ssm_conv_state = false;
+                ctx->fused_gdn_state_cpy = false;
+                ctx->fused_gdn_gates = false;
                 ctx->fused_cont_mul = false;
                 ctx->fused_mul_mat_cpy_f16 = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -15930,6 +16156,67 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
     }
 
+    // delta net gates computed by their delta net (ggml_vk_match_gdn_gates): the gate nodes go right before the delta net (they
+    // are read only by each other and by it), and stay there below (gdn_gate_runs)
+    std::vector<std::pair<std::vector<ggml_tensor *>, ggml_tensor *>> gdn_gate_runs;   // gate nodes in order, delta net
+    if (!ctx->device->disable_fusion) {
+        for (int gi = 0; gi < graph->n_nodes; ++gi) {
+            vk_gdn_gates gates;
+            std::vector<const ggml_tensor *> members;
+            if (graph->nodes[gi]->op != GGML_OP_GATED_DELTA_NET || !ggml_vk_find_gdn_gates(graph, gi, &gates, &members)) {
+                continue;
+            }
+            const auto is_member = [&](const ggml_tensor * t) {
+                return std::find(members.begin(), members.end(), t) != members.end();
+            };
+            // the gate nodes before the delta net, from the nearest back
+            int lo = gi;
+            size_t found = 0;
+            for (int i = gi - 1; i >= 0 && found < members.size(); --i) {
+                if (is_member(graph->nodes[i])) {
+                    lo = i;
+                    ++found;
+                }
+            }
+            // moved later, so nothing else may read them: every use of a gate node is by a gate node or the delta net
+            bool alone = found == members.size();
+            for (int i = lo; i < gi && alone; ++i) {
+                const ggml_tensor * t = graph->nodes[i];
+                if (!is_member(t)) {
+                    continue;
+                }
+                int uses = 0;
+                for (const ggml_tensor * r : members) {
+                    for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                        uses += r->src[si] == t;
+                    }
+                }
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    uses += graph->nodes[gi]->src[si] == t;
+                }
+                alone = (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && uses == ggml_node_get_use_count(graph, i);
+            }
+            if (!alone) {
+                continue;
+            }
+            std::vector<ggml_tensor *> run, rest;
+            for (int i = lo; i < gi; ++i) {
+                (is_member(graph->nodes[i]) ? run : rest).push_back(graph->nodes[i]);
+            }
+            const int first = lo + (int) rest.size();
+            for (int i = 0; i < (int) run.size(); ++i) {
+                graph->nodes[first + i] = run[i];
+            }
+            for (int i = 0; i < (int) rest.size(); ++i) {
+                graph->nodes[lo + i] = rest[i];
+            }
+            for (const ggml_tensor * t : { gates.fab, gates.fbo, gates.dt, gates.v }) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t), graph->nodes[gi]);
+            }
+            gdn_gate_runs.emplace_back(run, graph->nodes[gi]);
+        }
+    }
+
     std::vector<ggml_tensor *> new_order;
     std::vector<bool> used(graph->n_nodes, false);
     std::set<ggml_tensor *> used_node_set;
@@ -16114,6 +16401,55 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     first_unused++;
                 }
                 continue;
+            }
+        }
+        // a delta net and the CPY of its final state into the cache in a row (with the views between), for
+        // ggml_vk_gated_delta_net writing the state into the cache itself
+        if (graph->nodes[first_unused]->op == GGML_OP_GATED_DELTA_NET) {
+            ggml_tensor * gdn = graph->nodes[first_unused];
+            const int end = std::min(first_unused + 12, graph->n_nodes);
+            int j_cpy = -1;
+            for (int j = first_unused + 1; j < end; ++j) {
+                if (!used[j] && graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->src[0]->view_src == gdn) {
+                    j_cpy = j;
+                    break;
+                }
+            }
+            if (j_cpy > 0) {
+                // the CPY sources: a view of the delta net output and a view of the cache, each maybe a node here
+                std::vector<int> order = { first_unused };
+                bool ok = true;
+                for (int s = 0; s < 2 && ok; ++s) {
+                    const ggml_tensor * src = graph->nodes[j_cpy]->src[s];
+                    for (int k = first_unused + 1; k < j_cpy; ++k) {
+                        if (graph->nodes[k] == src && !used[k]) {
+                            const ggml_tensor * vs = src->src[0];
+                            bool vs_ready = vs == gdn || vs == nullptr;
+                            for (int m = first_unused + 1; m < j_cpy && !vs_ready; ++m) {
+                                vs_ready = graph->nodes[m] == vs ? used[m] : vs_ready;
+                            }
+                            // a source that is not a node in the window is ready
+                            bool in_window = false;
+                            for (int m = first_unused + 1; m < j_cpy; ++m) {
+                                in_window = in_window || graph->nodes[m] == vs;
+                            }
+                            ok = is_empty(src) && (vs_ready || !in_window);
+                            order.push_back(k);
+                        }
+                    }
+                }
+                if (ok) {
+                    order.push_back(j_cpy);
+                    for (int j : order) {
+                        new_order.push_back(graph->nodes[j]);
+                        used_node_set.insert(graph->nodes[j]);
+                        used[j] = true;
+                    }
+                    while (first_unused < graph->n_nodes && used[first_unused]) {
+                        first_unused++;
+                    }
+                    continue;
+                }
             }
         }
         // the one-token conv of a delta net: CONCAT, the CPY of its tail into the state cache, SSM_CONV and SILU
@@ -16507,6 +16843,21 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             new_order.insert(new_order.begin() + mi + 1, hp);
             new_order.insert(new_order.begin() + mi + 1, views.begin(), views.end());
         }
+    }
+    // Each delta net gate run back right before its delta net
+    for (const auto & rr : gdn_gate_runs) {
+        std::set<const ggml_tensor *> in_run(rr.first.begin(), rr.first.end());
+        std::vector<ggml_tensor *> order;
+        order.reserve(new_order.size());
+        for (ggml_tensor * t : new_order) {
+            if (t == rr.second) {
+                order.insert(order.end(), rr.first.begin(), rr.first.end());
+                order.push_back(t);
+            } else if (!in_run.count(t)) {
+                order.push_back(t);
+            }
+        }
+        new_order.swap(order);
     }
     // Replace the graph with the new order.
     GGML_ASSERT((int) new_order.size() == graph->n_nodes);
@@ -17377,6 +17728,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
                         return false;
                     }
+                }
+                if (op->src[6] && op->src[6]->type != GGML_TYPE_I32) {
+                    return false;
                 }
                 return op->type == GGML_TYPE_F32;
             }

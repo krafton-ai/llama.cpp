@@ -5527,6 +5527,52 @@ struct test_mul_mat_hc_post : public test_case {
     }
 };
 
+// RDA gates in front of a KDA delta net, as the Raon-1 nano graph builds them (llama_model_raon1_nano::graph::build_rda_layer):
+// g = lower*sigmoid(fbo + dt), beta = sigmoid(fab[rank + h]), v' = v*sigmoid(fab[rank + H + h])/beta. A backend may let the
+// delta net compute the gates itself (Vulkan).
+struct test_gdn_gates : public test_case {
+    const int64_t head_count, head_size, rank;
+
+    std::string vars() override { return VARS_TO_STR3(head_count, head_size, rank); }
+    std::string op_desc(ggml_tensor *) override { return "GDN_GATES"; }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    test_gdn_gates(int64_t head_count = 16, int64_t head_size = 128, int64_t rank = 32)
+        : head_count(head_count), head_size(head_size), rank(rank) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_w) override {
+        const int64_t H = head_count, S = head_size, d = H*S;
+        ggml_tensor * fab  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank + 2*H, 1);
+        ggml_tensor * fbo  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, 1);
+        ggml_tensor * dt   = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, d);
+        ggml_tensor * conv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*d, 1);
+        ggml_tensor * q    = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1), 1e-6f);
+        ggml_tensor * k    = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1), 1e-6f);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, 1);
+        ggml_set_name(state, "state");
+
+        ggml_tensor * v = ggml_view_4d(ctx, conv, S, H, 1, 1, S*sizeof(float), 3*d*sizeof(float), 3*d*sizeof(float), 2*d*sizeof(float));
+        ggml_tensor * g = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_add(ctx, fbo, dt)), -5.0f);
+        g = ggml_reshape_4d(ctx, g, S, H, 1, 1);
+        ggml_tensor * beta  = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, H, 1, fab->nb[1], rank*sizeof(float)));
+        ggml_tensor * write = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, H, 1, fab->nb[1], (rank + H)*sizeof(float)));
+        ggml_tensor * ratio = ggml_reshape_4d(ctx, ggml_div(ctx, write, beta), 1, H, 1, 1);
+        v = ggml_mul(ctx, v, ratio);
+        beta = ggml_reshape_4d(ctx, beta, 1, H, 1, 1);
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            init_tensor_uniform(t, strcmp(t->name, "state") == 0 ? -0.1f : -1.0f, strcmp(t->name, "state") == 0 ? 0.1f : 1.0f);
+        }
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -13535,6 +13581,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
         test_cases.emplace_back(new test_mul_mat_hc_post(t, 1536, 6144));
     }
+    // delta net gates computed by the delta net (Raon-1 nano, one token)
+    test_cases.emplace_back(new test_gdn_gates(16, 128, 32));
+    test_cases.emplace_back(new test_gdn_gates(4, 64, 8));
     // mHC selector (Raon-1 nano): decode, speculative verify and prefill token counts
     for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         for (int64_t nt : { 1, 2, 3, 4, 8, 9, 33 }) {

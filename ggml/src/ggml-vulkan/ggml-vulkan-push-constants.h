@@ -705,6 +705,12 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t use_ids;
+    uint32_t state_out;
+    uint32_t so_off;
+    uint32_t rank;
+    float lower;
+    uint32_t fab_t, fbo_t;
 };
 
 struct vk_op_ssm_scan_push_constants {
