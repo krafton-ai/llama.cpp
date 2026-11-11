@@ -8710,6 +8710,46 @@ struct test_concat_transposed : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL_MAT + GGML_OP_ADD: a norm, a projection of long rows to a few outputs and a bias,
+// e.g. the mix projection of mHC
+struct test_rms_norm_mul_mat_add : public test_case {
+    const ggml_type type_w;
+    const int64_t n;
+    const int64_t n_out;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT_ADD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_w, n, n_out, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rms_norm_mul_mat_add(ggml_type type_w, int64_t n, int64_t n_out, int64_t n_tokens)
+        : type_w(type_w), n(n), n_out(n_out), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, n, n_out);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_out);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, x, 1e-6f)), b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12267,6 +12307,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 32, 576, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1500, 1, 256, {1, 1}, {32, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 300, 32, 300, {1, 1}, {1, 1}));
+
+    for (int64_t n_tokens : {1, 4, 8, 9}) {
+        test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 2048, 17, n_tokens));
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F32, 4096, 24, 3));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
