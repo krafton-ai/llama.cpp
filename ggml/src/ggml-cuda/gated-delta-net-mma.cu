@@ -544,6 +544,10 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
         return gdn_path::ar;
     }
     if (a.kda) {
+        // on Ampere the shared-memory KDA kernel of gated_delta_net.cu is faster than this schedule
+        if (info.cc < GGML_CUDA_CC_ADA_LOVELACE) {
+            return gdn_path::ar;
+        }
         // the whole-head state copy does not fit next to the KDA operands: value slices of 32, or 16 when 32 leaves
         // half of the SMs without a block
         if (a.H * a.n_seqs * 4 * 2 <= info.nsm) {
