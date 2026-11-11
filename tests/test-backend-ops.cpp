@@ -8677,6 +8677,39 @@ struct test_pool1d_view : public test_case {
     }
 };
 
+// GGML_OP_CONCAT along dim 0 of a and a transposed b, e.g. the conv state and the new tokens of a short conv
+struct test_concat_transposed : public test_case {
+    const std::array<int64_t, 3> ne_a;
+    const int64_t n_b;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne_a, n_b) + ",transposed_b=1";
+    }
+
+    test_concat_transposed(std::array<int64_t, 3> ne_a, int64_t n_b)
+        : ne_a(ne_a), n_b(n_b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne_a[0], ne_a[1], ne_a[2]);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne_a[1], n_b, ne_a[2]);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * bt = ggml_transpose(ctx, b);
+        ggml_set_name(bt, "b_transposed");
+
+        ggml_tensor * out = ggml_concat(ctx, a, bt, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12191,6 +12224,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_pool1d_view(pool_type, {10, 3, 2, 1}, 3, 3, 1));
         test_cases.emplace_back(new test_pool1d_view(pool_type, {16, 5, 3, 2}, 16, 16, 0));
     }
+
+    test_cases.emplace_back(new test_concat_transposed({3, 96, 1}, 29));
+    test_cases.emplace_back(new test_concat_transposed({3, 1536, 1}, 64));
+    test_cases.emplace_back(new test_concat_transposed({7, 33, 2}, 40));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

@@ -126,3 +126,66 @@ kernel void kernel_concat_b4_pack(
         *y = *x;
     }
 }
+
+// dim == 0 with a transposed src1 (nb11 is the element size): a 16x16 tile is read along i1 (contiguous in src1)
+// and written along i0, so the loads from src1 are not one row each
+#define CONCAT_T_TILE 16
+kernel void kernel_concat_b4_t(
+        global const char * src0,
+        ulong offset0,
+        global const char * src1,
+        ulong offset1,
+        global char * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int ne1) {
+    local int tile[CONCAT_T_TILE][CONCAT_T_TILE + 1];
+
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst = dst + offsetd;
+
+    const int i3 = 0;  // the host only picks this kernel for ne3 == 1
+    const int i2 = get_group_id(2);
+    const int b0 = get_group_id(0) * CONCAT_T_TILE;
+    const int b1 = get_group_id(1) * CONCAT_T_TILE;
+    const int tx = get_local_id(0);
+    const int ty = get_local_id(1);
+
+    // load: tx runs along i1
+    {
+        const int i0 = b0 + ty;
+        const int i1 = b1 + tx;
+        if (i0 < ne0 && i1 < ne1) {
+            global const int * x = i0 < ne00 ?
+                    (global const int *) (src0 + i3 * nb03 + i2 * nb02 + i1 * nb01 + i0 * nb00) :
+                    (global const int *) (src1 + i3 * nb13 + i2 * nb12 + i1 * nb11 + (i0 - ne00) * nb10);
+            tile[ty][tx] = *x;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    // store: tx runs along i0
+    {
+        const int i0 = b0 + tx;
+        const int i1 = b1 + ty;
+        if (i0 < ne0 && i1 < ne1) {
+            *(global int *) (dst + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * nb0) = tile[tx][ty];
+        }
+    }
+}

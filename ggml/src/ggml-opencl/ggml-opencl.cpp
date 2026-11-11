@@ -1003,7 +1003,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_softplus_f16, kernel_softplus_f16_4, kernel_softplus_f16_nc;
     cl_kernel kernel_upscale;
     cl_kernel kernel_upscale_bilinear;
-    cl_kernel kernel_concat_b1, kernel_concat_b2, kernel_concat_b4, kernel_concat_b8, kernel_concat_b4_pack;
+    cl_kernel kernel_concat_b1, kernel_concat_b2, kernel_concat_b4, kernel_concat_b8, kernel_concat_b4_pack,
+        kernel_concat_b4_t;
     cl_kernel kernel_conv_2d_f16;
     cl_kernel kernel_conv_2d_f32;
     cl_kernel kernel_conv_2d_f16_f32;
@@ -3550,6 +3551,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_concat_b4 = clCreateKernel(prog, "kernel_concat_b4", &err), err));
         CL_CHECK((backend_ctx->kernel_concat_b8 = clCreateKernel(prog, "kernel_concat_b8", &err), err));
         CL_CHECK((backend_ctx->kernel_concat_b4_pack = clCreateKernel(prog, "kernel_concat_b4_pack", &err), err));
+        CL_CHECK((backend_ctx->kernel_concat_b4_t = clCreateKernel(prog, "kernel_concat_b4_t", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -17157,8 +17159,12 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     const size_t ts = ggml_type_size(dst->type);
     // the pack kernel copies 4-byte elements, so it is only valid for those.
     const bool concat_pack = (dim == 0 && ne0 < 32 && ts == 4);
+    // src1 transposed along the concat axis: tiled kernel (see kernel_concat_b4_t)
+    const bool   concat_t    = (dim == 0 && !concat_pack && ts == 4 && nb11 == ts && nb10 > nb11 && ne3 == 1);
     cl_kernel kernel;
-    if (concat_pack) {
+    if (concat_t) {
+        kernel = backend_ctx->kernel_concat_b4_t;
+    } else if (concat_pack) {
         kernel = backend_ctx->kernel_concat_b4_pack;
     } else {
         switch (ts) {
@@ -17193,6 +17199,14 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &nb1));
     CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &nb2));
     CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nb3));
+
+    if (concat_t) {
+        CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int), &ne1));
+        size_t global_work_size[] = { (size_t) CEIL_DIV(ne0, 16) * 16, (size_t) CEIL_DIV(ne1, 16) * 16, (size_t) ne2 };
+        size_t local_work_size[]  = { 16, 16, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        return;
+    }
     CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_int),   &dim));
 
     if (concat_pack) {
