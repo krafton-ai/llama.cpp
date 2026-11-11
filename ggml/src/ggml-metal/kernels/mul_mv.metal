@@ -214,6 +214,10 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
+constant int   FC_mul_mv_glu_v [[function_constant(FC_MUL_MV + 6)]];
+
+// MUL_MAT + GLU fusion (Q4_K): when set, each simdgroup computes rows j and j + glu and writes silu(row j)*row (j + glu)
+constant int   FC_mul_mv_glu = is_function_constant_defined(FC_mul_mv_glu_v) ? FC_mul_mv_glu_v : 0;
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -1534,7 +1538,8 @@ void kernel_mul_mv_q4_K_f32_impl(
     const int r1 = tgpig.y;
     const int im = tgpig.z;
 
-    const int first_row = (r0 * NSG + sgitg) * nr0;
+    const int first_row = (r0 * NSG + sgitg) * (FC_mul_mv_glu > 0 ? 1 : nr0);
+    const int row_step  = FC_mul_mv_glu > 0 ? FC_mul_mv_glu : 1;
 
     const uint i12 = im%FC_mul_mv_ne12;
     const uint i13 = im/FC_mul_mv_ne12;
@@ -1597,15 +1602,24 @@ void kernel_mul_mv_q4_K_f32_impl(
                                   (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
                          dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
-            q1 += args.nb01/2;
-            sc += args.nb01/2;
-            dh += args.nb01/2;
+            q1 += row_step*args.nb01/2;
+            sc += row_step*args.nb01/2;
+            dh += row_step*args.nb01/2;
         }
 
         y4 += 4 * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    if (FC_mul_mv_glu > 0) {
+        const float g = simd_sum(sumf[0]);
+        const float u = simd_sum(sumf[1]);
+        if (tiisg == 0 && first_row < FC_mul_mv_glu) {
+            dst_f32[first_row] = g/(1.0f + exp(-g))*u;
+        }
+        return;
+    }
 
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
         float sum_all = simd_sum(sumf[row]);

@@ -2538,7 +2538,11 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+    // a one-row Q4_K [gate | up] mat-vec feeding only a swiglu writes silu(gate)*up into the GLU output
+    const int n_fuse = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_GLU);
+    const ggml_tensor * dst = n_fuse > 1 ? ctx->node(idx + 1) : op;
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_glu(lib, op, n_fuse > 1 ? (int) dst->ne[0] : 0);
 
     const int nr0 = pipeline.nr0;
     const int nr1 = pipeline.nr1;
@@ -2572,7 +2576,7 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        3);
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -2585,7 +2589,7 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
     }
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {

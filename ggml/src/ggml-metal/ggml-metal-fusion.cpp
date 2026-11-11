@@ -706,6 +706,47 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+// MUL_MAT + GLU: a one-row Q4_K mat-vec whose [gate | up] output feeds only a single-src swiglu computes
+// rows j and j + n_ff in one simdgroup and writes silu(gate)*up; the mat-vec output itself is never stored
+static bool ggml_metal_fusion_check_mul_mat_glu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * mm  = nodes[0];
+    const ggml_tensor * glu = nodes[1];
+
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_Q4_K || mm->src[1]->type != GGML_TYPE_F32 ||
+        mm->type != GGML_TYPE_F32 || ggml_is_transposed(mm->src[0]) || (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[0] != mm || glu->src[1] != nullptr ||
+        ggml_get_op_params_i32(glu, 1) != 0 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+
+    // one simdgroup per output, two simdgroups per threadgroup (N_SG_Q4_K = 2)
+    if (mm->ne[0] != 2*glu->ne[0] || glu->ne[0] % 2 != 0) {
+        return false;
+    }
+
+    const int out = node_idxs[idx + 1];
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 2, fusion->ops.data(), &out, 1)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
+        return true;
+    }
+
+    // decode only: one src1 row, no batch
+    return mm->src[1]->ne[1] == 1 && mm->src[1]->ne[2] == 1 && mm->src[1]->ne[3] == 1 &&
+        mm->src[0]->ne[2] == 1 && mm->src[0]->ne[3] == 1;
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -756,6 +797,7 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 };
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_mul_mat_glu = { GGML_OP_MUL_MAT, GGML_OP_GLU };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -785,6 +827,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_MUL_MAT_GLU,    ops_mul_mat_glu,            {},     true,  ggml_metal_fusion_check_mul_mat_glu },
 };
 
 // ---- alloc deps -----------------------------------------------------------
