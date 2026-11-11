@@ -12681,6 +12681,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+    // 192/128 with one query head per K/V head (MLA prefill on K/V expanded per head): multi-stage MMA path for KV lengths
+    // that are multiples of 64, other kernels otherwise
+    test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {1, 1}, 256, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {1, 1}, 1024, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {1, 1}, 320, 33, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

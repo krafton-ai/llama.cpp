@@ -317,6 +317,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         case 192: {
             // MiMo-V2.5 / V2.5-Pro / V2-Flash: gqa_ratio is 8 (SWA) or 16 (full attn)
             GGML_ASSERT(V->ne[0] == 128);
+            // one query head per K/V head (MLA prefill on K/V expanded per head from the latent cache, e.g. Raon-1)
+            if (Q->ne[2] == K->ne[2]) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<192, 128, 1>(ctx, dst);
+                break;
+            }
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
             const bool use_gqa_opt = mask && max_bias == 0.0f;
@@ -586,10 +591,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
             break;
         case 192:
-            if (V->ne[0] != 128 || !gqa_opt_applies) {
+            if (V->ne[0] != 128) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (gqa_ratio % 8 != 0) {
+            if (gqa_ratio == 1) {
+                if (K->ne[1] % 64 != 0) {
+                    return BEST_FATTN_KERNEL_NONE; // the multi-stage 192/128 kernel does not check the KV bounds
+                }
+                break; // MMA kernel with ncols2 = 1
+            }
+            if (!gqa_opt_applies || gqa_ratio % 8 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;

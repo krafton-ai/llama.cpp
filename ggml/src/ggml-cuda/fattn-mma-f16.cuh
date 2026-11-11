@@ -63,8 +63,9 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128,  8,  64, 4,  64,  96,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 16,  64, 4,  32,  96,  64,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 32, 128, 2,  32,  96,  64,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 64, 128, 2,  32,  96,  64,  64, 2, true);
+    // 64 KV rows per rescale at 32 and 64 columns: one query head per K/V head (expanded MLA prefill) fills the columns with queries
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 32, 128, 2,  64,  96,  64,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 64, 128, 2,  64,  96,  64,  64, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  64, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 256, 1,  64, 128, 128, 128, 2, true);
@@ -363,13 +364,15 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ,
 // ------------------------------------------------------------------------------------------------------------------
 
 static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
-    return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
+    // multi-stage K/V loading also for one query head per K/V head at 192/128 (expanded MLA prefill): synchronous loads
+    // left that layout far below the GQA layouts that load K/V in several stages
+    return cp_async_available(cc) && (ncols2 >= 2 || (DKQ == 192 && DV == 128)) ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
 }
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse) {
 #ifdef CP_ASYNC_AVAILABLE
-    const int nstages_target = ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
+    const int nstages_target = ncols2 >= 2 || (DKQ == 192 && DV == 128) ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
     // sparse gather is not implemented for multi-stage loading
     return use_sparse && nstages_target > 1 ? 1 : nstages_target;
 #else
@@ -1347,7 +1350,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    if constexpr (ncols2 == 1 || use_sparse) {
+    // one query head per K/V head checks the KV bounds, unless it loads in several stages: that is only selected for
+    // 192/128 with a KV length that is a multiple of 64 (see ggml_cuda_get_best_fattn_kernel)
+    if constexpr ((ncols2 == 1 && nstages <= 1) || use_sparse) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
@@ -1835,7 +1840,7 @@ static __global__ void flash_attn_ext_f16(
         NO_DEVICE_CODE;
         return;
     }
-    if (DKQ == 192 && ncols2 != 8 && ncols2 != 16) {
+    if (DKQ == 192 && ncols2 != 1 && ncols2 != 8 && ncols2 != 16) {
         NO_DEVICE_CODE;
         return;
     }
