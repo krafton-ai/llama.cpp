@@ -60,6 +60,94 @@ kernel void kernel_argmax_f32(
     dst_i32[tgpig] = arg_val;
 }
 
+// one long row (decode argmax over the vocabulary) in two passes with the result of kernel_argmax_f32 with nth threads:
+// thread t of that kernel scans i = t, t + nth, ...; here its scan is cut into nseg consecutive pieces, one per
+// threadgroup, and the second pass joins the pieces of each t in order (the first maximum wins), then reduces as before
+kernel void kernel_argmax_part_f32(
+        constant ggml_metal_kargs_argmax_part & args,
+        device   const char * src0,
+        device         char * tmp,
+        uint  tgpig[[threadgroup_position_in_grid]],
+        uint  tpitg[[thread_position_in_threadgroup]]) {
+    device const float * x = (device const float *) src0;
+
+    const int64_t nk = (args.ne00 + args.nth - 1)/args.nth;  // iterations of one thread
+    const int64_t ks = (nk + args.nseg - 1)/args.nseg;       // iterations per piece
+
+    float   lmax = -INFINITY;
+    int32_t larg = -1;
+
+    const int64_t k1 = min(nk, (int64_t) (tgpig + 1)*ks);
+    for (int64_t k = (int64_t) tgpig*ks; k < k1; ++k) {
+        const int64_t i = tpitg + k*args.nth;
+        if (i < args.ne00 && x[i] > lmax) {
+            lmax = x[i];
+            larg = i;
+        }
+    }
+
+    ((device float   *) tmp)[tgpig*args.nth + tpitg] = lmax;
+    ((device int32_t *) tmp)[args.nseg*args.nth + tgpig*args.nth + tpitg] = larg;
+}
+
+kernel void kernel_argmax_join_f32(
+        constant ggml_metal_kargs_argmax_part & args,
+        device   const char * tmp,
+        device         char * dst,
+        threadgroup    char * shmem [[threadgroup(0)]],
+        uint  tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint    ntg[[threads_per_threadgroup]]) {
+    float   lmax = -INFINITY;
+    int32_t larg = -1;
+
+    for (int32_t g = 0; g < args.nseg; ++g) {
+        const float v = ((device const float *) tmp)[g*args.nth + tpitg];
+        if (v > lmax) {
+            lmax = v;
+            larg = ((device const int32_t *) tmp)[args.nseg*args.nth + g*args.nth + tpitg];
+        }
+    }
+
+    // from here as kernel_argmax_f32
+    float max_val = simd_max(lmax);
+    int32_t arg_val = simd_max(select(-1, larg, lmax == max_val));
+
+    device int32_t * dst_i32 = (device int32_t *) dst;
+
+    threadgroup   float * shared_maxval = (threadgroup   float *) shmem;
+    threadgroup int32_t * shared_argmax = (threadgroup int32_t *) shmem + N_SIMDWIDTH;
+
+    if (ntg > N_SIMDWIDTH) {
+        if (sgitg == 0) {
+            shared_maxval[tiisg] = -INFINITY;
+            shared_argmax[tiisg] = -1;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiisg == 0) {
+            shared_maxval[sgitg] = max_val;
+            shared_argmax[sgitg] = arg_val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        max_val = shared_maxval[tiisg];
+        arg_val = shared_argmax[tiisg];
+
+        float max_val_reduced   = simd_max(max_val);
+        int32_t arg_val_reduced = simd_max(select(-1, arg_val, max_val == max_val_reduced));
+
+        dst_i32[0] = arg_val_reduced;
+
+        return;
+    }
+
+    dst_i32[0] = arg_val;
+}
+
 kernel void kernel_diag_f32(
         constant ggml_metal_kargs_diag & args,
         device   const char * src0,

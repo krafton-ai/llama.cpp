@@ -5503,6 +5503,19 @@ int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// one long row: two passes (kernel_argmax_part_f32, kernel_argmax_join_f32) with the same result; the one-threadgroup kernel
+// reads a long row with one threadgroup only
+static constexpr int32_t ARGMAX_2P_NSEG = 64;
+
+static bool ggml_metal_op_argmax_use_2p(const ggml_tensor * op) {
+    return ggml_nrows(op->src[0]) == 1 && op->src[0]->ne[0] >= 32768;
+}
+
+size_t ggml_metal_op_argmax_extra(const ggml_tensor * op) {
+    // nth of the one-threadgroup kernel for a single long row is 256 (see below)
+    return ggml_metal_op_argmax_use_2p(op) ? (size_t) ARGMAX_2P_NSEG*256*(sizeof(float) + sizeof(int32_t)) : 0;
+}
+
 int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -5526,6 +5539,40 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
     int nth = 32; // SIMD width
     while (nth < ne00 && nth*ne01*ne02*ne03 < 256) {
         nth *= 2;
+    }
+
+    if (ggml_metal_op_argmax_use_2p(op)) {
+        GGML_ASSERT(nth == 256);
+
+        ggml_metal_kargs_argmax_part args1 = {
+            /*.ne00 = */ ne00,
+            /*.nb01 = */ nb01,
+            /*.nth  = */ nth,
+            /*.nseg = */ ARGMAX_2P_NSEG,
+        };
+
+        ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+        ggml_metal_buffer_id bid_tmp = bid_dst;
+        bid_tmp.offs += ggml_nbytes(op);
+
+        auto p0 = ggml_metal_library_get_pipeline_argmax_2p(lib, op, false);
+        ggml_metal_encoder_set_pipeline(enc, p0);
+        ggml_metal_encoder_set_bytes   (enc, &args1, sizeof(args1), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_tmp, 2);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ARGMAX_2P_NSEG, 1, 1, nth, 1, 1);
+
+        ggml_metal_op_concurrency_reset(ctx);
+
+        auto p1 = ggml_metal_library_get_pipeline_argmax_2p(lib, op, true);
+        ggml_metal_encoder_set_pipeline(enc, p1);
+        ggml_metal_encoder_set_bytes   (enc, &args1, sizeof(args1), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, p1.smem, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, nth, 1, 1);
+
+        return 1;
     }
 
     const size_t smem = pipeline.smem;

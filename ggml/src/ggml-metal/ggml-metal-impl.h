@@ -1384,6 +1384,13 @@ typedef struct {
 } ggml_metal_kargs_argmax;
 
 typedef struct {
+     int64_t ne00;
+    uint64_t nb01;
+     int32_t nth;  // threads of the one-threadgroup kernel whose result is reproduced
+     int32_t nseg; // threadgroups of the first pass
+} ggml_metal_kargs_argmax_part;
+
+typedef struct {
     int64_t  np;
 } ggml_metal_kargs_opt_step_adamw;
 
