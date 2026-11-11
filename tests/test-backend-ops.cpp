@@ -9208,6 +9208,41 @@ struct test_mul_mat_vt_shared : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT of n_head query rows against one shared F16 K cache: the decode attention scores of absorbed MLA
+// without FA. The OpenCL backend picks its kernels for these by the name the graph gives the scores ("kq-<layer>")
+struct test_mul_mat_kq_shared : public test_case {
+    const int64_t n_kv;
+    const int64_t d_k;
+    const int64_t n_head;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_KQ_SHARED";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_kv, d_k, n_head);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_kq_shared(int64_t n_kv, int64_t d_k = 576, int64_t n_head = 32)
+        : n_kv(n_kv), d_k(d_k), n_head(n_head) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d_k, n_kv);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_k, 1, n_head);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, cache, q);
+        ggml_set_name(out, "kq-0");
+        return out;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12814,6 +12849,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vt_shared(n_kv));
     }
     test_cases.emplace_back(new test_mul_mat_vt_shared(1000, 192, 128));
+
+    for (int64_t n_kv : {1000, 1280, 2304, 4352, 8448, 8704}) {
+        test_cases.emplace_back(new test_mul_mat_kq_shared(n_kv));
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
