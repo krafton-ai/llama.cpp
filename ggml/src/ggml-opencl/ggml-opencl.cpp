@@ -850,7 +850,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gelu_erf, kernel_gelu_erf_4;
     cl_kernel kernel_gelu_quick, kernel_gelu_quick_4;
     cl_kernel kernel_relu;
-    cl_kernel kernel_sigmoid_f32, kernel_sigmoid_f16;
+    cl_kernel kernel_sigmoid_f32, kernel_sigmoid_f16, kernel_sigmoid_f32_nc;
     cl_kernel kernel_dsv4_hc_pre_f32 = nullptr, kernel_dsv4_hc_post_f32 = nullptr, kernel_dsv4_hc_comb_f32 = nullptr;
     cl_kernel kernel_tri;
     cl_kernel kernel_pool_1d_f32;
@@ -3267,6 +3267,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_sigmoid_f32 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_sigmoid_f16 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_sigmoid_f32_nc = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f32_nc", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -9352,7 +9353,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 case GGML_UNARY_OP_GELU_QUICK:
                     return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
                 case GGML_UNARY_OP_SIGMOID:
-                    return ggml_is_contiguous(op->src[0]);
+                    return ggml_is_contiguous(op->src[0]) ||
+                           (op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_EXP:
@@ -15424,6 +15426,45 @@ static void ggml_cl_sigmoid(ggml_backend_t backend, const ggml_tensor * src0, co
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) {
+        GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        const int      ne00 = src0->ne[0];
+        const int      ne01 = src0->ne[1];
+        const int      ne02 = src0->ne[2];
+        const int      ne03 = src0->ne[3];
+        const cl_ulong nb00 = src0->nb[0];
+        const cl_ulong nb01 = src0->nb[1];
+        const cl_ulong nb02 = src0->nb[2];
+        const cl_ulong nb03 = src0->nb[3];
+        const cl_ulong nb0  = dst->nb[0];
+        const cl_ulong nb1  = dst->nb[1];
+        const cl_ulong nb2  = dst->nb[2];
+        const cl_ulong nb3  = dst->nb[3];
+
+        cl_kernel kernel = backend_ctx->kernel_sigmoid_f32_nc;
+
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra0->data_device));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &ne00));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &nb00));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &nb01));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &nb02));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_ulong), &nb03));
+        CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_ulong), &nb0));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb1));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb2));
+        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb3));
+
+        const int nth                = 64;
+        size_t    global_work_size[] = { (size_t) ne01 * nth, (size_t) ne02, (size_t) ne03 };
+        size_t    local_work_size[]  = { (size_t) nth, 1, 1 };
+
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        return;
+    }
 
     cl_kernel kernel;
     if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
