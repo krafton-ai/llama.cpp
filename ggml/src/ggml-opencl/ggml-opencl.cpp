@@ -78,6 +78,7 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
 static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor);
 static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor);
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst, const ggml_tensor * state_dst = nullptr);
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // Precompute mp (m' in the paper) and L such that division
@@ -9593,6 +9594,35 @@ static void ggml_opencl_dsv4_hc_post_sum(ggml_backend_t backend, const ggml_tens
     }
 }
 
+// gdn_state: GATED_DELTA_NET -> CPY(final state -> recurrent cache): the delta net writes its final state straight
+// into the cache row (state_dst) instead of the tail of its output, and the CPY is left out
+static const ggml_tensor * ggml_opencl_gdn_final_state_cpy(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * gdn = cgraph->nodes[i];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] != nullptr || ggml_get_op_params_i32(gdn, 0) != 1 ||
+        gdn->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    const ggml_tensor * v       = gdn->src[2];
+    const size_t        s_off   = (size_t) v->ne[0] * v->ne[1] * v->ne[2] * v->ne[3] * sizeof(float);
+    const int64_t       n_state = v->ne[0] * v->ne[0] * v->ne[1] * v->ne[3];
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE ||
+            n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE) {
+            continue;
+        }
+        const ggml_tensor * src = n->src[0];
+        if (n->op == GGML_OP_CPY && src && src->view_src == gdn && src->view_offs == s_off &&
+            ggml_nelements(src) == n_state && ggml_is_contiguous(src) && ggml_is_contiguous(n) &&
+            n->type == GGML_TYPE_F32 && n->src[1] && n->src[1]->extra && ggml_opencl_use_count(cgraph, src) == 1 &&
+            !ggml_opencl_overlaps(n, gdn->src[5])) {
+            return n;
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
 // two sigmoid gates of one input row and their ratio applied to v:
 //   SIGMOID(VIEW fab b+d) = write -> VIEW fab b -> SIGMOID = beta -> DIV(write, beta) -> RESHAPE -> MUL(v, ratio)
 // Outputs beta (node i + 2) and v' (node i + 5). Returns i + 5 or 0.
@@ -9819,6 +9849,7 @@ static void ggml_opencl_fused_concat_ssm_conv_silu(ggml_backend_t            bac
 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    const ggml_tensor *          cpy_skip        = nullptr;
     // nodes already computed by a fused kernel at an earlier node
     const ggml_tensor *          fused_skip[3]   = {};
 
@@ -9838,7 +9869,15 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
-        if (node == fused_skip[0] || node == fused_skip[1] || node == fused_skip[2]) {
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_GATED_DELTA_NET) {
+            const ggml_tensor * cpy = ggml_opencl_gdn_final_state_cpy(cgraph, i);
+            if (cpy) {
+                ggml_cl_gated_delta_net(backend, node, cpy);
+                cpy_skip = cpy;
+                continue;
+            }
+        }
+        if (node == cpy_skip || node == fused_skip[0] || node == fused_skip[1] || node == fused_skip[2]) {
             continue;
         }
         if (!backend_ctx->disable_fusion && node->op == GGML_OP_UNARY) {
@@ -10554,6 +10593,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return false;
                 }
                 const int64_t S_v = op->src[2]->ne[0];
+                if (op->src[6]) {  // no per-sequence state ids
+                    return false;
+                }
                 return S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128;
             }
         case GGML_OP_CONCAT:
@@ -31635,7 +31677,8 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
-static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+// state_dst: when set (the fused GDN + CPY of the final state into the cache), the final state goes there
+static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst, const ggml_tensor * state_dst) {
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
 
@@ -31761,6 +31804,12 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
+
+    ggml_tensor_extra_cl * extra_sdst = state_dst ? (ggml_tensor_extra_cl *) state_dst->extra : extra_dst;
+    const cl_ulong         off_sdst =
+        state_dst ? extra_sdst->offset + state_dst->view_offs : off_dst + (cl_ulong) s_off * sizeof(float);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &extra_sdst->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_sdst));
 
     // Subgroup size is 64 for Adreno and 32 for Intel
     const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;

@@ -9091,6 +9091,77 @@ struct test_dsv4_hc_post_sum : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET (K = 1) + CPY of the final state into a recurrent cache
+struct test_gated_delta_net_state_cpy : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_STATE_CPY";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_count, head_size, n_seq_tokens, n_seqs);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gated_delta_net_state_cpy(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = head_size;
+        const int64_t H = head_count;
+
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_seq_tokens, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_seq_tokens, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(state, "state");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+
+        // the final state follows the attention scores in the output
+        const int64_t n_attn = S*H*n_seq_tokens*n_seqs;
+        ggml_tensor * final_state = ggml_view_1d(ctx, gdn_out, S*S*H*n_seqs, ggml_row_size(gdn_out->type, n_attn));
+        ggml_tensor * cache = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S*S*H*n_seqs);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * cpy = ggml_cpy(ctx, final_state, cache);
+
+        // the copy first, then the scores
+        ggml_tensor * attn = ggml_cont(ctx, ggml_view_1d(ctx, gdn_out, n_attn, 0));
+        ggml_tensor * out = ggml_concat(ctx, cpy, attn, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12687,6 +12758,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post_sum(512, 1));
     test_cases.emplace_back(new test_dsv4_hc_post_sum(31, 3));
     test_cases.emplace_back(new test_dsv4_hc_post_sum(2560, 5));
+
+    // only the final state, copied into the cache
+    test_cases.emplace_back(new test_gated_delta_net_state_cpy(4, 32,  1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_state_cpy(4, 64,  5, 2));
+    test_cases.emplace_back(new test_gated_delta_net_state_cpy(8, 128, 1, 1));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

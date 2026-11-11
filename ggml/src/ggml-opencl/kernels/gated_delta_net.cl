@@ -97,7 +97,8 @@ kernel void kernel_gated_delta_net(
         uint  H_k,
         uint  rq3,
         float scale,
-        uint K) {
+        uint K,
+        global char * sdst_buf, ulong off_sdst) {
 
     global const float * data_q     = (global const float *)(q_buf     + off_q);
     global const float * data_k     = (global const float *)(k_buf     + off_k);
@@ -106,6 +107,8 @@ kernel void kernel_gated_delta_net(
     global const float * data_beta  = (global const float *)(beta_buf  + off_beta);
     global const float * data_state = (global const float *)(state_buf + off_state);
     global       float * data_dst   = (global       float *)(dst_buf   + off_dst);
+    // final state (K == 1): dst + s_off, or the recurrent cache row when the copy into it is fused
+    global float * data_sdst = (global float *) (sdst_buf + off_sdst);
 
     const uint head_id     = get_group_id(0);
     const uint seq_id      = get_group_id(1);
@@ -242,7 +245,7 @@ kernel void kernel_gated_delta_net(
             const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
             #pragma unroll
             for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
+                data_sdst[state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
             }
         }
     }
