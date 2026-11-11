@@ -3172,6 +3172,25 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+    // mHC selector fusion; the reductions use subgroup adds where the device has them
+#define HC_PIPELINE(p, name, n_params, block)                                                                     \
+    if (device->subgroup_arithmetic) {                                                                             \
+        ggml_vk_create_pipeline(device, device->p, #name, name ## _sg_len, name ## _sg_data, "main", n_params,     \
+            sizeof(vk_op_fused_push_constants), {1, 1, 1}, { block }, 1);                                             \
+    } else {                                                                                                       \
+        ggml_vk_create_pipeline(device, device->p, #name, name ## _len, name ## _data, "main", n_params,           \
+            sizeof(vk_op_fused_push_constants), {1, 1, 1}, { block }, 1);                                             \
+    }
+    HC_PIPELINE(pipeline_hc_mix_f32,      hc_mix_f32,      3, 256);
+    HC_PIPELINE(pipeline_hc_mix_f16,      hc_mix_f16,      3, 256);
+    HC_PIPELINE(pipeline_hc_mix_rows_f32, hc_mix_rows_f32, 3, 256);
+    HC_PIPELINE(pipeline_hc_mix_rows_f16, hc_mix_rows_f16, 3, 256);
+    HC_PIPELINE(pipeline_hc_pre_norm_f32, hc_pre_norm_f32, 5, 512);
+    HC_PIPELINE(pipeline_hc_mix_add_rms_f32, hc_mix_add_rms_f32, 6, 256);
+    HC_PIPELINE(pipeline_hc_mix_add_rms_f16, hc_mix_add_rms_f16, 6, 256);
+#undef HC_PIPELINE
+    ggml_vk_create_pipeline(device, device->pipeline_hc_select_f32, "hc_select_f32", hc_select_f32_len, hc_select_f32_data, "main", 5,
+        sizeof(vk_op_fused_push_constants), {1, 1, 1}, { 64 }, 1);
     // 2 keys x HG heads per invocation in the score phase instead of 1 key x 2*HG heads: fewer shared memory reads per
     // fma on GPUs with many cores
     const uint32_t mla_kg = device->shader_core_count >= 60 ? 2 : 1;
@@ -12385,6 +12404,8 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     }
 }
 
+static void ggml_vk_hc_select_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, const int * run);
+
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
@@ -12677,7 +12698,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_RMS_NORM:
-        ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
+        if (ctx->fused_hc_select) {
+            ggml_vk_hc_select_fused(ctx, compute_ctx, cgraph, ctx->hc_select_run);
+        } else {
+            ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
+        }
         break;
     case GGML_OP_RMS_NORM_BACK:
         ggml_vk_rms_norm_back(ctx, compute_ctx, src0, src1, node);
@@ -13683,6 +13708,304 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
            ggml_vk_can_fuse_unary_mul(cgraph, node_idx, node_idx + 1);
 }
 
+// mHC selector (DeepSeek-V4 style hyper-connections with the folded selector of Raon-1 nano): the graph computes
+//   mixes = MUL_MAT(fn, RMS_NORM(flat x)) + base; sg = SIGMOID(mixes[0:2hc]); pre = sg[0:hc]; post = sg[hc:2hc]
+//   e = MUL_MAT(K, mixes); rho = SCALE_BIAS(POOL_1D_MAX(e * r), 1, 1); comb = e / rho + c0       (K | r | c0 = chart)
+//   y = RMS_NORM(DSV4_HC_PRE(x, pre)) * w
+// in about 13 small dispatches. It runs as three: hc_mix (the projection and the sum of squares, split over input chunks
+// for a few tokens), hc_select (sg and comb) and hc_pre_norm (y from the partial sums). The nodes must be in one run
+// starting at the first RMS_NORM (ggml_vk_graph_optimize gathers them); outputs are sg, comb and y.
+// optional, with up to 8 tokens: the per-layer input tail of the layer before, x = streams + RMS_NORM(g) * w (RMS_NORM, MUL,
+// ADD); hc_mix computes x itself and writes it (the readers after the run)
+enum { HC_RN_A, HC_MM, HC_ADD, HC_SIG, HC_PRE, HC_RN_B, HC_MUL, HC_MMK, HC_MULR, HC_POOL, HC_SCALE, HC_DIV, HC_COMB,
+       HC_T_RN, HC_T_MUL, HC_T_ADD, HC_ROLES };
+
+static bool ggml_vk_hc_is_view_of(const ggml_tensor * v, const ggml_tensor * t, size_t offs) {
+    return v && (v->op == GGML_OP_VIEW || v->op == GGML_OP_RESHAPE) && v->view_src == (t->view_src ? t->view_src : t) &&
+           v->view_offs == (t->view_src ? t->view_offs : 0) + offs;
+}
+
+// finds the mHC selector nodes from the RMS_NORM at node_idx; run gets their node indices (HC_ROLES), *last the last node
+// of the run. All nodes between are the run's nodes or views.
+static bool ggml_vk_find_hc_select(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int W, int * run);
+static bool ggml_vk_check_hc_select_run(const struct ggml_cgraph * cgraph, int node_idx, const int * run, int * last);
+
+static bool ggml_vk_match_hc_select(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int * run, int * last) {
+    if (ggml_vk_find_hc_select(ctx, cgraph, node_idx, 48, run)) {
+        // the selector's RMS_NORM starts the run: a tail before it has run already
+        run[HC_T_RN] = run[HC_T_MUL] = run[HC_T_ADD] = -1;
+        return ggml_vk_check_hc_select_run(cgraph, node_idx, run, last);
+    }
+    // the RMS_NORM of a tail starts the run: the selector's RMS_NORM comes a few nodes later
+    for (int j = node_idx + 1; j < std::min(cgraph->n_nodes, node_idx + 12); ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_RMS_NORM && ggml_vk_find_hc_select(ctx, cgraph, j, 48, run) && run[HC_T_RN] == node_idx) {
+            return ggml_vk_check_hc_select_run(cgraph, node_idx, run, last);
+        }
+    }
+    return false;
+}
+
+// the role nodes of an mHC selector from the RMS_NORM at node_idx, within the next W nodes
+static bool ggml_vk_find_hc_select(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int W, int * run) {
+    const ggml_tensor * rn_a = cgraph->nodes[node_idx];
+    if (rn_a->op != GGML_OP_RMS_NORM || rn_a->type != GGML_TYPE_F32 || !ggml_is_contiguous(rn_a->src[0]) ||
+        rn_a->src[0]->ne[2] != 1 || rn_a->src[0]->ne[3] != 1 || !ctx->device->pipeline_hc_select_f32) {
+        return false;
+    }
+    const int end = std::min(cgraph->n_nodes, node_idx + W);
+    auto find = [&](ggml_op op, auto && pred) -> int {
+        for (int j = node_idx + 1; j < end; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == op && pred(n)) {
+                return j;
+            }
+        }
+        return -1;
+    };
+    const int64_t nx = rn_a->ne[0], nt = rn_a->ne[1];
+    run[HC_RN_A] = node_idx;
+    run[HC_MM] = find(GGML_OP_MUL_MAT, [&](const ggml_tensor * n) {
+        return n->src[1] == rn_a && (n->src[0]->type == GGML_TYPE_F32 || n->src[0]->type == GGML_TYPE_F16) &&
+               ggml_is_contiguous(n->src[0]) && n->src[0]->ne[0] == nx && n->src[0]->ne[2] == 1 && n->src[0]->ne[3] == 1; });
+    if (run[HC_MM] < 0) return false;
+    const ggml_tensor * mm = cgraph->nodes[run[HC_MM]];
+    const int64_t nmix = mm->ne[0];
+    run[HC_ADD] = find(GGML_OP_ADD, [&](const ggml_tensor * n) {
+        return n->src[0] == mm && n->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(n->src[1]) && ggml_nelements(n->src[1]) == nmix; });
+    if (run[HC_ADD] < 0) return false;
+    const ggml_tensor * add = cgraph->nodes[run[HC_ADD]];
+    run[HC_SIG] = find(GGML_OP_UNARY, [&](const ggml_tensor * n) {
+        return ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID && ggml_vk_hc_is_view_of(n->src[0], add, 0) &&
+               n->src[0]->nb[1] == add->nb[1] && n->src[0]->ne[0] % 2 == 0 && n->src[0]->ne[1] == nt && ggml_is_contiguous_rows(n); });
+    if (run[HC_SIG] < 0) return false;
+    const ggml_tensor * sig = cgraph->nodes[run[HC_SIG]];
+    const int64_t hc = sig->ne[0] / 2, hc2 = hc*hc;
+    if (hc < 1 || hc > 16 || nmix + 1 > 64 || hc2 > nmix || hc2 > 64) return false;
+    run[HC_PRE] = find(GGML_OP_DSV4_HC_PRE, [&](const ggml_tensor * n) {
+        const ggml_tensor * x = n->src[0];
+        return ggml_vk_hc_is_view_of(n->src[1], sig, 0) && n->src[1]->ne[0] == hc && x->type == GGML_TYPE_F32 &&
+               x->ne[1] == hc && x->ne[2] == nt && x->ne[0]*hc == nx && x->nb[0] == sizeof(float) && x->nb[1] == x->ne[0]*sizeof(float) &&
+               (rn_a->src[0] == x || ggml_vk_hc_is_view_of(rn_a->src[0], x, 0)); });
+    if (run[HC_PRE] < 0) return false;
+    const ggml_tensor * pre = cgraph->nodes[run[HC_PRE]];
+    run[HC_RN_B] = find(GGML_OP_RMS_NORM, [&](const ggml_tensor * n) { return n->src[0] == pre; });
+    if (run[HC_RN_B] < 0) return false;
+    const ggml_tensor * rn_b = cgraph->nodes[run[HC_RN_B]];
+    run[HC_MUL] = find(GGML_OP_MUL, [&](const ggml_tensor * n) {
+        return n->src[0] == rn_b && n->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(n->src[1]) && ggml_nelements(n->src[1]) == pre->ne[0]; });
+    if (run[HC_MUL] < 0) return false;
+    run[HC_MMK] = find(GGML_OP_MUL_MAT, [&](const ggml_tensor * n) {
+        const ggml_tensor * K = n->src[0];
+        return n->src[1] == add && K->type == GGML_TYPE_F32 && K->view_src && K->view_src->type == GGML_TYPE_F32 && K->view_offs == 0 &&
+               K->ne[0] == nmix && K->ne[1] == hc2 && K->nb[1] == nmix*sizeof(float); });
+    if (run[HC_MMK] < 0) return false;
+    const ggml_tensor * mmk = cgraph->nodes[run[HC_MMK]];
+    const ggml_tensor * chart = mmk->src[0]->view_src;
+    if (!ggml_is_contiguous(chart) || ggml_nelements(chart) < nmix*hc2 + 2*hc2) return false;
+    run[HC_MULR] = find(GGML_OP_MUL, [&](const ggml_tensor * n) {
+        return n->src[0] == mmk && n->src[1]->view_src == chart && n->src[1]->view_offs == nmix*hc2*sizeof(float) && n->src[1]->ne[0] == hc2; });
+    if (run[HC_MULR] < 0) return false;
+    const ggml_tensor * mulr = cgraph->nodes[run[HC_MULR]];
+    run[HC_POOL] = find(GGML_OP_POOL_1D, [&](const ggml_tensor * n) {
+        const int32_t * pp = (const int32_t *) n->op_params;
+        return n->src[0] == mulr && pp[0] == GGML_OP_POOL_MAX && pp[1] == hc2 && pp[2] == hc2 && pp[3] == 0; });
+    if (run[HC_POOL] < 0) return false;
+    const ggml_tensor * pool = cgraph->nodes[run[HC_POOL]];
+    run[HC_SCALE] = find(GGML_OP_SCALE, [&](const ggml_tensor * n) {
+        return n->src[0] == pool && ggml_get_op_params_f32(n, 0) == 1.0f && ggml_get_op_params_f32(n, 1) == 1.0f; });
+    if (run[HC_SCALE] < 0) return false;
+    const ggml_tensor * sc = cgraph->nodes[run[HC_SCALE]];
+    run[HC_DIV] = find(GGML_OP_DIV, [&](const ggml_tensor * n) {
+        return ggml_vk_hc_is_view_of(n->src[0], mmk, 0) && n->src[0]->ne[0] == hc && n->src[0]->ne[1] == hc &&
+               ggml_vk_hc_is_view_of(n->src[1], sc, 0) && ggml_nelements(n->src[1]) == nt; });
+    if (run[HC_DIV] < 0) return false;
+    const ggml_tensor * div = cgraph->nodes[run[HC_DIV]];
+    run[HC_COMB] = find(GGML_OP_ADD, [&](const ggml_tensor * n) {
+        return n->src[0] == div && n->src[1]->view_src == chart && n->src[1]->view_offs == (nmix*hc2 + hc2)*sizeof(float) &&
+               n->src[1]->ne[0] == hc && n->src[1]->ne[1] == hc && n->src[1]->nb[1] == hc*sizeof(float); });
+    if (run[HC_COMB] < 0) return false;
+    const ggml_tensor * comb = cgraph->nodes[run[HC_COMB]];
+    if (!ggml_is_contiguous(comb) || !ggml_is_contiguous(cgraph->nodes[run[HC_MUL]])) return false;
+
+    // the tail before: x = ADD(streams, RESHAPE(MUL(RMS_NORM(g), w))), within the W nodes before node_idx
+    run[HC_T_RN] = run[HC_T_MUL] = run[HC_T_ADD] = -1;
+    const ggml_tensor * x = pre->src[0];
+    if (nt <= 8 && nx % (4*8) == 0 && ctx->device->pipeline_hc_mix_add_rms_f32 && x->op == GGML_OP_ADD &&
+        ggml_is_contiguous(x->src[0]) && ggml_are_same_shape(x->src[0], x) && x->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(x)) {
+        const ggml_tensor * r = x->src[1];
+        const ggml_tensor * mw = (r->op == GGML_OP_RESHAPE || r->op == GGML_OP_VIEW) ? r->src[0] : nullptr;
+        if (mw && mw->op == GGML_OP_MUL && mw->src[0]->op == GGML_OP_RMS_NORM && r->ne[0] == x->ne[0] && r->ne[1] == 1 &&
+            ggml_is_contiguous(mw) && mw->ne[0] == x->ne[0] && mw->ne[1] == nt &&
+            mw->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(mw->src[1]) && ggml_nelements(mw->src[1]) == x->ne[0] &&
+            ggml_is_contiguous(mw->src[0]->src[0]) && mw->src[0]->src[0]->type == GGML_TYPE_F32) {
+            for (int j = std::max(0, node_idx - W); j < node_idx; ++j) {
+                const ggml_tensor * t = cgraph->nodes[j];
+                if (t == mw->src[0]) run[HC_T_RN] = j;
+                if (t == mw)         run[HC_T_MUL] = j;
+                if (t == x)          run[HC_T_ADD] = j;
+            }
+            if (run[HC_T_RN] < 0 || run[HC_T_MUL] < 0 || run[HC_T_ADD] < 0) {
+                run[HC_T_RN] = run[HC_T_MUL] = run[HC_T_ADD] = -1;
+            }
+        }
+    }
+    return true;
+}
+
+// the nodes from node_idx to the last role are the roles and views only, and only sg, comb, y (and views of them) are
+// used after the run
+static bool ggml_vk_check_hc_select_run(const struct ggml_cgraph * cgraph, int node_idx, const int * run, int * last) {
+    const ggml_tensor * sig  = cgraph->nodes[run[HC_SIG]];
+    const ggml_tensor * comb = cgraph->nodes[run[HC_COMB]];
+    int hi = node_idx;
+    for (int r = 0; r < HC_ROLES; ++r) {
+        hi = std::max(hi, run[r]);
+    }
+    // every node of the range is a role or a view; the outputs are sg, comb, y and the views of them
+    int idxs[64], outs[64];
+    ggml_op ops[64];
+    int n = 0, no = 0;
+    const ggml_tensor * out_t[4] = { sig, comb, cgraph->nodes[run[HC_MUL]], run[HC_T_ADD] >= 0 ? cgraph->nodes[run[HC_T_ADD]] : nullptr };
+    for (int j = node_idx; j <= hi; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        bool role = false;
+        for (int r = 0; r < HC_ROLES; ++r) {
+            role = role || run[r] == j;
+        }
+        const bool empty = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
+        if (!role && !empty) {
+            return false;
+        }
+        if (n >= 64) {
+            return false;
+        }
+        idxs[n] = j; ops[n] = t->op; ++n;
+        bool is_out = false;
+        for (const ggml_tensor * o : out_t) {
+            const ggml_tensor * v = t;
+            while (v && o) {
+                is_out = is_out || v == o;
+                v = v->view_src;
+            }
+        }
+        if (is_out) {
+            outs[no++] = j;
+        }
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, outs, no)) {
+        return false;
+    }
+    *last = hi;
+    return true;
+}
+
+static void ggml_vk_hc_select_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, const int * run) {
+    const ggml_tensor * rn_a = cgraph->nodes[run[HC_RN_A]];
+    const ggml_tensor * mm   = cgraph->nodes[run[HC_MM]];
+    const ggml_tensor * add  = cgraph->nodes[run[HC_ADD]];
+    ggml_tensor * sig        = cgraph->nodes[run[HC_SIG]];
+    const ggml_tensor * pre  = cgraph->nodes[run[HC_PRE]];
+    const ggml_tensor * rn_b = cgraph->nodes[run[HC_RN_B]];
+    ggml_tensor * y          = cgraph->nodes[run[HC_MUL]];
+    const ggml_tensor * mmk  = cgraph->nodes[run[HC_MMK]];
+    ggml_tensor * comb       = cgraph->nodes[run[HC_COMB]];
+
+    const ggml_tensor * flat  = rn_a->src[0];
+    const ggml_tensor * fn    = mm->src[0];
+    const ggml_tensor * base  = add->src[1];
+    const ggml_tensor * chart = mmk->src[0]->view_src;
+    const ggml_tensor * x     = pre->src[0];
+    const ggml_tensor * w     = y->src[1];
+    const uint32_t nx = (uint32_t) flat->ne[0], nt = (uint32_t) flat->ne[1], nmix = (uint32_t) mm->ne[0];
+    const uint32_t hc = (uint32_t) (sig->ne[0] / 2);
+
+    // a few tokens (decode, speculative verify): 8 input splits for more workgroups; more tokens: whole rows
+    const uint32_t ns = nt <= 8 && nx % (4*8) == 0 ? 8 : 1;
+    const uint64_t parts_size = (uint64_t) (nmix + 1) * ns * nt * sizeof(float);
+    if (ctx->prealloc_size_split_k < parts_size) {
+        ctx->prealloc_size_split_k = parts_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    const vk_subbuffer parts = { ctx->prealloc_split_k, 0, parts_size };
+
+    // 1. partial projections and sums of squares: parts [nmix + 1, ns, nt]
+    if (run[HC_T_ADD] >= 0) {
+        // with the tail: x = streams + g / rms(g) * w computed here, and written to the tail's ADD for the readers after
+        GGML_ASSERT(ns > 1);
+        const ggml_tensor * xadd    = cgraph->nodes[run[HC_T_ADD]];
+        const ggml_tensor * streams = xadd->src[0];
+        const ggml_tensor * g       = cgraph->nodes[run[HC_T_RN]]->src[0];
+        const ggml_tensor * gw      = cgraph->nodes[run[HC_T_MUL]]->src[1];
+        vk_op_fused_push_constants pc {};
+        pc.ne0 = nx / ns; pc.ne1 = nmix; pc.ne2 = (uint32_t) streams->ne[0];
+        pc.f0 = ggml_get_op_params_f32(cgraph->nodes[run[HC_T_RN]], 0);
+        pc.a_nb2 = ggml_vk_nb_elem(streams, 2);
+        pc.b_nb1 = ggml_vk_nb_elem(fn, 1);
+        pc.c_nb1 = ggml_vk_nb_elem(g, 1);
+        pc.d_nb1 = nmix + 1; pc.d_nb2 = (nmix + 1) * ns;
+        pc.o_nb2 = ggml_vk_nb_elem(xadd, 2);
+        init_pushconst_tensor_offsets(ctx, pc, streams, fn, g, gw, nullptr);
+        pc.o_off = get_misalign_bytes(ctx, xadd) / sizeof(float);
+        vk_pipeline pipeline = fn->type == GGML_TYPE_F16 ? ctx->device->pipeline_hc_mix_add_rms_f16 : ctx->device->pipeline_hc_mix_add_rms_f32;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, streams, true), ggml_vk_tensor_subbuffer(ctx, fn, true), parts,
+                ggml_vk_tensor_subbuffer(ctx, g, true), ggml_vk_tensor_subbuffer(ctx, gw, true), ggml_vk_tensor_subbuffer(ctx, xadd, true) },
+            pc, { nmix + 1, ns, nt });
+    } else {
+        vk_op_fused_push_constants pc {};
+        pc.ne0 = nx / ns; pc.ne1 = nmix;
+        pc.a_nb1 = ggml_vk_nb_elem(flat, 1);
+        pc.b_nb1 = ggml_vk_nb_elem(fn, 1);
+        pc.d_nb1 = nmix + 1; pc.d_nb2 = (nmix + 1) * ns;
+        init_pushconst_tensor_offsets(ctx, pc, flat, fn, nullptr, nullptr, nullptr);
+        const bool f16 = fn->type == GGML_TYPE_F16;
+        vk_pipeline pipeline = ns > 1 ? (f16 ? ctx->device->pipeline_hc_mix_f16 : ctx->device->pipeline_hc_mix_f32)
+                                      : (f16 ? ctx->device->pipeline_hc_mix_rows_f16 : ctx->device->pipeline_hc_mix_rows_f32);
+        if (ns == 1) {
+            pc.ne0 = nx;
+        }
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const std::array<uint32_t, 3> wg = ns > 1 ? std::array<uint32_t, 3>{ nmix + 1, ns, nt } : std::array<uint32_t, 3>{ CEIL_DIV(nmix + 1, 4u), 1, nt };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, flat, true), ggml_vk_tensor_subbuffer(ctx, fn, true), parts }, pc, wg);
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+    // 2. sg [2hc, nt] and comb [hc*hc, nt]
+    {
+        vk_op_fused_push_constants pc {};
+        pc.ne0 = nmix; pc.ne1 = hc; pc.ne2 = nx; pc.ne3 = ns;
+        pc.f0 = ggml_get_op_params_f32(rn_a, 0);
+        pc.a_nb1 = nmix + 1; pc.a_nb2 = (nmix + 1) * ns;
+        pc.d_nb1 = ggml_vk_nb_elem(sig, 1);
+        pc.o_nb2 = ggml_vk_nb_elem(comb, 2);
+        init_pushconst_tensor_offsets(ctx, pc, nullptr, base, chart, nullptr, sig);
+        pc.o_off = get_misalign_bytes(ctx, comb) / sizeof(float);
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_hc_select_f32, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_hc_select_f32, { parts, ggml_vk_tensor_subbuffer(ctx, base, true),
+                ggml_vk_tensor_subbuffer(ctx, chart, true), ggml_vk_tensor_subbuffer(ctx, sig, true), ggml_vk_tensor_subbuffer(ctx, comb, true) },
+            pc, { nt, 1, 1 });
+    }
+    // 3. y = RMS_NORM(sum_s x_s * pre_s) * w, pre from the partial sums
+    {
+        vk_op_fused_push_constants pc {};
+        pc.ne0 = (uint32_t) x->ne[0]; pc.ne1 = hc; pc.ne2 = nx; pc.ne3 = ns;
+        pc.f0 = ggml_get_op_params_f32(rn_b, 0);
+        pc.f1 = ggml_get_op_params_f32(rn_a, 0);
+        pc.a_nb1 = ggml_vk_nb_elem(x, 1); pc.a_nb2 = ggml_vk_nb_elem(x, 2);
+        pc.b_nb1 = nmix + 1; pc.b_nb2 = (nmix + 1) * ns;
+        pc.c_nb1 = nmix;
+        pc.d_nb1 = ggml_vk_nb_elem(y, 1);
+        init_pushconst_tensor_offsets(ctx, pc, x, nullptr, w, base, y);
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_hc_pre_norm_f32, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_hc_pre_norm_f32, { ggml_vk_tensor_subbuffer(ctx, x, true), parts,
+                ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, base, true), ggml_vk_tensor_subbuffer(ctx, y, true) },
+            pc, { nt, 1, 1 });
+    }
+    ctx->prealloc_split_k_need_sync = true;
+}
+
 static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * scale_in  = cgraph->nodes[node_idx];
     const ggml_tensor * sigmoid   = cgraph->nodes[node_idx + 1];
@@ -14538,17 +14861,31 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
         // The array is sized to handle the largest fusion (asserted later).
-        bool op_srcs_fused_elementwise[13];
+        bool op_srcs_fused_elementwise[64];
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
+        ctx->fused_hc_select = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (num_adds) {
+            int hc_last = 0;
+            if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_vk_match_hc_select(ctx, cgraph, i, ctx->hc_select_run, &hc_last) &&
+                hc_last - i < 31) {
+                ctx->num_additional_fused_ops = hc_last - i;
+                ctx->fused_hc_select = true;
+                fusion_string = "HC_SELECT";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // three outputs: sg, comb and y (the sync tracking below adds every marked node)
+                ctx->fused_ops_write_mask |= (1 << (ctx->hc_select_run[HC_SIG] - i)) | (1 << (ctx->hc_select_run[HC_COMB] - i)) |
+                                             (1 << (ctx->hc_select_run[HC_MUL] - i));
+                if (ctx->hc_select_run[HC_T_ADD] >= 0) {
+                    ctx->fused_ops_write_mask |= 1 << (ctx->hc_select_run[HC_T_ADD] - i);
+                }
+            } else if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
@@ -14733,11 +15070,36 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         GGML_ASSERT(ctx->num_additional_fused_ops < (int)(sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0])));
-        ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
+        if (!ctx->fused_hc_select) {
+            ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
+        } else {
+            // the mHC selector reads only nodes from before the run and weights: no output may overlap them
+            const int * run = ctx->hc_select_run;
+            const bool tail = run[HC_T_ADD] >= 0;
+            const ggml_tensor * outs[4] = { cgraph->nodes[run[HC_SIG]], cgraph->nodes[run[HC_COMB]], cgraph->nodes[run[HC_MUL]],
+                                            tail ? cgraph->nodes[run[HC_T_ADD]] : nullptr };
+            const ggml_tensor * ins[9] = { tail ? nullptr : cgraph->nodes[run[HC_RN_A]]->src[0], cgraph->nodes[run[HC_MM]]->src[0], cgraph->nodes[run[HC_ADD]]->src[1],
+                                           cgraph->nodes[run[HC_MMK]]->src[0]->view_src, tail ? nullptr : cgraph->nodes[run[HC_PRE]]->src[0],
+                                           cgraph->nodes[run[HC_MUL]]->src[1],
+                                           tail ? cgraph->nodes[run[HC_T_ADD]]->src[0] : nullptr, tail ? cgraph->nodes[run[HC_T_RN]]->src[0] : nullptr,
+                                           tail ? cgraph->nodes[run[HC_T_MUL]]->src[1] : nullptr };
+            bool overlap = false;
+            for (const ggml_tensor * o : outs) {
+                for (const ggml_tensor * in : ins) {
+                    overlap = overlap || (o && in && ggml_vk_tensors_overlap(in, o, false));
+                }
+            }
+            if (overlap) {
+                ctx->fused_hc_select = false;
+                ctx->num_additional_fused_ops = 0;
+                ctx->fused_ops_write_mask = 1;
+                fusion_string = nullptr;
+            }
+        }
 
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->num_additional_fused_ops && !ctx->fused_hc_select) {
             // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
             ggml_tensor *output_nodes[2] {};
@@ -14786,6 +15148,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
+                ctx->fused_hc_select = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -14927,6 +15290,107 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         return false;
     };
 
+    // mHC selectors (ggml_vk_hc_select_fused): the graph has their nodes spread over the layer (comb comes right before
+    // its DSV4_HC_POST). Bring each one's nodes, with the views they read, right after its first RMS_NORM, when their
+    // sources are ready there, and keep that run together below (hc_runs)
+    std::vector<std::vector<ggml_tensor *>> hc_runs;   // the nodes of each run, in order
+    std::set<const ggml_tensor *> hc_run_nodes;
+    if (!ctx->device->disable_fusion) {
+        std::unordered_map<const ggml_tensor *, int> pos;
+        pos.reserve(graph->n_nodes);
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            pos[graph->nodes[i]] = i;
+        }
+        for (int a = 0; a < graph->n_nodes; ++a) {
+            int run[HC_ROLES];
+            if (graph->nodes[a]->op != GGML_OP_RMS_NORM || !ggml_vk_find_hc_select(ctx, graph, a, 512, run)) {
+                continue;
+            }
+            // the roles and the views among their sources (recursively), placed at the run's start (the tail's RMS_NORM
+            // when there is a tail, else a) in their present order
+            const int start = run[HC_T_RN] >= 0 ? run[HC_T_RN] : a;
+            const ggml_tensor * rn_a_t = graph->nodes[a];
+            std::set<int> members;
+            std::vector<int> stack;
+            for (int r = 0; r < HC_ROLES; ++r) {
+                if (run[r] >= 0) {
+                    stack.push_back(run[r]);
+                }
+            }
+            bool ok = true;
+            while (!stack.empty() && ok) {
+                const int j = stack.back();
+                stack.pop_back();
+                if (!members.insert(j).second) {
+                    continue;
+                }
+                const ggml_tensor * t = graph->nodes[j];
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    const ggml_tensor * src = t->src[si];
+                    if (!src) {
+                        continue;
+                    }
+                    auto it = pos.find(src);
+                    if (it == pos.end() || it->second < start) {
+                        continue;   // a leaf or a node that is ready at the start
+                    }
+                    const bool view = src->op == GGML_OP_VIEW || src->op == GGML_OP_RESHAPE || src->op == GGML_OP_PERMUTE || src->op == GGML_OP_TRANSPOSE;
+                    if (view) {
+                        stack.push_back(it->second);
+                    } else if (!members.count(it->second)) {
+                        bool role = false;
+                        for (int r = 0; r < HC_ROLES; ++r) {
+                            role = role || run[r] == it->second;
+                        }
+                        ok = role;   // a computed source outside the selector, not ready at the start
+                    }
+                }
+            }
+            if (!ok || hc_run_nodes.count(graph->nodes[a])) {
+                continue;
+            }
+            // the run starts at its first node (the tail's RMS_NORM when there is a tail, before a); only the nodes from
+            // there to the last member move
+            const int a0 = *members.begin();
+            const int a1 = *members.rbegin();
+            std::vector<ggml_tensor *> order;
+            order.reserve(a1 - a0 + 1);
+            for (int j : members) {
+                order.push_back(graph->nodes[j]);
+            }
+            for (int i = a0 + 1; i <= a1; ++i) {
+                if (!members.count(i)) {
+                    order.push_back(graph->nodes[i]);
+                }
+            }
+            for (int i = a0; i <= a1; ++i) {
+                graph->nodes[i] = order[i - a0];
+                pos[order[i - a0]] = i;
+            }
+            int last = 0;
+            const int na = pos[rn_a_t];
+            if (!ggml_vk_find_hc_select(ctx, graph, na, (int) members.size() + 1, run) ||
+                (run[HC_T_RN] >= 0 && run[HC_T_RN] != a0) ||
+                !ggml_vk_check_hc_select_run(graph, a0, run, &last)) {
+                a = na;
+                continue;   // the reordered graph is still valid; the run just stays unfused
+            }
+            hc_runs.emplace_back(graph->nodes + a0, graph->nodes + last + 1);
+            for (int i = a0; i <= last; ++i) {
+                hc_run_nodes.insert(graph->nodes[i]);
+                // keep the run's external sources alive through its last node (the fused kernels read them while they
+                // write the outputs)
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    ggml_tensor * src = graph->nodes[i]->src[si];
+                    if (src && !hc_run_nodes.count(src)) {
+                        params->add_alloc_dep(params->user_data, src, graph->nodes[last]);
+                    }
+                }
+            }
+            a = last;
+        }
+    }
+
     std::vector<ggml_tensor *> new_order;
     std::vector<bool> used(graph->n_nodes, false);
     std::set<ggml_tensor *> used_node_set;
@@ -15063,6 +15527,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 continue;
             }
             if (is_empty(graph->nodes[j])) {
+                continue;
+            }
+            if (hc_run_nodes.count(graph->nodes[j])) {
                 continue;
             }
             // Protect every interior QSA node (not just the start): the mask branch is
@@ -15268,7 +15735,23 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             first_unused++;
         }
     }
+    // Each mHC selector run back in one piece at its first node (the reordering above may have spread it): its nodes only
+    // read nodes that precede its first node, weights and each other, so the move keeps every dependency
+    for (const auto & run : hc_runs) {
+        std::set<const ggml_tensor *> in_run(run.begin(), run.end());
+        std::vector<ggml_tensor *> order;
+        order.reserve(new_order.size());
+        for (ggml_tensor * t : new_order) {
+            if (t == run[0]) {
+                order.insert(order.end(), run.begin(), run.end());
+            } else if (!in_run.count(t)) {
+                order.push_back(t);
+            }
+        }
+        new_order.swap(order);
+    }
     // Replace the graph with the new order.
+    GGML_ASSERT((int) new_order.size() == graph->n_nodes);
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
     }

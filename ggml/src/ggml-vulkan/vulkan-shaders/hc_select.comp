@@ -1,0 +1,66 @@
+#version 450
+
+// mHC selector (fusion of ADD(base) -> SIGMOID of the pre / post logits, and MUL_MAT(K) -> MUL(r) -> POOL_1D(max) ->
+// SCALE_BIAS(1, 1) -> DIV -> ADD(c0) for the stream combination), from the split partial sums of hc_mix, one workgroup per
+// token:
+//   m = (sum_s parts[:, s]) / sqrt(sum_s parts[nmix, s] / np + eps) + base
+//   sg[0:2hc] = sigmoid(m[0:2hc]);  e = K m;  rho = 1 + max_o e[o]*r[o];  comb[o] = c0[o] + e[o]/rho
+// ne0 = nmix, ne1 = hc, ne2 = np, ne3 = nsplit, f0 = eps
+// a = parts [nmix + 1, nsplit, nt] (a_nb1 split, a_nb2 token), b = base, c = chart = K {nmix, hc*hc} | r | c0,
+// d = sigmoid of the pre / post logits [2hc, nt] (d_nb1 token), o = comb [hc*hc, nt] (o_nb2 token)
+
+#include "fused_common.glsl"
+
+layout(binding = 0, std430) readonly buffer A { float data_a[]; };
+layout(binding = 1, std430) readonly buffer B { float data_b[]; };
+layout(binding = 2, std430) readonly buffer C { float data_c[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
+layout(binding = 4, std430) writeonly buffer O { float data_o[]; };
+
+shared float m_s[BLOCK_SIZE];
+shared float er_s[BLOCK_SIZE];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint t    = gl_WorkGroupID.x;
+    const uint nmix = ne0;
+    const uint hc   = ne1;
+    const uint hc2  = hc*hc;
+    const uint np   = ne2;
+
+    float v = 0.0f;
+    if (tid <= nmix) {
+        for (uint s = 0; s < ne3; ++s) {
+            v += data_a[a_off + tid + s*a_nb1 + t*a_nb2];
+        }
+    }
+    m_s[tid] = v;
+    barrier();
+    const float inv = 1.0f/sqrt(m_s[nmix]/float(np) + f0);
+    barrier();
+    if (tid < nmix) {
+        m_s[tid] = v*inv + data_b[b_off + tid];
+    }
+    barrier();
+
+    if (tid < 2*hc) {
+        data_d[d_off + t*d_nb1 + tid] = sigmoid_f(m_s[tid]);
+    }
+    float e = 0.0f;
+    if (tid < hc2) {
+        const uint kb = c_off + tid*nmix;
+        for (uint k = 0; k < nmix; ++k) {
+            e = fma(data_c[kb + k], m_s[k], e);
+        }
+        er_s[tid] = e*data_c[c_off + nmix*hc2 + tid];
+    }
+    barrier();
+    if (tid < hc2) {
+        // POOL_1D(max) over all hc*hc products, as the graph (no clamp)
+        float mx = er_s[0];
+        for (uint o = 1; o < hc2; ++o) {
+            mx = max(mx, er_s[o]);
+        }
+        data_o[o_off + t*o_nb2 + tid] = data_c[c_off + nmix*hc2 + hc2 + tid] + e/(1.0f + mx);
+    }
+}

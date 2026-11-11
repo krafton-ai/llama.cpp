@@ -1,0 +1,102 @@
+#version 450
+
+// mHC pre stream mix followed by RMS norm and weight (fusion of DSV4_HC_PRE -> RMS_NORM -> MUL), one workgroup per token:
+//   h[i] = sum_s x[i, s, t]*pre[s, t];  y[i] = h[i] / sqrt(mean(h^2) + eps) * w[i]
+// PARTS: pre[s, t] = sigmoid(sum_j parts[s, j, t] / sqrt(sum_j parts[nmix, j, t] / np + hc_eps) + base[s])
+// ne0 = n, ne1 = hc, ne2 = np (0: pre given), ne3 = nsplit, f0 = eps, f1 = hc_eps
+// a = x [n, hc, nt] (a_nb1 stream, a_nb2 token), b = pre (b_nb0, b_nb1) or parts (b_nb1, b_nb2, nmix = c_nb1),
+// c = w, e = base
+
+#include "fused_common.glsl"
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer P { float data_p[]; };
+layout(binding = 2, std430) readonly buffer W { float data_w[]; };
+layout(binding = 3, std430) readonly buffer E { float data_e[]; };
+layout(binding = 4, std430) buffer D { float data_d[]; };
+
+const uint MAX_HC = 16;
+const uint RC = 4;   // register-cached elements per invocation
+const uint HC_C = 4; // register-cached streams
+shared float pw[MAX_HC + 1];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.x;
+    const uint n   = ne0;
+    const uint hc  = ne1;
+    const uint np  = ne2;
+
+    const uint xb = a_off + t*a_nb2;
+    const uint db = d_off + t*d_nb1;
+    // small rows (e.g. n = 1536, hc = 4): load x before the pre weights are ready and keep h in registers
+    const bool cached = n <= RC*BLOCK_SIZE && hc <= HC_C;
+    float xr[RC][HC_C];
+    if (cached) {
+        [[unroll]] for (uint r = 0; r < RC; ++r) {
+            const uint i = tid + r*BLOCK_SIZE;
+            [[unroll]] for (uint s = 0; s < HC_C; ++s) {
+                xr[r][s] = i < n && s < hc ? data_x[xb + i + s*a_nb1] : 0.0f;
+            }
+        }
+    }
+
+    if (np > 0) {
+        const uint nmix = c_nb1;
+        // threads 0..hc-1 sum their pre logit over the splits, thread hc the sum of squares
+        if (tid <= hc) {
+            const uint k = tid < hc ? tid : nmix;
+            float v = 0.0f;
+            for (uint j = 0; j < ne3; ++j) {
+                v += data_p[b_off + k + j*b_nb1 + t*b_nb2];
+            }
+            pw[tid] = v;
+        }
+        barrier();
+        const float inv = 1.0f/sqrt(pw[hc]/float(np) + f1);
+        barrier();
+        if (tid < hc) {
+            pw[tid] = sigmoid_f(pw[tid]*inv + data_e[e_off + tid]);
+        }
+    } else if (tid < hc) {
+        pw[tid] = data_p[b_off + tid*b_nb0 + t*b_nb1];
+    }
+    barrier();
+
+    if (cached) {
+        float h[RC];
+        float ss = 0.0f;
+        [[unroll]] for (uint r = 0; r < RC; ++r) {
+            h[r] = 0.0f;
+            [[unroll]] for (uint s = 0; s < HC_C; ++s) {
+                h[r] = fma(xr[r][s], s < hc ? pw[s] : 0.0f, h[r]);
+            }
+            ss = fma(h[r], h[r], ss);
+        }
+        ss = block_sum(ss);
+        const float scale = 1.0f/sqrt(ss/float(n) + f0);
+        [[unroll]] for (uint r = 0; r < RC; ++r) {
+            const uint i = tid + r*BLOCK_SIZE;
+            if (i < n) {
+                data_d[db + i] = h[r]*scale*data_w[c_off + i];
+            }
+        }
+        return;
+    }
+
+    float ss = 0.0f;
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        float h = 0.0f;
+        for (uint s = 0; s < hc; ++s) {
+            h = fma(data_x[xb + i + s*a_nb1], pw[s], h);
+        }
+        data_d[db + i] = h;
+        ss = fma(h, h, ss);
+    }
+    ss = block_sum(ss);
+    const float scale = 1.0f/sqrt(ss/float(n) + f0);
+    // each invocation rescales the elements it wrote itself
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        data_d[db + i] = data_d[db + i]*scale*data_w[c_off + i];
+    }
+}

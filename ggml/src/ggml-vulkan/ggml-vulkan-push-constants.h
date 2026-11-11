@@ -861,6 +861,21 @@ struct vk_quantize_q8_1_push_constants {
     uint32_t num_blocks;
 };
 
+// the fusion shaders (fused_common.glsl): strides and offsets in elements, a / b / c / e the sources in order, d the
+// destination, o a second destination
+struct vk_op_fused_push_constants {
+    uint32_t ne0; uint32_t ne1; uint32_t ne2; uint32_t ne3;
+    float f0; float f1;
+    uint32_t a_nb0; uint32_t a_nb1; uint32_t a_nb2;
+    uint32_t b_nb0; uint32_t b_nb1; uint32_t b_nb2;
+    uint32_t c_nb1;
+    uint32_t e_nb1; uint32_t e_nb2;
+    uint32_t d_nb1; uint32_t d_nb2;
+    uint32_t a_off; uint32_t b_off; uint32_t c_off; uint32_t e_off; uint32_t d_off;
+    uint32_t o_off; uint32_t o_nb2;
+};
+static_assert(sizeof(vk_op_fused_push_constants) <= 128);
+
 struct vk_op_fa_mla_decode_push_constants {
     uint32_t n_kv;
     uint32_t split_kv;
@@ -979,6 +994,14 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
     p.p_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
     p.c_offset = src3 ? get_misalign_bytes(ctx, src3) / ggml_type_size(src3->type) : 0;
     p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_fused_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.a_off = src0 ? get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type) : 0;
+    p.b_off = src1 ? get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type) : 0;
+    p.c_off = src2 ? get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type) : 0;
+    p.e_off = src3 ? get_misalign_bytes(ctx, src3) / ggml_type_size(src3->type) : 0;
+    p.d_off = dst  ? get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type)  : 0;
 }
 
 template <typename T> size_t push_constant_size(const T &t) {

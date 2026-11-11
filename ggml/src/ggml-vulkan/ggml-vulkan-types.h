@@ -990,6 +990,10 @@ struct vk_device_struct {
     bool fa_sparse_compact_use_subgroups;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
+    // mHC selector fusion (hc_mix split / rows -> hc_select -> hc_pre_norm)
+    vk_pipeline pipeline_hc_mix_f32, pipeline_hc_mix_f16, pipeline_hc_mix_rows_f32, pipeline_hc_mix_rows_f16;
+    vk_pipeline pipeline_hc_select_f32, pipeline_hc_pre_norm_f32;
+    vk_pipeline pipeline_hc_mix_add_rms_f32, pipeline_hc_mix_add_rms_f16;   // with x = streams + RMS_NORM(g) * w in front
     vk_pipeline pipeline_fa_mla_decode[3];  // 16, 32, 64 query heads on one 576 / 512 latent head
     vk_pipeline pipeline_fa_mla_decode_hg2[2];  // 32 query heads in two workgroups along y; [1] without the K tile prefetch
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
@@ -1284,6 +1288,8 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_hc_select {};   // mHC selector: the run's node indices are in hc_select_run
+    int  hc_select_run[16] {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

@@ -930,6 +930,18 @@ void process_shaders() {
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
     string_to_spv("fa_mla_decode_f32_f16", "flash_attn_mla_decode.comp", {});
+    for (const std::string sg : {"", "_sg"}) {
+        const std::string sg_add = sg.empty() ? "0" : "1";
+        string_to_spv("hc_mix_f32" + sg,      "hc_mix.comp",      {{"FN_TYPE", "float"}, {"USE_SUBGROUP_ADD", sg_add}});
+        string_to_spv("hc_mix_f16" + sg,      "hc_mix.comp",      {{"FN_TYPE", "float16_t"}, {"FN_F16", "1"}, {"USE_SUBGROUP_ADD", sg_add}});
+        string_to_spv("hc_mix_rows_f32" + sg, "hc_mix.comp",      {{"FN_TYPE", "float"}, {"ROWS", "4"}, {"USE_SUBGROUP_ADD", sg_add}});
+        string_to_spv("hc_mix_rows_f16" + sg, "hc_mix.comp",      {{"FN_TYPE", "float16_t"}, {"FN_F16", "1"}, {"ROWS", "4"}, {"USE_SUBGROUP_ADD", sg_add}});
+        string_to_spv("hc_pre_norm_f32" + sg, "hc_pre_norm.comp", {{"USE_SUBGROUP_ADD", sg_add}});
+        string_to_spv("hc_mix_add_rms_f32" + sg, "hc_mix.comp",   {{"FN_TYPE", "float"}, {"ADD_RMS", "1"}, {"USE_SUBGROUP_ADD", sg_add}});
+        string_to_spv("hc_mix_add_rms_f16" + sg, "hc_mix.comp",   {{"FN_TYPE", "float16_t"}, {"FN_F16", "1"}, {"ADD_RMS", "1"}, {"USE_SUBGROUP_ADD", sg_add}});
+    }
+    string_to_spv("hc_select_f32", "hc_select.comp", {});
+
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 

@@ -1,0 +1,106 @@
+#version 450
+
+#ifdef FN_F16
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+
+// mHC mix projection with the sum of squares (fusion of RMS_NORM -> MUL_MAT), split over input chunks: one workgroup per
+// (mix row k, split s, token t).
+//   dst[k, s, t] = sum_i fn[s*chunk + i, k] * x[s*chunk + i, t]   (k < nmix)
+//   dst[nmix, s, t] = sum_i x[s*chunk + i, t]^2
+// ne0 = chunk, ne1 = nmix; a = x (a_nb1 token stride), b = fn (b_nb1 row stride)
+// ADD_RMS: x is first streams + g / rms(g) * w (the previous layer's PLE tail), computed here
+// (ne2 = n per stream, f0 = eps, a = streams with token stride a_nb2, c = g with token stride c_nb1, e = w); the
+// workgroup of the sum-of-squares row also writes x to the add_rms output (o_off, o_nb2)
+
+// ROWS (no split, several tokens; prefill): workgroup (g, 0, t) computes rows g*ROWS .. g*ROWS + ROWS - 1 of token t
+// (row nmix is the sum of squares), so the token's input is read once per ROWS rows
+
+#include "fused_common.glsl"
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer W { FN_TYPE data_w[]; };
+layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
+#ifdef ADD_RMS
+layout(binding = 3, std430) readonly buffer G { float data_g[]; };
+layout(binding = 4, std430) readonly buffer NW { float data_nw[]; };
+layout(binding = 5, std430) writeonly buffer O { float data_o[]; };
+#endif
+
+#ifdef ROWS
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.z;
+    const uint n = ne0;
+    const uint nmix = ne1;
+    const uint k0 = gl_WorkGroupID.x*ROWS;
+    const uint xb = a_off + t*a_nb1;
+
+    float acc[ROWS];
+    [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        const float v = data_x[xb + i];
+        [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+            const uint k = k0 + r;
+            if (k < nmix) {
+                acc[r] = fma(float(data_w[b_off + k*b_nb1 + i]), v, acc[r]);
+            } else if (k == nmix) {
+                acc[r] = fma(v, v, acc[r]);
+            }
+        }
+    }
+    const uint db = d_off + t*d_nb2;
+    [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+        if (k0 + r <= nmix) {
+            const float s = block_sum(acc[r]);
+            if (tid == 0) {
+                data_d[db + k0 + r] = s;
+            }
+        }
+    }
+}
+#else
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint k = gl_WorkGroupID.x;
+    const uint s = gl_WorkGroupID.y;
+    const uint t = gl_WorkGroupID.z;
+    const uint chunk = ne0;
+
+#ifdef ADD_RMS
+    const uint n = ne2;
+    float ss = 0.0f;
+    for (uint e = tid; e < n; e += BLOCK_SIZE) {
+        const float g = data_g[c_off + t*c_nb1 + e];
+        ss = fma(g, g, ss);
+    }
+    const float scale = 1.0f/sqrt(block_sum(ss)/float(n) + f0);
+    const uint xb = a_off + t*a_nb2 + s*chunk;
+#define X_AT(i) (data_x[xb + (i)] + data_g[c_off + t*c_nb1 + (s*chunk + (i)) % n]*scale*data_nw[e_off + (s*chunk + (i)) % n])
+#else
+    const uint xb = a_off + t*a_nb1 + s*chunk;
+#define X_AT(i) data_x[xb + (i)]
+#endif
+    float acc = 0.0f;
+    if (k < ne1) {
+        const uint wb = b_off + k*b_nb1 + s*chunk;
+        for (uint i = tid; i < chunk; i += BLOCK_SIZE) {
+            acc = fma(float(data_w[wb + i]), X_AT(i), acc);
+        }
+    } else {
+        for (uint i = tid; i < chunk; i += BLOCK_SIZE) {
+            const float v = X_AT(i);
+            acc = fma(v, v, acc);
+#ifdef ADD_RMS
+            data_o[o_off + t*o_nb2 + s*chunk + i] = v;
+#endif
+        }
+    }
+    acc = block_sum(acc);
+    if (tid == 0) {
+        data_d[d_off + k + s*d_nb1 + t*d_nb2] = acc;
+    }
+}
+#endif

@@ -4407,6 +4407,80 @@ struct test_snake_fuse : public test_case {
 };
 
 
+// mHC selector as the Raon-1 nano graph builds it (llama_model_raon1_nano::graph::build_hc_pre): the projection of the
+// RMS-normed streams, the sigmoid of the pre / post logits, the stream combination from the folded chart, and the pre mix
+// with its RMS norm. A backend may fuse it (Vulkan: hc_mix, hc_select, hc_pre_norm); sg, comb and y are checked.
+struct test_hc_select : public test_case {
+    const ggml_type type_fn;
+    const int64_t n, hc, nmix, nt;
+    const bool tail;   // x = streams + RMS_NORM(g) * w in front (the per-layer input of the layer before)
+    ggml_tensor * sg = nullptr, * comb = nullptr, * y = nullptr, * xt = nullptr;
+
+    test_hc_select(ggml_type type_fn = GGML_TYPE_F32, int64_t n = 1536, int64_t hc = 4, int64_t nmix = 17, int64_t nt = 1, bool tail = false)
+        : type_fn(type_fn), n(n), hc(hc), nmix(nmix), nt(nt), tail(tail) {}
+
+    std::string vars() override { return VARS_TO_STR6(type_fn, n, hc, nmix, nt, tail); }
+    std::string op_desc(ggml_tensor *) override { return "HC_SELECT"; }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (tail) {
+            return { sg, comb, y, xt };
+        }
+        return { sg, comb, y };
+    }
+    double max_nmse_err() override { return type_fn == GGML_TYPE_F16 ? 1e-4 : 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_w) override {
+        const int64_t hc2 = hc*hc;
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, hc, nt);
+        if (tail) {
+            ggml_tensor * g  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, nt);
+            ggml_tensor * gw = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, n);
+            x = ggml_add(ctx, x, ggml_reshape_3d(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, g, 1e-5f), gw), n, 1, nt));
+            xt = x;
+        }
+        ggml_tensor * fn    = ggml_new_tensor_2d(ctx_w, type_fn, n*hc, nmix);
+        ggml_tensor * base  = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, nmix);
+        ggml_tensor * chart = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, nmix*hc2 + 2*hc2);
+        ggml_tensor * w     = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, n);
+        ggml_set_name(x, "x");
+        ggml_set_name(chart, "chart");
+
+        ggml_tensor * flat  = ggml_reshape_2d(ctx, x, n*hc, nt);
+        ggml_tensor * mixes = ggml_add(ctx, ggml_mul_mat(ctx, fn, ggml_rms_norm(ctx, flat, 1e-6f)), base);
+        sg = ggml_sigmoid(ctx, ggml_view_2d(ctx, mixes, 2*hc, nt, mixes->nb[1], 0));
+        ggml_tensor * pre  = ggml_view_2d(ctx, sg, hc, nt, sg->nb[1], 0);
+        ggml_tensor * post = ggml_view_2d(ctx, sg, hc, nt, sg->nb[1], hc*sg->nb[0]);
+        y = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_dsv4_hc_pre(ctx, x, pre), 1e-5f), w);
+
+        ggml_tensor * K  = ggml_view_2d(ctx, chart, nmix, hc2, nmix*chart->nb[0], 0);
+        ggml_tensor * r  = ggml_view_1d(ctx, chart, hc2, nmix*hc2*chart->nb[0]);
+        ggml_tensor * c0 = ggml_view_2d(ctx, chart, hc, hc, hc*chart->nb[0], (nmix*hc2 + hc2)*chart->nb[0]);
+        ggml_tensor * e   = ggml_mul_mat(ctx, K, mixes);
+        ggml_tensor * rho = ggml_pool_1d(ctx, ggml_mul(ctx, e, r), GGML_OP_POOL_MAX, hc2, hc2, 0);
+        rho = ggml_reshape_3d(ctx, ggml_scale_bias(ctx, rho, 1.0f, 1.0f), 1, 1, nt);
+        comb = ggml_add(ctx, ggml_div(ctx, ggml_reshape_3d(ctx, e, hc, hc, nt), rho), c0);
+
+        // the outputs are read after the selector, as in the model (post and comb by hc_post, y by the layer); the first
+        // reader takes comb and y, so the graph has the selector's nodes in one run (no graph optimization here)
+        ggml_tensor * out = ggml_add(ctx, ggml_view_1d(ctx, comb, 1, 0), ggml_view_1d(ctx, y, 1, 0));
+        out = ggml_add(ctx, out, ggml_view_1d(ctx, post, 1, 0));
+        // x is read after the selector too (the hc_post residual)
+        return tail ? ggml_add(ctx, out, ggml_view_1d(ctx, xt, 1, 0)) : out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            // a small chart keeps rho = 1 + max(e * r) away from 0, like the folded chart (max(e * r) >= 0)
+            init_tensor_uniform(t, strcmp(t->name, "chart") == 0 ? -0.1f : -1.0f, strcmp(t->name, "chart") == 0 ? 0.1f : 1.0f);
+        }
+    }
+};
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -13429,6 +13503,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    // mHC selector (Raon-1 nano): decode, speculative verify and prefill token counts
+    for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int64_t nt : { 1, 2, 3, 4, 8, 9, 33 }) {
+            test_cases.emplace_back(new test_hc_select(t, 1536, 4, 17, nt));
+        }
+        test_cases.emplace_back(new test_hc_select(t, 256, 4, 17, 2));
+        for (int64_t nt : { 1, 2, 4, 8 }) {
+            test_cases.emplace_back(new test_hc_select(t, 1536, 4, 17, nt, true));
+        }
+    }
     // MLA decode and speculative verify (Raon-1 nano: 32 query heads on one latent head, F16 cache that holds V as a sub-view
     // of K), 1 to 8 query tokens, cache lengths around the split sizes (4100: an odd number of splits)
     for (int nb : { 1, 2, 3, 4, 8 }) {
