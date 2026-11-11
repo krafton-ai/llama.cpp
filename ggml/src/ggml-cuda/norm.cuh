@@ -18,3 +18,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// MUL(MUL(RMS_NORM(x), w), unary(g)) with w broadcast along the rows of x and unary SIGMOID or SILU (a gated RMS norm)
+void ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_w,
+                                    ggml_tensor * gate, ggml_tensor * mul_out);

@@ -823,3 +823,69 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// one warp per row
+template <bool gate_silu>
+static __global__ void rms_norm_mul_gate_f32(
+        const float * x, const float * w, const float * g, float * dst, const int ncols, const int64_t nrows,
+        const int ne1, const int ne2, const int64_t sx1, const int64_t sx2, const int64_t sx3,
+        const int64_t sg1, const int64_t sg2, const int64_t sg3, const float eps) {
+    const int64_t row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y;
+    if (row >= nrows) {
+        return;
+    }
+    const int64_t i1 = row % ne1;
+    const int64_t i2 = (row / ne1) % ne2;
+    const int64_t i3 = row / ((int64_t) ne1*ne2);
+
+    const float * xr = x + i1*sx1 + i2*sx2 + i3*sx3;
+    const float * gr = g + i1*sg1 + i2*sg2 + i3*sg3;
+    float       * yr = dst + row*ncols;
+
+    float sum = 0.0f;
+    for (int col = threadIdx.x; col < ncols; col += WARP_SIZE) {
+        sum += xr[col]*xr[col];
+    }
+    sum = warp_reduce_sum(sum);
+    const float scale = rsqrtf(sum/ncols + eps);
+
+    for (int col = threadIdx.x; col < ncols; col += WARP_SIZE) {
+        const float gv   = gr[col];
+        const float gate = gate_silu ? gv/(1.0f + expf(-gv)) : 1.0f/(1.0f + expf(-gv));
+        yr[col] = (scale*xr[col])*w[col]*gate;
+    }
+}
+
+void ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_w,
+                                    ggml_tensor * gate, ggml_tensor * mul_out) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul_w->src[0] == rms_norm ? mul_w->src[1] : mul_w->src[0];
+    const ggml_tensor * g = gate->src[0];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && mul_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && g->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(w) && ggml_is_contiguous(mul_out));
+    GGML_ASSERT(ggml_are_same_shape(x, g) && ggml_are_same_shape(x, mul_out) && w->ne[0] == x->ne[0]);
+
+    const float eps = ggml_get_op_params_f32(rms_norm, 0);
+    const bool  gate_silu = ggml_get_unary_op(gate) == GGML_UNARY_OP_SILU;
+    GGML_ASSERT(gate_silu || ggml_get_unary_op(gate) == GGML_UNARY_OP_SIGMOID);
+
+    constexpr int rows_per_block = 4;
+    const int64_t nrows = ggml_nrows(x);
+    const dim3 blocks((nrows + rows_per_block - 1) / rows_per_block, 1, 1);
+    const dim3 threads(WARP_SIZE, rows_per_block, 1);
+
+    auto launch = [&](auto kernel) {
+        kernel<<<blocks, threads, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) w->data, (const float *) g->data, (float *) mul_out->data,
+            (int) x->ne[0], nrows, (int) x->ne[1], (int) x->ne[2],
+            x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float),
+            g->nb[1]/sizeof(float), g->nb[2]/sizeof(float), g->nb[3]/sizeof(float), eps);
+    };
+    if (gate_silu) {
+        launch(rms_norm_mul_gate_f32<true>);
+    } else {
+        launch(rms_norm_mul_gate_f32<false>);
+    }
+}

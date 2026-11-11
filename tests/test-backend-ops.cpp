@@ -5480,6 +5480,229 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// A gated delta net layer with a conv state for one sequence, built with the same calls in the same order as
+// llm_build_delta_net_base (build_rs, build_conv_state, build_recurrent_attn with the fused gated delta net) and the
+// RDA layer of Raon-1 nano (build_rda_layer) emit it: q | k | v | g projection, conv + SiLU, L2 norm of q | k, decay
+// gate lower * sigmoid(f_b(f_a(x)) + dt), beta = sigmoid(b), v scaled by sigmoid(b + d) / sigmoid(b), gated RMS norm
+// of the output. n_rs_seq > 0 keeps rollback snapshots (as with speculative decoding). Covers the fusions of the
+// recurrent state rows, the conv state update, the gates and the gated norm
+struct test_delta_net_layer : public test_case {
+    const int64_t n_embd;
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t rank;
+    const int64_t n_tokens;
+    const int64_t d_conv;
+    const int     n_rs_seq;
+    const int     cell_src; // cell the state of the sequence is read from
+    const int     cell_dst; // cell the new state is written to (kv_head)
+
+    static constexpr int64_t mem_size = 4;
+
+    std::vector<ggml_tensor *> checked;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DELTA_NET_LAYER";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR9(n_embd, head_dim, n_head, rank, n_tokens, d_conv, n_rs_seq, cell_src, cell_dst);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+
+    // a whole layer: the CUDA gated delta net over a few tokens differs from the CPU by up to ~1e-5 NMSE on Ampere even
+    // without fusion
+    double max_nmse_err() override { return 5e-5; }
+
+    test_delta_net_layer(int64_t n_embd = 256, int64_t head_dim = 128, int64_t n_head = 4, int64_t rank = 32,
+            int64_t n_tokens = 1, int64_t d_conv = 4, int n_rs_seq = 0, int cell_src = 1, int cell_dst = 1)
+        : n_embd(n_embd), head_dim(head_dim), n_head(n_head), rank(rank), n_tokens(n_tokens), d_conv(d_conv),
+          n_rs_seq(n_rs_seq), cell_src(cell_src), cell_dst(cell_dst) {}
+
+    void expand(ggml_tensor * t) {
+        if (mode == MODE_TEST && gf != nullptr) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+
+    // llm_graph_context::build_rs for one sequence (n_rs == n_seqs == 1), no cell to clear
+    ggml_tensor * build_rs(ggml_context * ctx, ggml_tensor * s, ggml_tensor * s_copy, int64_t state_size) {
+        const int64_t n_rs = 1, n_seqs = 1, rs_head = cell_dst, i0 = 0;
+        const int32_t rs_zero = -1;
+
+        ggml_tensor * states = ggml_reshape_2d(ctx, s, state_size, s->ne[1]);
+        ggml_tensor * state_zero = ggml_view_1d(ctx, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        expand(ggml_scale_inplace(ctx, state_zero, 0));
+
+        ggml_tensor * states_all    = ggml_get_rows(ctx, states, s_copy);
+        ggml_tensor * output_states = ggml_view_2d(ctx, states_all, state_size, n_seqs, states_all->nb[1], 0);
+        expand(output_states);
+
+        ggml_tensor * states_extra = ggml_view_2d(ctx, states_all, state_size, n_rs - n_seqs, states_all->nb[1], (n_seqs - i0)*states_all->nb[1]);
+        expand(ggml_cpy(ctx, states_extra, ggml_view_2d(ctx, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+
+        return output_states;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+
+        const int64_t d_inner  = head_dim*n_head;
+        const int64_t conv_ch  = 3*d_inner;
+        const int64_t n_embd_r = (d_conv - 1)*conv_ch;
+        const int64_t n_embd_s = head_dim*head_dim*n_head;
+        const int64_t K        = n_rs_seq + 1;
+        const int64_t n_seqs   = 1;
+        const int64_t n_seq_tokens = n_tokens;
+        const int64_t kv_head  = cell_dst;
+
+        ggml_tensor * cur      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * wqkv     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 4*d_inner);
+        ggml_tensor * conv1d   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, conv_ch);
+        ggml_tensor * ssm_f_a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, rank + 2*n_head);
+        ggml_tensor * ssm_f_b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, d_inner);
+        ggml_tensor * ssm_dt_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d_inner);
+        ggml_tensor * o_norm   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor * wo       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, n_embd);
+        ggml_tensor * conv_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_r, mem_size*K);
+        ggml_tensor * ssm_all  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, mem_size*K);
+        ggml_tensor * s_copy   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(wqkv, "wqkv");
+        ggml_set_name(conv1d, "conv1d");
+        ggml_set_name(ssm_f_a, "ssm_f_a");
+        ggml_set_name(ssm_f_b, "ssm_f_b");
+        ggml_set_name(ssm_dt_b, "ssm_dt_b");
+        ggml_set_name(o_norm, "ssm_o_norm");
+        ggml_set_name(wo, "wo");
+        ggml_set_name(conv_all, "conv_cache");
+        ggml_set_name(ssm_all, "ssm_cache");
+        ggml_set_name(s_copy, "s_copy");
+
+        // build_rda_layer
+        ggml_tensor * qkvg = ggml_mul_mat(ctx, wqkv, cur);
+        ggml_tensor * qkv  = ggml_view_3d(ctx, qkvg, 3*d_inner, n_seq_tokens, n_seqs, qkvg->nb[1], qkvg->nb[1]*n_seq_tokens, 0);
+
+        // build_conv_state
+        ggml_tensor * conv_states = build_rs(ctx, conv_all, s_copy, n_embd_r);
+        conv_states = ggml_reshape_3d(ctx, conv_states, d_conv - 1, conv_ch, n_seqs);
+        ggml_tensor * qkv_mixed  = ggml_transpose(ctx, qkv);
+        ggml_tensor * conv_input = ggml_concat(ctx, conv_states, qkv_mixed, 0);
+        const size_t row_size = ggml_row_size(conv_all->type, n_embd_r);
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+            const int64_t s_slot = K - t;
+            ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, conv_ch, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, s_idx));
+            ggml_tensor * update = ggml_view_2d(ctx, conv_all, n_embd_r, n_seqs, conv_all->nb[1], (s_slot*mem_size + kv_head)*row_size);
+            ggml_tensor * cpy = ggml_cpy(ctx, last, update);
+            expand(cpy);
+            checked.push_back(cpy);
+        }
+
+        ggml_tensor * conv = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, conv1d));
+        const size_t nb1 = ggml_row_size(conv->type, 3*d_inner);
+        ggml_tensor * qk = ggml_l2_norm(ctx, ggml_view_4d(ctx, conv, head_dim, 2*n_head, n_seq_tokens, n_seqs,
+                ggml_row_size(conv->type, head_dim), nb1, nb1*n_seq_tokens, 0), 1e-6f);
+        ggml_tensor * Qcur = ggml_view_4d(ctx, qk, head_dim, n_head, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3], 0);
+        ggml_tensor * Kcur = ggml_view_4d(ctx, qk, head_dim, n_head, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3], n_head*qk->nb[1]);
+        ggml_tensor * Vcur = ggml_view_4d(ctx, conv, head_dim, n_head, n_seq_tokens, n_seqs,
+                ggml_row_size(conv->type, head_dim), nb1, nb1*n_seq_tokens, 2*ggml_row_size(conv->type, d_inner));
+        checked.push_back(conv);
+        checked.push_back(qk);
+
+        ggml_tensor * fab = ggml_mul_mat(ctx, ssm_f_a, cur);
+        ggml_tensor * f_a = ggml_view_2d(ctx, fab, rank, n_tokens, fab->nb[1], 0);
+
+        ggml_tensor * g1 = ggml_add(ctx, ggml_mul_mat(ctx, ssm_f_b, f_a), ssm_dt_b);
+        g1 = ggml_scale(ctx, ggml_sigmoid(ctx, g1), -5.0f);
+        checked.push_back(g1);
+        g1 = ggml_reshape_4d(ctx, g1, head_dim, n_head, n_seq_tokens, n_seqs);
+
+        ggml_tensor * beta  = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, n_head, n_tokens, fab->nb[1], rank*fab->nb[0]));
+        ggml_tensor * write = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, n_head, n_tokens, fab->nb[1], (rank + n_head)*fab->nb[0]));
+        ggml_tensor * ratio = ggml_reshape_4d(ctx, ggml_div(ctx, write, beta), 1, n_head, n_seq_tokens, n_seqs);
+        Vcur = ggml_mul(ctx, Vcur, ratio);
+        checked.push_back(beta);
+        checked.push_back(Vcur);
+        beta = ggml_reshape_4d(ctx, beta, 1, n_head, n_seq_tokens, n_seqs);
+
+        ggml_tensor * g2 = ggml_view_3d(ctx, qkvg, head_dim, n_head, n_tokens,
+                ggml_row_size(qkvg->type, head_dim), qkvg->nb[1], 3*ggml_row_size(qkvg->type, d_inner));
+
+        ggml_tensor * state = build_rs(ctx, ssm_all, s_copy, n_embd_s);
+        state = ggml_reshape_4d(ctx, state, head_dim, head_dim, n_head, n_seqs);
+
+        // build_recurrent_attn with the fused gated delta net
+        const int64_t S_v = head_dim, H_v = n_head;
+        ggml_tensor * output;
+        if (n_rs_seq == 0) {
+            ggml_tensor * result = ggml_gated_delta_net(ctx, Qcur, Kcur, Vcur, g1, beta, state, 1);
+            output = ggml_view_4d(ctx, result, S_v, H_v, n_tokens, n_seqs,
+                    ggml_row_size(result->type, S_v), ggml_row_size(result->type, S_v*H_v),
+                    ggml_row_size(result->type, S_v*H_v*n_tokens), 0);
+            ggml_tensor * new_state = ggml_view_4d(ctx, result, S_v, S_v, H_v, n_seqs,
+                    ggml_row_size(result->type, S_v), ggml_row_size(result->type, S_v*S_v),
+                    ggml_row_size(result->type, S_v*S_v*H_v), ggml_row_size(result->type, S_v*H_v*n_tokens*n_seqs));
+            ggml_tensor * cpy = ggml_cpy(ctx, new_state,
+                    ggml_view_2d(ctx, ssm_all, n_embd_s, n_seqs, ssm_all->nb[1], kv_head*n_embd_s*ggml_element_size(ssm_all)));
+            expand(cpy);
+            checked.push_back(cpy);
+        } else {
+            const int64_t D = S_v*S_v*H_v;
+            ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, Qcur, Kcur, Vcur, g1, beta, state, K);
+            output = ggml_view_4d(ctx, gdn_out, S_v, H_v, n_seq_tokens, n_seqs,
+                    ggml_row_size(gdn_out->type, S_v), ggml_row_size(gdn_out->type, S_v*H_v),
+                    ggml_row_size(gdn_out->type, S_v*H_v*n_seq_tokens), 0);
+            const size_t  ssm_row_size = n_embd_s*ggml_element_size(ssm_all);
+            const int64_t n_written    = std::min<int64_t>(n_seq_tokens, K);
+            ggml_tensor * src = ggml_view_3d(ctx, gdn_out, D, n_seqs, n_written,
+                    ggml_row_size(gdn_out->type, D), ggml_row_size(gdn_out->type, S_v*S_v*H_v*n_seqs),
+                    ggml_row_size(gdn_out->type, S_v*H_v*n_seq_tokens*n_seqs));
+            ggml_tensor * dst = ggml_view_3d(ctx, ssm_all, D, n_seqs, n_written, ssm_all->nb[1],
+                    (size_t) mem_size*ssm_row_size, (size_t) kv_head*ssm_row_size);
+            ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+            expand(cpy);
+            checked.push_back(cpy);
+        }
+        output = ggml_is_contiguous(output) ? output : ggml_cont(ctx, output);
+
+        // RMSNorm(o) * sigmoid(g2)
+        ggml_tensor * o = ggml_reshape_3d(ctx, output, head_dim, n_head, n_tokens);
+        ggml_tensor * gated = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, 1e-6f), o_norm), ggml_sigmoid(ctx, g2));
+        checked.push_back(gated);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, wo, ggml_reshape_2d(ctx, gated, d_inner, n_tokens));
+        ggml_set_name(out, "out");
+        checked.push_back(out);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const std::string name = t->name;
+            if (name == "s_copy") {
+                const int32_t row = cell_src;
+                ggml_backend_tensor_set(t, &row, 0, sizeof(row));
+            } else if (name == "cur" || name == "ssm_dt_b" || name == "conv_cache" || name == "ssm_cache") {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (name == "ssm_o_norm") {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (name == "conv1d") {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            } else if (t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -13277,6 +13500,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // f16 x f32 GEMM with a src1 of 8192 columns
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 8192, 576, {1, 1}, {1, 1}));
+
+    // gated delta net layer with conv state (Raon-1 nano RDA layer order): decode, speculative verify, prefill
+    //                                              n_embd hd  nh rank  T  dc rs src dst
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,   1, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,   1, 4, 0, 0, 2));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,   1, 4, 2, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,   3, 4, 2, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,   7, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,   7, 4, 3, 2, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,  33, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32, 512, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer(1536, 128, 16, 64,   1, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer(1536, 128, 16, 64,   7, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256,  64,  4, 32,   1, 3, 0, 1, 1));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

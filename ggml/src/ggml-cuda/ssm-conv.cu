@@ -204,3 +204,107 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// one thread per channel; with fuse_l2 one block per L2 row of the output. The thread reads the old state of its
+// channel before it writes any copy, so the cache row it reads may be one that it writes
+template <int nc, bool fuse_l2>
+static __global__ void conv_state_f32(const ggml_cuda_conv_state_args a) {
+    const int64_t c     = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const bool    valid = c < a.n_ch;
+
+    const float * state = a.state;
+    if (a.state_row != nullptr) {
+        state += (int64_t) a.state_row[0]*a.state_row_stride;
+    }
+
+    float st[nc - 1];
+    float w[nc];
+#pragma unroll
+    for (int j = 0; j < nc - 1; ++j) {
+        st[j] = valid ? state[c*a.state_stride_c + j] : 0.0f;
+    }
+#pragma unroll
+    for (int j = 0; j < nc; ++j) {
+        w[j] = valid ? a.w[c*a.w_stride_c + j] : 0.0f;
+    }
+
+    float win[nc];
+#pragma unroll
+    for (int j = 0; j < nc - 1; ++j) {
+        win[j] = st[j];
+    }
+
+    for (int t = 0; t < a.n_t; ++t) {
+        win[nc - 1] = valid ? a.x[t*a.x_stride_t + c*a.x_stride_c] : 0.0f;
+
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < nc; ++j) {
+            sumf += win[j]*w[j];
+        }
+        const float out = ggml_cuda_op_silu_single(sumf);
+        if (valid) {
+            a.y[t*a.y_stride_t + c] = out;
+        }
+
+        if constexpr (fuse_l2) {
+            __shared__ float s_sum[32];
+            if ((int64_t) blockIdx.x*blockDim.x < a.l2_nc) { // the same for the whole block
+                float sum = warp_reduce_sum(valid ? out*out : 0.0f);
+                if (threadIdx.x % WARP_SIZE == 0) {
+                    s_sum[threadIdx.x / WARP_SIZE] = sum;
+                }
+                __syncthreads();
+                const int lane = threadIdx.x % WARP_SIZE;
+                sum = lane < (int) (blockDim.x / WARP_SIZE) ? s_sum[lane] : 0.0f;
+                sum = warp_reduce_sum(sum);
+                __syncthreads();
+                if (valid) {
+                    a.y_l2[t*a.y_l2_stride_t + c] = out*rsqrtf(fmaxf(sum, a.l2_eps*a.l2_eps));
+                }
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < nc - 1; ++j) {
+            win[j] = win[j + 1];
+        }
+    }
+
+    if (!valid) {
+        return;
+    }
+    for (int k = 0; k < a.n_copies; ++k) {
+#pragma unroll
+        for (int j = 0; j < nc - 1; ++j) {
+            const int p = a.copy_start[k] + j;
+            a.copy_dst[k][c*(nc - 1) + j] = p < nc - 1 ? st[p] : a.x[(p - (nc - 1))*a.x_stride_t + c*a.x_stride_c];
+        }
+    }
+}
+
+void ggml_cuda_op_conv_state(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state_args & args) {
+    const bool fuse_l2 = args.y_l2 != nullptr;
+    GGML_ASSERT(!fuse_l2 || (args.l2_n % WARP_SIZE == 0 && args.l2_n <= 32*WARP_SIZE));
+
+    const int    threads = fuse_l2 ? args.l2_n : 128;
+    const dim3   blocks((args.n_ch + threads - 1) / threads, 1, 1);
+    cudaStream_t stream  = ctx.stream();
+
+    auto launch = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        if (fuse_l2) {
+            conv_state_f32<kNC, true><<<blocks, threads, 0, stream>>>(args);
+        } else {
+            conv_state_f32<kNC, false><<<blocks, threads, 0, stream>>>(args);
+        }
+    };
+
+    switch (args.nc) {
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        default: GGML_ABORT("unsupported conv width %d", args.nc);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
