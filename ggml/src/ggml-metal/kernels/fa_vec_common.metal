@@ -624,7 +624,7 @@ kernel void kernel_flash_attn_ext_vec(
                 continue;
             }
 
-            const int64_t rid = iq3*args.ne2*args.ne1 + iq2 + iq1_q*args.ne1;
+            const int64_t rid = iq3*args.ne2*args.ne1 + (int64_t) iq2*args.rs2 + (int64_t) iq1_q*args.rs1;
 
             const float Sval = NWG == 1 ? (ss[2*qq + 0] == 0.0f ? 0.0f : 1.0f/ss[2*qq + 0]) : 1.0f;
 

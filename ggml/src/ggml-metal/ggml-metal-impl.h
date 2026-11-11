@@ -445,6 +445,8 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  rs1; // output row of query row i1 and head i2: i3*ne2*ne1 + i2*rs2 + i1*rs1
+    int32_t  rs2;
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {
@@ -481,6 +483,8 @@ typedef struct {
     int32_t  n_head_log2;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
+    int32_t  rs1; // as in ggml_metal_kargs_flash_attn_ext
+    int32_t  rs2;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {

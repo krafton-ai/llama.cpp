@@ -3122,6 +3122,58 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// flash attention with one K/V head, several query heads and few query tokens (MLA decode and speculative verify):
+// the heads go in as query rows and the tokens as heads, so that a threadgroup of query rows reads each K/V block once
+// for several heads instead of once per head. The mask then has a zero row stride and one row per token (its rows
+// broadcast over the heads), and the kernels write head h of token t to output row t*n_head + h (rid strides).
+// The view keeps the data pointers; it is used for the dispatch and for the extra buffer sizes alike
+struct ggml_metal_fa_rows {
+    ggml_tensor op_v;
+    ggml_tensor q_v;
+    ggml_tensor m_v;
+    const ggml_tensor * op;
+    bool on = false;
+
+    explicit ggml_metal_fa_rows(const ggml_tensor * src) : op(src) {
+        const ggml_tensor * q = src->src[0];
+        const ggml_tensor * k = src->src[1];
+        const ggml_tensor * m = src->src[3];
+
+        float max_bias;
+        memcpy(&max_bias, (const int32_t *) src->op_params + 1, sizeof(max_bias));
+
+        if (k->ne[2] != 1 || q->ne[2] <= 1 || q->ne[2] > 256 || q->ne[1] > 8 || max_bias != 0.0f || src->src[4] != nullptr) {
+            return;
+        }
+        if (m && m->ne[2] != 1) {
+            return;
+        }
+
+        op_v = *src;
+        q_v  = *q;
+        q_v.ne[1] = q->ne[2];
+        q_v.ne[2] = q->ne[1];
+        q_v.nb[1] = q->nb[2];
+        q_v.nb[2] = q->nb[1];
+        op_v.src[0] = &q_v;
+
+        if (m) {
+            m_v = *m;
+            m_v.ne[1] = q->ne[2];
+            m_v.nb[1] = 0;
+            m_v.ne[2] = q->ne[1];
+            m_v.nb[2] = m->nb[1];
+            op_v.src[3] = &m_v;
+        }
+
+        op = &op_v;
+        on = true;
+    }
+
+    ggml_metal_fa_rows(const ggml_metal_fa_rows &) = delete;
+    ggml_metal_fa_rows & operator=(const ggml_metal_fa_rows &) = delete;
+};
+
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -3284,6 +3336,9 @@ static size_t ggml_metal_op_flash_attn_ext_kv_f16_k_size(const ggml_tensor * op)
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
+    const ggml_metal_fa_rows fa_rows(op);
+    op = fa_rows.op;
+
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -3342,6 +3397,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
+    const ggml_metal_fa_rows fa_rows(op);
+    op = fa_rows.op;
+
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
   //GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
   //GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -3380,6 +3438,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
 
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const ggml_metal_fa_rows fa_rows(op);
+    op = fa_rows.op;
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
@@ -3436,6 +3497,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_idx(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
+    const ggml_metal_fa_rows fa_rows(op);
+    op = fa_rows.op;
+
     GGML_TENSOR_LOCALS( int32_t, ne3, op->src[3], ne);
 
     const int n_kv_max = ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op);
@@ -3450,7 +3514,8 @@ size_t ggml_metal_op_flash_attn_ext_extra_idx(const ggml_tensor * op) {
 }
 
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op = ctx->node(idx);
+    const ggml_metal_fa_rows fa_rows(ctx->node(idx));
+    const ggml_tensor * op = fa_rows.op;
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -3708,6 +3773,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.m1            =*/ m1,
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
+            /*.rs1           =*/ fa_rows.on ? 1   : ne1,
+            /*.rs2           =*/ fa_rows.on ? ne1 : 1,
         };
 
         // shared memory layout: queries (16-bit), scores (float), probabilities (16-bit), row scale (float), rescale flag (int)
@@ -3885,6 +3952,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.m1            =*/ m1,
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
+            /*.rs1           =*/ fa_rows.on ? 1   : ne1,
+            /*.rs2           =*/ fa_rows.on ? ne1 : 1,
         };
 
         // few query blocks over a long cache (e.g. MLA decode with the heads as query rows): split the cache over
@@ -4129,6 +4198,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
             /*.n_kv_max_padded =*/ n_kv_max_padded,
+            /*.rs1           =*/ fa_rows.on ? 1   : ne1,
+            /*.rs2           =*/ fa_rows.on ? ne1 : 1,
         };
 
         auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);

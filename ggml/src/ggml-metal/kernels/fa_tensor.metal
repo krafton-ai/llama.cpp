@@ -272,9 +272,9 @@ kernel void kernel_flash_attn_ext_tensor(
     }
 
     // store to global memory - rows past ne01 are clipped by the tensor extents
-    device float * pdst = (device float *) dst + ((uint64_t) iq3*args.ne2*args.ne1 + iq2 + (uint64_t) iq1*args.ne1)*DV;
+    device float * pdst = (device float *) dst + ((uint64_t) iq3*args.ne2*args.ne1 + (uint64_t) iq2*args.rs2 + (uint64_t) iq1*args.rs1)*DV;
 
-    auto td = tensor(pdst, dextents<int32_t, 2>(DV, args.ne01 - iq1), array<int, 2>({1, args.ne1*DV}));
+    auto td = tensor(pdst, dextents<int32_t, 2>(DV, args.ne01 - iq1), array<int, 2>({1, args.rs1*DV}));
 
     co.store(td);
 }

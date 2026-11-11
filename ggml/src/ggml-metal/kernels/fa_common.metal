@@ -708,7 +708,7 @@ void kernel_flash_attn_ext_impl(
                     const short c  = 8*sgitg + ii*8*NSG + el%8;
 
                     if (iq1 + j < args.ne01 && c < DV) {
-                        const uint64_t rid = (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
+                        const uint64_t rid = (uint64_t)iq3*args.ne2*args.ne1 + (uint64_t)iq2*args.rs2 + (uint64_t)(iq1 + j)*args.rs1;
 
                         if (NWG > 1) {
                             dstf[4*(rid*DV4*NWG + NWG*(c/4) + iwg) + c%4] = sc[el];
@@ -735,7 +735,7 @@ void kernel_flash_attn_ext_impl(
                     break;
                 }
 
-                const uint64_t rid = (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
+                const uint64_t rid = (uint64_t)iq3*args.ne2*args.ne1 + (uint64_t)iq2*args.rs2 + (uint64_t)(iq1 + j)*args.rs1;
 
                 if (tiisg == 0) {
                     dst1[rid*(2*NWG) + 2*iwg + 0] = S[jj];
@@ -761,7 +761,7 @@ void kernel_flash_attn_ext_impl(
                 break;
             }
 
-            const uint64_t rid = (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
+            const uint64_t rid = (uint64_t)iq3*args.ne2*args.ne1 + (uint64_t)iq2*args.rs2 + (uint64_t)(iq1 + j)*args.rs1;
 
             for (short i = tiisg; i < DV4; i += NW) {
                 dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[j*PV4 + i];
@@ -782,7 +782,7 @@ void kernel_flash_attn_ext_impl(
             break;
         }
 
-        device float4 * dst4 = (device float4 *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1)*DV4;
+        device float4 * dst4 = (device float4 *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + (uint64_t)iq2*args.rs2 + (uint64_t)(iq1 + j)*args.rs1)*DV4;
 
         const float scale = S[jj] == 0.0 ? 0.0f : 1.0f/S[jj];
 
