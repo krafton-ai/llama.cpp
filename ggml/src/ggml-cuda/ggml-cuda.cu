@@ -6164,6 +6164,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 GGML_LOG_DEBUG("Adding stream at node %s %p\n", root_node->name, root_node);
                 concurrent_node_ranges.emplace_back(fork_node_idx, join_node_idx);
 
+                // the branches run at the same time, so no tensor of the region may be freed (and its memory reused by
+                // a node of another branch) before the join. Interleaving alone does not guarantee this: a short branch
+                // can finish early in graph order and its buffers be reused while another stream still reads them
+                add_alloc_deps(fork_node_idx + 1, join_node_idx);
+
                 // interleave tensors to extend lifetimes so that ggml graph doesn't recycle them
                 // example transformation:
                 // [attn-norm, QMul, QNorm, QRope, KMul, KNorm, KRope, VMul, attn] ->
