@@ -603,3 +603,67 @@ kernel void kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_j64(
     }
 }
 #endif  // NCOL_SPLIT_VARIANTS
+
+#ifdef NCOL_SPLIT_NORM
+// The 8-head vector-P split variant that also divides P by the softmax row sums (the softmax then only
+// writes exp(x - max) and the sums).
+kernel void kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_norm(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D,
+        global const float * sums) {
+    local float Pl[64][12];
+    const int lane = get_local_id(0);
+    const int head0 = (get_group_id(0) % 4) * 8;
+    const int d = 2 * ((get_group_id(0) / 4) * 64 + lane);
+    const int split = get_group_id(1);
+    const int j0 = 256 * split;
+    float8 even[1] = { 0 }, odd[1] = { 0 };
+    for (int strip = 0; strip < 256; strip += 64) {
+        const int left = clamp(J - j0 - strip, 0, 64);
+        const int row = (lane % 16) * 4;
+        for (int h = lane / 16; h < 8; h += 4) {
+            const global float * weights = (global const float *) (p + offp + (ulong) (head0 + h) * nbp1);
+            float4 w = vload4(0, weights + j0 + strip + row) / sums[head0 + h];
+            Pl[row][h] = w.s0;
+            Pl[row + 1][h] = w.s1;
+            Pl[row + 2][h] = w.s2;
+            Pl[row + 3][h] = w.s3;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        // The selector only admits full 256-key splits.
+        for (int u = 0; u < left; u += 4) {
+            float2 values[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const global half * ptr = (global const half *) (v + offv + (ulong) (j0 + strip + u + i) * nbvj) + d;
+                values[i] = vload_half2(0, ptr);
+            }
+#pragma unroll
+            for (int h8 = 0; h8 < 1; ++h8) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float8 w = vload8(h8, &Pl[u + i][0]);
+                    even[h8] = mad((float8) values[i].x, w, even[h8]);
+                    odd[h8] = mad((float8) values[i].y, w, odd[h8]);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    global float * out = part + ((ulong) split * 32 + head0) * D + d;
+#pragma unroll
+    for (int h8 = 0; h8 < 1; ++h8) {
+        global float * out_odd = out + 1;
+        NCOL_STORE8(even[h8], out, D)
+        NCOL_STORE8(odd[h8], out_odd, D)
+        out += 8 * D;
+    }
+}
+#endif  // NCOL_SPLIT_NORM

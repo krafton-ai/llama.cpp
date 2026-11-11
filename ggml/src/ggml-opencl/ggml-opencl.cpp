@@ -873,6 +873,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16t_f32_ncol_split             = nullptr;
     cl_kernel kernel_mul_mat_ncol_split_reduce               = nullptr;
     cl_kernel kernel_mul_mat_f16t_f32_ncol_split_var[NCOL_SPLIT_COUNT] = {};
+    cl_kernel kernel_mul_mat_f16t_f32_ncol_split_norm        = nullptr;
+    cl_kernel kernel_soft_max_4_exp_sum                      = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2                 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576            = nullptr;
     cl_kernel kernel_mul_mat_ncol_pack_q                     = nullptr;
@@ -882,6 +884,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img  = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2 = nullptr;
     ggml_cl_buffer prealloc_ncol_part;      // the split partial sums of kernel_mul_mat_f16t_f32_ncol_split
+    ggml_cl_buffer prealloc_soft_max_sums;  // the softmax row sums for kernel_mul_mat_f16t_f32_ncol_split_norm
+    std::mutex     soft_max_sums_mutex;
     ggml_cl_buffer ncol_q_packed;           // q as half [576][32] for the _pq variants
     cl_mem         ncol_q_packed_image       = nullptr;
     bool           ncol_q_packed_image_tried = false;
@@ -1354,6 +1358,8 @@ struct ggml_backend_opencl_context {
     // the optional decode attention kernels (kernels/mul_mat_f16_f32_ncol*.cl) and the packed q image
     void release_ncol_kernels() {
         cl_kernel * kernels[] = {
+            &kernel_soft_max_4_exp_sum,
+            &kernel_mul_mat_f16t_f32_ncol_split_norm,
             &kernel_mul_mat_ncol_pack_q,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img,
@@ -1706,6 +1712,22 @@ static cl_kernel ggml_cl_create_optional_kernel(ggml_backend_opencl_context * ba
     return nullptr;
 }
 
+// builds an optional program (a failed build only logs) and creates its kernel `name`, see above
+static cl_kernel ggml_cl_build_optional_kernel(ggml_backend_opencl_context * backend_ctx,
+                                               const std::string &           src,
+                                               const std::string &           opts,
+                                               const char *                  name,
+                                               size_t                        min_wg) {
+    cl_program prog =
+        build_program_from_source_ex(backend_ctx->context, backend_ctx->device, src.c_str(), opts, false, name);
+    if (!prog) {
+        return nullptr;
+    }
+    cl_kernel kernel = ggml_cl_create_optional_kernel(backend_ctx, prog, name, min_wg);
+    CL_CHECK(clReleaseProgram(prog));
+    return kernel;
+}
+
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     if (backend_ctx->kernels_loaded) {
         return;
@@ -1843,6 +1865,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 CL_CHECK(clReleaseProgram(variants));
             }
         }
+        // the split variant that also divides P by the softmax sums (see ggml_opencl_match_soft_max_ncol_split)
+        backend_ctx->kernel_mul_mat_f16t_f32_ncol_split_norm = ggml_cl_build_optional_kernel(
+            backend_ctx, kernel_src, compile_opts + " -DNCOL_SPLIT_NORM", "kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_norm", 64);
         if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO && backend_ctx->has_subgroup_shuffle) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
             const std::string r2_src {
@@ -3357,6 +3382,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_soft_max_4 = clCreateKernel(backend_ctx->program_softmax_4_f32, "kernel_soft_max_4", &err), err));
+        // softmax that leaves the division to the normalizing PV split (see ggml_cl_soft_max)
+        backend_ctx->kernel_soft_max_4_exp_sum = ggml_cl_build_optional_kernel(
+            backend_ctx, kernel_src, compile_opts + " -DSOFT_MAX_4_EXP_SUM", "kernel_soft_max_4_exp_sum", 64);
         GGML_LOG_CONT(".");
     }
 
@@ -9213,7 +9241,108 @@ static void                ggml_opencl_fused_concat_ssm_conv_silu(ggml_backend_t
                                                                   const ggml_tensor *       cat,
                                                                   const ggml_tensor * const nodes[3]);
 static const ggml_tensor * ggml_opencl_ncol_split_mul_mat_node(const ggml_cgraph * cgraph, int i, size_t max_alloc);
-static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor * cont, ggml_tensor * mm);
+static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor * cont, ggml_tensor * mm, bool norm);
+static void ggml_cl_soft_max_ext(ggml_backend_t      backend,
+                                 const ggml_tensor * src0,
+                                 const ggml_tensor * src1,
+                                 ggml_tensor *       dst,
+                                 bool                exp_sum);
+static bool ggml_cl_buffer_range(ggml_backend_opencl_context * ctx, const ggml_tensor * t, ggml_cl_range & r);
+
+// SOFT_MAX at node index followed by the MUL_MAT of the ncol split (cont, mm) on a long cache: the softmax writes
+// exp(x - max) and the row sums, and the split divides P by the sums
+static bool ggml_opencl_match_soft_max_ncol_split(ggml_backend_opencl_context * ctx,
+                                                  const ggml_cgraph *           graph,
+                                                  int                           index,
+                                                  const ggml_tensor *           cont,
+                                                  const ggml_tensor *           mm) {
+    const ggml_tensor * soft = graph->nodes[index];
+    // the normalizing split replaces the c8_vp variant, which runs only when the variants before it exist
+    const cl_kernel * variants = ctx->kernel_mul_mat_f16t_f32_ncol_split_var;
+    if (!ctx->kernel_soft_max_4_exp_sum || !ctx->kernel_mul_mat_f16t_f32_ncol_split_norm || !variants[NCOL_SPLIT_D2_C16] ||
+        !variants[NCOL_SPLIT_D2_C16_U4] || !variants[NCOL_SPLIT_D2_C8_U4] || !variants[NCOL_SPLIT_D2_C8_VP] ||
+        ctx->disable_fusion) {
+        return false;
+    }
+    if (!cont || !mm || index + 1 >= graph->n_nodes || graph->nodes[index + 1] != mm) {
+        return false;
+    }
+    if (soft->op != GGML_OP_SOFT_MAX || mm->op != GGML_OP_MUL_MAT || mm->src[0] != cont || mm->src[1] != soft) {
+        return false;
+    }
+    if (cont->op != GGML_OP_CONT || !cont->src[0] || cont->src[0]->op != GGML_OP_TRANSPOSE) {
+        return false;
+    }
+    if (!graph->use_counts || !graph->visited_hash_set.size || !ggml_node_has_n_uses(graph, index, 1)) {
+        return false;
+    }
+    if (!ggml_opencl_only_users(graph, soft, mm, nullptr) || !ggml_opencl_only_users(graph, cont, mm, nullptr)) {
+        return false;
+    }
+    if (soft->src[2] || (soft->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const ggml_tensor * score = soft->src[0];
+    const ggml_tensor * mask  = soft->src[1];
+    const ggml_tensor * v     = cont->src[0];
+    if (!score || !mask || (score->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        !ggml_opencl_only_users(graph, score, soft, nullptr)) {
+        return false;
+    }
+    if (soft->type != GGML_TYPE_F32 || score->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F32 ||
+        v->type != GGML_TYPE_F16 || mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(soft) || !ggml_is_contiguous(score) || !ggml_is_contiguous(mask) ||
+        !ggml_is_contiguous(mm) || !ggml_are_same_shape(score, soft)) {
+        return false;
+    }
+
+    // the cache lengths this path is used for
+    const int64_t n_kv = soft->ne[0];
+    if (n_kv != 65536 && n_kv != 33024) {
+        return false;
+    }
+    if (soft->ne[1] != 1 || soft->ne[2] != 32 || soft->ne[3] != 1) {
+        return false;
+    }
+    if (mask->ne[0] != n_kv || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return false;
+    }
+    if (v->ne[0] != n_kv || v->ne[1] != 512 || v->ne[2] != 1 || v->ne[3] != 1 || v->nb[0] != 1152 || v->nb[1] != 2) {
+        return false;
+    }
+    if (mm->ne[0] != 512 || mm->ne[1] != 1 || mm->ne[2] != 32 || mm->ne[3] != 1) {
+        return false;
+    }
+    // the softmax and the matmul of the same attention layer
+    if (strncmp(soft->name, "kq_soft_max-", 12) != 0 || strncmp(mm->name, "kqv-", 4) != 0 ||
+        strcmp(soft->name + 12, mm->name + 4) != 0) {
+        return false;
+    }
+    if (ggml_get_op_params_f32(soft, 1) != 0.0f) {  // max_bias
+        return false;
+    }
+
+    ggml_cl_range rs, rp, rv, rm, ro;
+    if (!ggml_cl_buffer_range(ctx, score, rs) || !ggml_cl_buffer_range(ctx, soft, rp) ||
+        !ggml_cl_buffer_range(ctx, mask, rm) || !ggml_cl_buffer_range(ctx, v, rv) ||
+        !ggml_cl_buffer_range(ctx, mm, ro)) {
+        return false;
+    }
+    // the softmax runs in place: the scores and the probabilities are the same range
+    const bool in_place = rs.buf == rp.buf && rs.first == rp.first && rs.last == rp.last;
+    return in_place && !ggml_cl_ranges_overlap(rm, rp) && !ggml_cl_ranges_overlap(rv, rp) &&
+           !ggml_cl_ranges_overlap(rm, ro) && !ggml_cl_ranges_overlap(rp, ro) && !ggml_cl_ranges_overlap(rv, ro);
+}
+
+static void ggml_cl_soft_max(ggml_backend_t      backend,
+                             const ggml_tensor * src0,
+                             const ggml_tensor * src1,
+                             ggml_tensor *       dst) {
+    ggml_cl_soft_max_ext(backend, src0, src1, dst, false);
+}
 
 // Fused op chains (kernels/fused_ops.cl): each matcher checks one chain, each runner computes it with one kernel.
 
@@ -10048,8 +10177,21 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 continue;
             }
         }
+        // the sums buffer is shared: another thread on this context takes the unfused path
+        if (node->op == GGML_OP_SOFT_MAX && ncol_split_mm &&
+            ggml_opencl_match_soft_max_ncol_split(backend_ctx, cgraph, i, ncol_split_cont, ncol_split_mm) &&
+            backend_ctx->soft_max_sums_mutex.try_lock()) {
+            backend_ctx->prealloc_soft_max_sums.allocate(backend_ctx->context, 32 * sizeof(float));
+            ggml_cl_soft_max_ext(backend, node->src[0], node->src[1], node, true);
+            ggml_cl_mul_mat_ncol_split(backend, ncol_split_cont, cgraph->nodes[i + 1], true);
+            backend_ctx->soft_max_sums_mutex.unlock();
+            ncol_split_cont = nullptr;
+            ncol_split_mm   = nullptr;
+            ++i;
+            continue;
+        }
         if (node == ncol_split_mm) {
-            ggml_cl_mul_mat_ncol_split(backend, ncol_split_cont, node);
+            ggml_cl_mul_mat_ncol_split(backend, ncol_split_cont, node, false);
             ncol_split_cont = nullptr;
             ncol_split_mm   = nullptr;
             continue;
@@ -25777,7 +25919,8 @@ static bool ggml_cl_ncol_split_ranges_ok(ggml_backend_opencl_context * backend_c
            !ggml_cl_ranges_overlap(rp, rd);
 }
 
-static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor * cont, ggml_tensor * mm) {
+// norm: P is exp(x - max) and prealloc_soft_max_sums holds the row sums (ggml_opencl_match_soft_max_ncol_split)
+static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor * cont, ggml_tensor * mm, bool norm) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     const ggml_tensor *           view        = cont->src[0];
     const ggml_tensor *           p           = mm->src[1];
@@ -25827,7 +25970,10 @@ static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor
 
     {
         cl_kernel kernel = backend_ctx->kernel_mul_mat_f16t_f32_ncol_split;
-        if (short_kv) {
+        if (norm) {
+            GGML_ASSERT(long_kv && long_idx == NCOL_SPLIT_D2_C8_VP);
+            kernel = backend_ctx->kernel_mul_mat_f16t_f32_ncol_split_norm;
+        } else if (short_kv) {
             kernel = variants[short_2304 ? NCOL_SPLIT_D2_C8_VP_J64 : NCOL_SPLIT_D2_C8_VP_J128];
         } else if (long_kv) {
             kernel = variants[long_idx];
@@ -25845,6 +25991,9 @@ static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &D));
         if (!long_kv && !short_kv) {
             CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &JC));
+        }
+        if (norm) {
+            CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &backend_ctx->prealloc_soft_max_sums.buffer));
         }
 
         // the variants take two d per lane; c8 / c16 split the 32 heads over 4 / 2 groups
@@ -31353,7 +31502,12 @@ static void ggml_cl_diag(ggml_backend_t backend, const ggml_tensor * src0, const
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
-static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// exp_sum: write exp(x - max) and the row sums instead of the probabilities (see ggml_opencl_match_soft_max_ncol_split)
+static void ggml_cl_soft_max_ext(ggml_backend_t      backend,
+                                 const ggml_tensor * src0,
+                                 const ggml_tensor * src1,
+                                 ggml_tensor *       dst,
+                                 bool                exp_sum) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
     GGML_ASSERT(dst);
@@ -31449,6 +31603,10 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
         }
     }
 
+    if (exp_sum) {
+        kernel = backend_ctx->kernel_soft_max_4_exp_sum;
+        CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_mem), &backend_ctx->prealloc_soft_max_sums.buffer));
+    }
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
     CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   extra1 ? &extra1->data_device : &extra0->data_device));
