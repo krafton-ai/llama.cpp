@@ -5074,6 +5074,92 @@ struct test_v_gate_fuse : public test_case {
     }
 };
 
+// one-token delta net whose initial state is a GET_ROWS of the state cache and whose final state is copied back into the same
+// cache row (in place), as the recurrent memory builds it at decode. A backend may let the delta net read the cache rows
+// itself (Metal); the attention output and the new cache row are checked.
+struct test_gdn_state_fuse : public test_case {
+    const int64_t head_count, head_size, n_seqs, n_cells;
+    ggml_tensor * attn = nullptr, * cpy = nullptr;
+
+    test_gdn_state_fuse(int64_t head_count = 16, int64_t head_size = 128, int64_t n_seqs = 1, int64_t n_cells = 4)
+        : head_count(head_count), head_size(head_size), n_seqs(n_seqs), n_cells(n_cells) {}
+
+    std::string vars() override { return VARS_TO_STR4(head_count, head_size, n_seqs, n_cells); }
+    std::string op_desc(ggml_tensor *) override { return "GDN_STATE"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { attn, cpy }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S_v = head_size, H = head_count, D = S_v*S_v*H;
+        ggml_tensor * q    = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, n_seqs), 1e-6f);
+        ggml_tensor * k    = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, n_seqs), 1e-6f);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, n_seqs);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, n_seqs);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_cells);
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(cache, "cache");
+        ggml_set_name(ids, "ids");
+        ggml_tensor * state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, cache, ids), S_v, S_v, H, n_seqs);
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        attn = ggml_view_4d(ctx, out, S_v, H, 1, n_seqs, ggml_row_size(out->type, S_v), ggml_row_size(out->type, S_v*H),
+                ggml_row_size(out->type, S_v*H), 0);
+        ggml_tensor * src = ggml_view_3d(ctx, out, D, n_seqs, 1, ggml_row_size(out->type, D), ggml_row_size(out->type, D*n_seqs),
+                ggml_row_size(out->type, S_v*H*n_seqs));
+        // the cells n_cells - n_seqs .. n_cells - 1, the same rows as ids
+        ggml_tensor * dst = ggml_view_3d(ctx, cache, D, n_seqs, 1, cache->nb[1], cache->nb[1]*n_seqs, (n_cells - n_seqs)*cache->nb[1]);
+        cpy = ggml_cpy(ctx, src, dst);
+        return ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, attn)); // the cpy right after the delta net, as in the model
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) {
+                    v[i] = (int32_t) (n_cells - n_seqs + i);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "cache") == 0) {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            } else if (!ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// the one-token conv state of a delta net as llm_build_delta_net_base::build_conv_state builds it: CONCAT(state, x^T), the CPY of
+// its last 3 columns into the cache, then SSM_CONV, SILU and the L2 norm of the q | k heads. A backend may run it as one kernel
+// (Metal); the cache row, the silu output and the norm are checked.
+struct test_conv_state_fuse : public test_case {
+    const int64_t head_size, n_head;
+    ggml_tensor * cpy = nullptr, * silu = nullptr, * qk = nullptr;
+
+    test_conv_state_fuse(int64_t head_size = 128, int64_t n_head = 4) : head_size(head_size), n_head(n_head) {}
+
+    std::string vars() override { return VARS_TO_STR2(head_size, n_head); }
+    std::string op_desc(ggml_tensor *) override { return "CONV_STATE"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy, silu, qk }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ch = 3*head_size*n_head; // q | k | v
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*ch, 2);
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ch, 1);
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, ch);
+        ggml_tensor * st  = ggml_reshape_3d(ctx, ggml_view_1d(ctx, cache, 3*ch, 0), 3, ch, 1);
+        ggml_tensor * cat = ggml_concat(ctx, st, ggml_transpose(ctx, x), 0);
+        ggml_tensor * last = ggml_view_3d(ctx, cat, 3, ch, 1, cat->nb[1], cat->nb[2], sizeof(float));
+        cpy = ggml_cpy(ctx, last, ggml_view_2d(ctx, cache, 3*ch, 1, cache->nb[1], cache->nb[1]));
+        silu = ggml_silu(ctx, ggml_ssm_conv(ctx, cat, w));
+        qk = ggml_l2_norm(ctx, ggml_view_4d(ctx, silu, head_size, 2*n_head, 1, 1, head_size*sizeof(float), silu->nb[1], silu->nb[2], 0), 1e-6f);
+        // the cpy first in graph order (the model expands it with the concat), the conv chain right after it (in the model the
+        // backend's graph optimization moves it there; the test runs no graph optimization)
+        return ggml_add(ctx, ggml_view_1d(ctx, cpy, 1, 0), ggml_view_1d(ctx, qk, 1, 0));
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
@@ -10605,6 +10691,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_norm_fuse(128, 16, nt));
         test_cases.emplace_back(new test_v_gate_fuse(128, 16, 32, nt));
     }
+    test_cases.emplace_back(new test_gdn_state_fuse(16, 128, 1, 4));
+    test_cases.emplace_back(new test_gdn_state_fuse(4, 64, 2, 5));
+    test_cases.emplace_back(new test_conv_state_fuse(128, 4));
+    test_cases.emplace_back(new test_conv_state_fuse(128, 16));
     test_cases.emplace_back(new test_mla_expand_kv(300, 4, 4));
     test_cases.emplace_back(new test_mla_expand_kv(1024, 0, 16));
     test_cases.emplace_back(new test_mla_expand_kv(1, 8, 8));

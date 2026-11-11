@@ -1038,6 +1038,8 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
+    int32_t  has_ids; // 1 => seq i23 reads its initial state from row ids[i23] of the state cache (GGML_METAL_FUSION_GDN_STATE)
+    uint64_t nb_s1;   // byte stride of the state cache rows (with ids)
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
@@ -1385,6 +1387,14 @@ typedef struct {
     float    eps0;   // RMS norm of the flat streams
     float    eps1;   // RMS norm of the pre-weighted sum
 } ggml_metal_kargs_hc_select;
+
+// GGML_METAL_FUSION_CONV_STATE (one token, 4 taps, 128-channel heads)
+typedef struct {
+    int32_t  n_qk;  // channels of the q | k heads that get the L2 norm
+    float    eps;
+    uint64_t nb_x;  // byte stride between the channels of x
+    uint64_t nb_w;  // byte stride between the rows of the conv weight
+} ggml_metal_kargs_conv_state;
 
 // GGML_METAL_FUSION_GATED_NORM: rows i1 < ne1, i2 < ne2 of x, g and dst
 typedef struct {

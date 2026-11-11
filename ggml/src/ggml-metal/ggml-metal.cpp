@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-context.h"
@@ -577,6 +578,9 @@ static void ggml_backend_metal_event_wait(ggml_backend_t backend, ggml_backend_e
 
 static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(params && params->add_alloc_dep);
+
+    // gather the delta-net fusion nodes first, so that the alloc deps below see those patterns in their final order
+    ggml_metal_graph_gather(cgraph);
 
     // keep the MoE weighted-reduction inputs alive until the fused output so the
     // allocator cannot reuse them while the fused kernel is still reading them

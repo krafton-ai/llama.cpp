@@ -957,6 +957,144 @@ static bool ggml_metal_fusion_check_v_gate(
     return true;
 }
 
+// CONCAT(state, x^T) + CPY of its last 3 columns into the cache + SSM_CONV (4 taps) + silu + L2 norm of the q | k heads, one token
+// (the graph optimizer moves the conv, silu and norm next to the cpy, see ggml_graph_optimize)
+static bool ggml_metal_fusion_check_conv_state(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+
+    const ggml_tensor * cat  = nodes[0];
+    const ggml_tensor * cpy  = nodes[1];
+    const ggml_tensor * conv = nodes[2];
+    const ggml_tensor * silu = nodes[3];
+    const ggml_tensor * l2   = nodes[4];
+
+    const ggml_tensor * st = cat->src[0];
+    const ggml_tensor * x  = cat->src[1];
+    if (ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || st->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+        cat->ne[0] != 4 || cat->ne[1] % 128 != 0 || cat->ne[2] != 1 || cat->ne[3] != 1 ||
+        st->ne[0] != 3 || st->nb[0] != sizeof(float) || st->nb[1] != 3*sizeof(float) || x->ne[0] != 1 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const ggml_tensor * last  = cpy->src[0];
+    const ggml_tensor * cache = cpy->src[1];
+    if (last->view_src != cat || last->view_offs != sizeof(float) || last->ne[0] != 3 || last->ne[1] != cat->ne[1] ||
+        cache->type != GGML_TYPE_F32 || cache->nb[0] != sizeof(float) || cache->ne[0] != 3*cat->ne[1] || ggml_nrows(cache) != 1) {
+        return false;
+    }
+
+    const ggml_tensor * w = conv->src[1];
+    if (conv->src[0] != cat || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->nb[0] != sizeof(float) || w->ne[1] != cat->ne[1] ||
+        conv->type != GGML_TYPE_F32 || (conv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != conv || silu->type != GGML_TYPE_F32 || !ggml_is_contiguous(silu)) {
+        return false;
+    }
+
+    const ggml_tensor * q = l2->src[0];
+    if (q->view_src != silu || q->view_offs != 0 || q->ne[0] != 128 || q->nb[0] != sizeof(float) || q->nb[1] != 128*sizeof(float) ||
+        q->ne[0]*q->ne[1] > silu->ne[0] || q->ne[2] != 1 || q->ne[3] != 1 || l2->type != GGML_TYPE_F32 || !ggml_is_contiguous(l2)) {
+        return false;
+    }
+
+    // the concat and the conv are not stored: the cpy view and the conv must be the only readers of the concat, silu of the conv
+    if (ggml_node_get_use_count(gf, node_idxs[idx + 0]) != 2 || ggml_node_get_use_count(gf, node_idxs[idx + 2]) != 1) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
+        return true;
+    }
+
+    // the cache must be allocated, and the kernel reads the state and x while it writes the outputs
+    if (cache->data == nullptr) {
+        return false;
+    }
+    for (const ggml_tensor * in : { st, x }) {
+        for (const ggml_tensor * out : { silu, l2 }) {
+            if (ggml_metal_fusion_overlap(in, out) || ggml_metal_fusion_overlap(out, in)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// GET_ROWS of the initial states from the state cache + GATED_DELTA_NET + CPY into the cache (GDN_CACHE): the delta net reads row
+// ids[s] of the cache itself (the graph optimizer moves the GET_ROWS next to the delta net, see ggml_graph_optimize)
+static bool ggml_metal_fusion_check_gdn_state(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    // with 4 nodes the second is the copy of the extra states of the recurrent memory, without elements at decode
+    const int x = (int) fusion->ops.size() - 3;
+
+    const ggml_tensor * gr  = nodes[0];
+    const ggml_tensor * gdn = nodes[1 + x];
+
+    if (!ggml_metal_fusion_check_gdn_cache(fusion, nodes + 1 + x, gf, node_idxs, idx + 1 + x, mode)) {
+        return false;
+    }
+    if (x && (ggml_nelements(nodes[1]) != 0 || !nodes[1]->src[0]->view_src || nodes[1]->src[0]->view_src != gr)) {
+        return false;
+    }
+
+    const ggml_tensor * cache = gr->src[0];
+    const ggml_tensor * ids   = gr->src[1];
+    const int64_t S_v    = gdn->src[2]->ne[0];
+    const int64_t H      = gdn->src[2]->ne[1];
+    const int64_t n_seqs = gdn->src[2]->ne[3];
+
+    if (gr->type != GGML_TYPE_F32 || cache->type != GGML_TYPE_F32 || cache->ne[0] != S_v*S_v*H || cache->nb[0] != sizeof(float) ||
+            ids->type != GGML_TYPE_I32 || ids->ne[0] < n_seqs || ids->nb[0] != sizeof(int32_t) || gr->ne[1] < n_seqs ||
+            cache->ne[2] != 1 || cache->ne[3] != 1 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    // the delta net's state is the first n_seqs rows of the GET_ROWS output through views only
+    const ggml_tensor * s = gdn->src[5];
+    int n_views = 0;
+    while (s != gr) {
+        if (!s->view_src || ++n_views > 4) {
+            return false;
+        }
+        s = s->view_src;
+    }
+    if (gdn->src[5]->view_offs != 0) {
+        return false;
+    }
+    // nothing else reads the GET_ROWS output: the nodes between it and the delta net are views read once and empty copies of
+    // views of it (the extra states of the recurrent memory at decode; the op encoders skip empty nodes, so this pattern
+    // may match with or without that copy)
+    int n_empty_cpy = 0;
+    for (int i = node_idxs[idx + 0] + 1; i < node_idxs[idx + 1 + x]; ++i) {
+        const ggml_tensor * v = gf->nodes[i];
+        if (v->op == GGML_OP_CPY && ggml_nelements(v) == 0) {
+            if (!v->src[0]->view_src || v->src[0]->view_src != gr) {
+                return false;
+            }
+            n_empty_cpy++;
+            continue;
+        }
+        if (!ggml_op_is_empty(v->op) || ggml_node_get_use_count(gf, i) != 1) {
+            return false;
+        }
+    }
+    return ggml_node_get_use_count(gf, node_idxs[idx + 0]) == 1 + n_empty_cpy;
+}
+
 static bool ggml_metal_fusion_check_mul_mat_glu(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -1050,6 +1188,12 @@ static const std::vector<ggml_op> ops_mul_mat_glu = { GGML_OP_MUL_MAT, GGML_OP_G
 static const std::vector<ggml_op> ops_hc_select = {
     GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL
 };
+// raw sequence with the views, so that the alloc deps keep the state and x alive until the fused output
+static const std::vector<ggml_op> ops_conv_state = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_L2_NORM
+};
+static const std::vector<ggml_op> ops_gdn_state = { GGML_OP_GET_ROWS, GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
+static const std::vector<ggml_op> ops_gdn_state_x = { GGML_OP_GET_ROWS, GGML_OP_CPY, GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_gated_norm = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_v_gate = { GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_DIV, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_hc_comb_post = {
@@ -1089,6 +1233,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_HC_COMB_POST,   ops_hc_comb_post,           {},     true,  ggml_metal_fusion_check_hc_comb_post },
     { GGML_METAL_FUSION_GATED_NORM,     ops_gated_norm,             {},     true,  ggml_metal_fusion_check_gated_norm },
     { GGML_METAL_FUSION_V_GATE,         ops_v_gate,                 {1},    true,  ggml_metal_fusion_check_v_gate },
+    { GGML_METAL_FUSION_CONV_STATE,     ops_conv_state,             {1, 3}, true,  ggml_metal_fusion_check_conv_state },
+    { GGML_METAL_FUSION_GDN_STATE,      ops_gdn_state,              {},     true,  ggml_metal_fusion_check_gdn_state },
+    { GGML_METAL_FUSION_GDN_STATE,      ops_gdn_state_x,            {},     true,  ggml_metal_fusion_check_gdn_state },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -1347,6 +1494,12 @@ static bool ggml_metal_fusion_check_memory_ranges(
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 const ggml_tensor * src = nodes[j]->src[s];
                 if (!src || src->op == GGML_OP_NONE || same_memory(src, dst)) {
+                    continue;
+                }
+                // GDN_STATE reads the initial states from the cache rows it writes: each row is read before it is written,
+                // by the same threads (kernel_gated_delta_net_impl with ids); the GET_ROWS and the empty copy of the extra
+                // states (its sources are views of the cache) are not run
+                if (fusion->id == GGML_METAL_FUSION_GDN_STATE && j < (int) fusion->ops.size() - 2) {
                     continue;
                 }
 

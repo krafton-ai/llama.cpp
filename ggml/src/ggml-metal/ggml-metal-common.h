@@ -48,6 +48,9 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * ten
 //
 // note: this implementation is generic and not specific to metal
 //       if it proves to work well, we can start using it for other backends in the future
+// move the nodes of the delta-net fusions next to each other (CONV_STATE, GDN_STATE); also run by ggml_graph_optimize
+void ggml_metal_graph_gather(struct ggml_cgraph * gf);
+
 void ggml_graph_optimize(struct ggml_cgraph * gf);
 
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*

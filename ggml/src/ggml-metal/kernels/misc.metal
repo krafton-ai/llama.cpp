@@ -764,6 +764,42 @@ kernel void kernel_dsv4_hc_pre_gated_f32(
     *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
 }
 
+// GGML_METAL_FUSION_CONV_STATE: CONCAT(state, x^T) + CPY of its last 3 columns into the cache + SSM_CONV (4 taps) + silu + L2 norm of
+// the q | k heads, one token. One threadgroup of 32 threads per 128-channel head, 4 channels per thread; the conv sums as
+// kernel_ssm_conv_f32_f32_4 and the norm as kernel_l2_norm_f32_f32_4 with 32 threads
+kernel void kernel_conv_state_f32(
+        constant ggml_metal_kargs_conv_state & args,
+        device const float * st,
+        device const  char * x,
+        device const  char * w,
+        device       float * cache,
+        device      float4 * y,
+        device      float4 * qk,
+        uint  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int i4 = tgpig*32 + tiisg;  // float4 index of the 4 channels
+
+    float v[4];
+    FOR_UNROLL (int j = 0; j < 4; ++j) {
+        const int c = 4*i4 + j;
+        const float4 win = float4(st[3*c + 0], st[3*c + 1], st[3*c + 2], *((device const float *) (x + c*args.nb_x)));
+        float sumf = 0.0f;
+        sumf += dot(win, *((device const float4 *) (w + c*args.nb_w)));
+        cache[3*c + 0] = win[1];
+        cache[3*c + 1] = win[2];
+        cache[3*c + 2] = win[3];
+        v[j] = sumf/(1.0f + exp(-sumf));
+    }
+    const float4 v4 = float4(v[0], v[1], v[2], v[3]);
+    y[i4] = v4;
+
+    if ((int) tgpig*128 < args.n_qk) {
+        const float sumf = simd_sum(dot(v4, v4));
+        const float scale = 1.0f/max(sqrt(sumf), args.eps);
+        qk[i4] = v4 * scale;
+    }
+}
+
 // GGML_METAL_FUSION_GATED_NORM: one simdgroup per row
 kernel void kernel_gated_norm_f32(
         constant ggml_metal_kargs_gated_norm & args,

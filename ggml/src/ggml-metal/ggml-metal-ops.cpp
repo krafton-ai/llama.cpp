@@ -561,8 +561,55 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
     return res;
 }
 
+static int ggml_metal_op_try_fusion(ggml_metal_op_t ctx, int idx, ggml_metal_fusion_id id);
+static int ggml_metal_op_gated_delta_net_impl(ggml_metal_op_t ctx, int idx, const ggml_tensor * gr);
+
+// GGML_METAL_FUSION_CONV_STATE: CONCAT + CPY + SSM_CONV + SILU + L2_NORM at one token in one kernel
+static int ggml_metal_op_conv_state(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_tensor * cat  = ctx->node(idx);
+    ggml_tensor * cpy  = ctx->node(idx + 1);
+    ggml_tensor * conv = ctx->node(idx + 2);
+    ggml_tensor * silu = ctx->node(idx + 3);
+    ggml_tensor * l2   = ctx->node(idx + 4);
+
+    // the encode loop checked the last node of the group; the kernel also writes the cache and the silu output
+    if (!ggml_metal_op_concurrency_check(ctx, cpy) || !ggml_metal_op_concurrency_check(ctx, silu)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+
+    ggml_metal_kargs_conv_state args = {
+        /*.n_qk =*/ (int32_t) (l2->src[0]->ne[0]*l2->src[0]->ne[1]),
+        /*.eps  =*/ ggml_get_op_params_f32(l2, 0),
+        /*.nb_x =*/ cat->src[1]->nb[1],
+        /*.nb_w =*/ conv->src[1]->nb[1],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_by_name(ctx->lib, "kernel_conv_state_f32");
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cat->src[0]),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cat->src[1]),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(conv->src[1]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cpy->src[1]),  4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(silu),         5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(l2),           6);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, cat->ne[1]/128, 1, 1, 32, 1, 1);
+
+    return n_fuse;
+}
+
 int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    {
+        const int n = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_CONV_STATE);
+        if (n > 1) {
+            return ggml_metal_op_conv_state(ctx, idx, n);
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -1226,6 +1273,17 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
 
 int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    {
+        // GGML_METAL_FUSION_GDN_STATE: the delta net reads the initial states from the cache rows itself
+        const int n = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_GDN_STATE);
+        if (n > 1) {
+            // n - 2: the delta net (after the empty copy of the extra states, if any)
+            const int n_gdn = ggml_metal_op_gated_delta_net_impl(ctx, idx + n - 2, op);
+            GGML_ASSERT(n_gdn == 2);
+            return n;
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -2036,8 +2094,13 @@ int ggml_metal_op_mla_expand_kv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+// gr: the GET_ROWS of the initial states when fused (GGML_METAL_FUSION_GDN_STATE): the kernel reads row ids[s] of the cache
+static int ggml_metal_op_gated_delta_net_impl(ggml_metal_op_t ctx, int idx, const ggml_tensor * gr) {
     ggml_tensor * op = ctx->node(idx);
+
+    if (gr && !ggml_metal_op_concurrency_check(ctx, op)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -2120,6 +2183,8 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
         /*.nb_out =*/ nb_out,
+        /*.has_ids =*/ gr ? 1 : 0,
+        /*.nb_s1   =*/ gr ? gr->src[0]->nb[1] : 0,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2129,15 +2194,20 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), ida++); // v
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // gate
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gr ? gr->src[0] : op->src[5]), ida++); // state (or its cache)
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst (attn)
     ggml_metal_encoder_set_buffer  (enc, bid_out,                              ida++); // state_out
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gr ? gr->src[1] : op->src[5]), ida++); // ids (with gr)
 
     const int nsg = pipeline.nsg;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
 
     return n_fuse;
+}
+
+int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+    return ggml_metal_op_gated_delta_net_impl(ctx, idx, nullptr);
 }
 
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {

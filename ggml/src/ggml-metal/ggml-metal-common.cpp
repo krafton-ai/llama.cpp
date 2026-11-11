@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -559,7 +560,145 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
+// gather the nodes of two delta-net fusions next to each other before the fusion packing (the graph is not allocated yet, so
+// moving nodes changes no buffer reuse). Only moves that keep every node after its sources:
+//   - CONV_STATE: the SSM_CONV of a CONCAT, its SILU and the L2_NORM of a view of the SILU (contiguous in graph order) are moved
+//     forward to just after the CPY that stores the last columns of the CONCAT
+//   - GDN_STATE: the GET_ROWS of the initial states (and the views of it the delta net reads) is moved backward to just before
+//     the GATED_DELTA_NET when nothing else in between reads it
+static bool in_chain_all(const std::vector<ggml_tensor *> & moved, const std::vector<const ggml_tensor *> & chain) {
+    for (const ggml_tensor * c : chain) {
+        if (std::find(moved.begin(), moved.end(), c) == moved.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_metal_graph_gather(ggml_cgraph * gf) {
+    ggml_tensor ** nodes = gf->nodes;
+    const int n = gf->n_nodes;
+
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * conv = nodes[i];
+        if (conv->op != GGML_OP_SSM_CONV || conv->src[0]->op != GGML_OP_CONCAT) {
+            continue;
+        }
+        const ggml_tensor * cat = conv->src[0];
+        // the CPY of a view of the concat right after the concat
+        int j = i - 1;
+        while (j >= 0 && nodes[j] != cat && i - j < 256) {
+            --j;
+        }
+        if (j < 0 || nodes[j] != cat) {
+            continue;
+        }
+        int k = j + 1;
+        while (k < i && ggml_op_is_empty(nodes[k]->op)) {
+            ++k;
+        }
+        if (k >= i || nodes[k]->op != GGML_OP_CPY || !nodes[k]->src[0]->view_src || nodes[k]->src[0]->view_src != cat) {
+            continue;
+        }
+        // the block: SSM_CONV, SILU, views of the SILU, L2_NORM of one of them
+        int e = i + 1;
+        if (e >= n || nodes[e]->op != GGML_OP_UNARY || nodes[e]->src[0] != conv) {
+            continue;
+        }
+        const ggml_tensor * silu = nodes[e];
+        ++e;
+        while (e < n && ggml_op_is_empty(nodes[e]->op) && nodes[e]->view_src == silu) {
+            ++e;
+        }
+        if (e >= n || nodes[e]->op != GGML_OP_L2_NORM || !nodes[e]->src[0]->view_src || nodes[e]->src[0]->view_src != silu) {
+            continue;
+        }
+        if (k + 1 < i) {
+            std::rotate(nodes + k + 1, nodes + i, nodes + e + 1);
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * gdn = nodes[i];
+        if (gdn->op != GGML_OP_GATED_DELTA_NET) {
+            continue;
+        }
+        // the view chain of the state down to its GET_ROWS
+        std::vector<const ggml_tensor *> chain;
+        const ggml_tensor * s = gdn->src[5];
+        while (s && ggml_op_is_empty(s->op) && s->view_src && chain.size() < 4) {
+            chain.push_back(s);
+            s = s->view_src;
+        }
+        if (!s || s->op != GGML_OP_GET_ROWS) {
+            continue;
+        }
+        chain.push_back(s);
+        int j = i - 1;
+        while (j >= 0 && nodes[j] != s && i - j < 512) {
+            --j;
+        }
+        if (j < 0 || nodes[j] != s) {
+            continue;
+        }
+        // the GET_ROWS moves with every node in between that depends on it: the views of the chain and the copy of the extra
+        // states of the recurrent memory, which has no elements at decode (n_rs == n_seqs); other readers keep it in place
+        std::vector<ggml_tensor *> rest, moved;
+        auto is_moved = [&](const ggml_tensor * t) { return t && std::find(moved.begin(), moved.end(), t) != moved.end(); };
+        bool ok = true;
+        for (int m = j; m < i && ok; ++m) {
+            ggml_tensor * t = nodes[m];
+            bool dep = m == j || is_moved(t->view_src);
+            for (int q = 0; q < GGML_MAX_SRC && !dep; ++q) {
+                dep = is_moved(t->src[q]);
+            }
+            if (!dep) {
+                rest.push_back(t);
+                continue;
+            }
+            if (m != j && !ggml_op_is_empty(t->op) && !(t->op == GGML_OP_CPY && ggml_nelements(t) == 0)) {
+                ok = false;
+            }
+            moved.push_back(t);
+        }
+        // the views a moved copy writes through (empty, read by it only) move with it
+        for (int m = (int) rest.size() - 1; m >= 0 && ok; --m) {
+            ggml_tensor * t = rest[m];
+            if (!ggml_op_is_empty(t->op)) {
+                continue;
+            }
+            bool used_by_moved = false, used_by_rest = false;
+            for (ggml_tensor * u : moved) {
+                for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                    used_by_moved |= u->src[q] == t;
+                }
+            }
+            for (ggml_tensor * u : rest) {
+                for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                    used_by_rest |= u->src[q] == t;
+                }
+            }
+            if (used_by_moved && !used_by_rest) {
+                rest.erase(rest.begin() + m);
+                moved.insert(moved.begin(), t);
+            }
+        }
+        if (!ok || !in_chain_all(moved, chain)) {
+            continue;
+        }
+        int m = j;
+        for (ggml_tensor * t : rest) {
+            nodes[m++] = t;
+        }
+        for (ggml_tensor * t : moved) {
+            nodes[m++] = t;
+        }
+    }
+}
+
 void ggml_graph_optimize(ggml_cgraph * gf) {
+    ggml_metal_graph_gather(gf);
+
     const int n = gf->n_nodes;
 
     std::vector<node_info> nodes;
