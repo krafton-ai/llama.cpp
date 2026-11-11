@@ -12257,6 +12257,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // many batches of src1 against one src0 matrix
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 1, 128, {1, 1}, {8, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 4, 128, {1, 1}, {8, 1}));
+    }
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));

@@ -24322,6 +24322,45 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         return;
     }
 
+    // one src1 row per batch against a single src0 matrix (MQA / absorbed-MLA decode: KQ and KQV of all query
+    // heads share one K / V): the batches are the columns of one matrix multiply, so the shared matrix is read
+    // once instead of once per batch. Needs the src1 rows and the dst rows at a uniform stride
+    if ((src0t == GGML_TYPE_F16 || src0t == GGML_TYPE_F32) && src1t == GGML_TYPE_F32 && src0->ne[2] == 1 &&
+        src0->ne[3] == 1 && src1->ne[1] == 1 && src1->ne[2] > 1 && src1->ne[3] == 1 && src1->nb[0] == sizeof(float) &&
+        dst->nb[0] == sizeof(float)) {
+        ggml_tensor fake_src1 = *src1;
+        fake_src1.ne[1]       = src1->ne[2];
+        fake_src1.ne[2]       = 1;
+        fake_src1.nb[1]       = src1->nb[2];
+        fake_src1.nb[2]       = fake_src1.nb[1] * fake_src1.ne[1];
+        fake_src1.nb[3]       = fake_src1.nb[2];
+        ggml_tensor fake_dst  = *dst;
+        fake_dst.ne[1]        = dst->ne[2];
+        fake_dst.ne[2]        = 1;
+        fake_dst.nb[1]        = dst->nb[2];
+        fake_dst.nb[2]        = fake_dst.nb[1] * fake_dst.ne[1];
+        fake_dst.nb[3]        = fake_dst.nb[2];
+        ggml_cl_mul_mat(backend, src0, &fake_src1, &fake_dst);
+        return;
+    }
+    // the same for many rows per batch (absorbed-MLA prefill KQV: the 32 heads' probabilities against the one
+    // latent V) when src1 and dst are contiguous: the batches stack into one matrix of ne1*ne2 columns
+    if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[1] > 1 &&
+        src1->ne[2] > 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        ggml_tensor fake_src1 = *src1;
+        fake_src1.ne[1]       = src1->ne[1] * src1->ne[2];
+        fake_src1.ne[2]       = 1;
+        fake_src1.nb[2]       = fake_src1.nb[1] * fake_src1.ne[1];
+        fake_src1.nb[3]       = fake_src1.nb[2];
+        ggml_tensor fake_dst  = *dst;
+        fake_dst.ne[1]        = dst->ne[1] * dst->ne[2];
+        fake_dst.ne[2]        = 1;
+        fake_dst.nb[2]        = fake_dst.nb[1] * fake_dst.ne[1];
+        fake_dst.nb[3]        = fake_dst.nb[2];
+        ggml_cl_mul_mat(backend, src0, &fake_src1, &fake_dst);
+        return;
+    }
+
     // quant kv without FA
     // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
     // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
