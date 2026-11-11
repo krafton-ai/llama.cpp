@@ -8800,6 +8800,55 @@ struct test_mul_mat_pool_max_div_add : public test_case {
     }
 };
 
+// GGML_OP_UNARY(SIGMOID) x2 + DIV + MUL: two sigmoid gates from one input row and their ratio applied to v,
+// e.g. the write / erase gates of a delta net
+struct test_sigmoid_div_mul : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+    const int64_t rank;
+
+    ggml_tensor * beta = nullptr;
+    ggml_tensor * out  = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_DIV_MUL";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_dim, n_head, n_tokens, rank);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { beta, out }; }
+
+    test_sigmoid_div_mul(int64_t head_dim, int64_t n_head, int64_t n_tokens, int64_t rank)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens), rank(rank) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // rows: [rank values | b | b + d]
+        ggml_tensor * fab = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank + 2*n_head, n_tokens);
+        ggml_set_name(fab, "fab");
+
+        // v is the last third of each row of a q | k | v tensor
+        ggml_tensor * qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*head_dim*n_head, n_tokens);
+        ggml_set_name(qkv, "qkv");
+        ggml_tensor * v = ggml_view_4d(ctx, qkv, head_dim, n_head, n_tokens, 1,
+                head_dim*ggml_element_size(qkv), qkv->nb[1], qkv->nb[1]*n_tokens, 2*head_dim*n_head*ggml_element_size(qkv));
+
+        const size_t es = ggml_element_size(fab);
+        beta = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, n_head, n_tokens, fab->nb[1], rank*es));
+        ggml_set_name(beta, "beta");
+        ggml_tensor * write = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, n_head, n_tokens, fab->nb[1], (rank + n_head)*es));
+        ggml_tensor * ratio = ggml_reshape_4d(ctx, ggml_div(ctx, write, beta), 1, n_head, n_tokens, 1);
+
+        out = ggml_mul(ctx, v, ratio);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12367,6 +12416,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_pool_max_div_add(4, 17, n_tokens));
     }
     test_cases.emplace_back(new test_mul_mat_pool_max_div_add(2, 6, 3));
+
+    test_cases.emplace_back(new test_sigmoid_div_mul(128, 4, 1, 16));
+    test_cases.emplace_back(new test_sigmoid_div_mul(64, 8, 5, 32));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

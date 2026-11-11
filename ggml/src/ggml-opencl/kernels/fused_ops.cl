@@ -154,6 +154,44 @@ kernel void kernel_mul_mat_pool_max_div_add(
 }
 
 //------------------------------------------------------------------------------
+// sigmoid_div_mul: item per (j = h*hd + i, t)
+//   beta[h, t] = sigmoid(fab[t, rank + h]),  w = sigmoid(fab[t, rank + nh + h]),  v'[i, h, t] = v[i, h, t] * (w / beta)
+// same expressions as the standard SIGMOID, DIV and MUL kernels
+//------------------------------------------------------------------------------
+kernel void kernel_sigmoid_div_mul(
+        global const char * fab,
+        ulong offset_a,
+        ulong nba1,
+        global const char * v,
+        ulong offset_v,
+        ulong nbv1,
+        ulong nbv2,
+        global char * vout,
+        ulong offset_vo,
+        global char * bout,
+        ulong offset_bo,
+        int rank,
+        int hd,
+        int nh,
+        int nt) {
+    const int j = get_global_id(0);
+    const int t = get_global_id(1);
+    if (j >= hd * nh || t >= nt) {
+        return;
+    }
+    const int h = j / hd, i = j % hd;
+    global const float * a = (global const float *) (fab + offset_a + t * nba1);
+    const float beta = 1.0f / (1.0f + exp(-a[rank + h]));
+    const float w = 1.0f / (1.0f + exp(-a[rank + nh + h]));
+    const float ratio = w / beta;
+    const float vv = *(global const float *) (v + offset_v + i * sizeof(float) + h * nbv1 + t * nbv2);
+    ((global float *) (vout + offset_vo))[(t * nh + h) * hd + i] = vv * ratio;
+    if (i == 0) {
+        ((global float *) (bout + offset_bo))[t * nh + h] = beta;
+    }
+}
+
+//------------------------------------------------------------------------------
 // rms_norm_mul_mat_add_reduce: second half of RMS_NORM -> MUL_MAT -> ADD(base).
 //   parts [nmix + 1, nsplit, nt] from kernel_rms_norm_mul_mat_add_part_*: rows 0..nmix-1 partial w.x, row nmix partial x.x
 //   y[k, t] = sum_s parts[k, s, t] / sqrt(sum_s parts[nmix, s, t] / n + eps) + base[k]
