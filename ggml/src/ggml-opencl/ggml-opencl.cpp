@@ -453,6 +453,8 @@ static void ggml_cl_adreno_xmem_attn_release_scratch(ggml_backend_opencl_context
 
 // backend device context
 struct ggml_backend_opencl_device_context {
+    ~ggml_backend_opencl_device_context();
+
     cl_platform_id platform;
     std::string platform_name;
 
@@ -909,6 +911,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_adreno_xmem_store_dst_f32;
     cl_kernel kernel_mul_mm_f16_f32_kqv;
     cl_kernel kernel_mul_mm_f16_f32_kq;
+    cl_kernel kernel_mla_qk_prefill = nullptr;
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
     cl_kernel kernel_convert_block_q1_0, kernel_restore_block_q1_0;
     cl_kernel kernel_convert_block_q4_0, kernel_restore_block_q4_0;
@@ -1335,6 +1338,17 @@ struct ggml_backend_opencl_context {
     }
 };
 
+ggml_backend_opencl_device_context::~ggml_backend_opencl_device_context() {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    // Backend contexts are cached across ref_count reaching zero. Only the
+    // owning device registry's destruction ends this optional kernel's life.
+    if (backend_ctx && backend_ctx->kernel_mla_qk_prefill) {
+        clReleaseKernel(backend_ctx->kernel_mla_qk_prefill);
+        backend_ctx->kernel_mla_qk_prefill = nullptr;
+    }
+#endif
+}
+
 // All registered devices with a default device in the front.
 static std::vector<ggml_backend_device> g_ggml_backend_opencl_devices;
 // All device contexts associated with the devices above.
@@ -1505,6 +1519,75 @@ static std::string ggml_opencl_make_compile_opts(const ggml_backend_opencl_conte
 
     return compile_opts;
 }
+
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+static bool mla_qk_prefill_qualify(ggml_backend_opencl_context *ctx, cl_kernel k) {
+    size_t local[3] = {64, 1, 2}, mx = 0, count = 0;
+    if (clGetKernelSubGroupInfo(k, ctx->device, CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
+            sizeof(local), local, sizeof(mx), &mx, nullptr) != CL_SUCCESS ||
+        clGetKernelSubGroupInfo(k, ctx->device, CL_KERNEL_SUB_GROUP_COUNT_FOR_NDRANGE,
+            sizeof(local), local, sizeof(count), &count, nullptr) != CL_SUCCESS || mx != 64 || count != 2) {
+        return false;
+    }
+    cl_int e = CL_SUCCESS;
+    cl_mem a = nullptr, b = nullptr, o = nullptr, ia = nullptr, io = nullptr;
+    a = clCreateBuffer(ctx->context, CL_MEM_READ_WRITE, 16, nullptr, &e);
+    bool ok = e == CL_SUCCESS && a;
+    if (ok) {
+        b = clCreateBuffer(ctx->context, CL_MEM_READ_WRITE, 16, nullptr, &e);
+        ok = e == CL_SUCCESS && b;
+    }
+    if (ok) {
+        o = clCreateBuffer(ctx->context, CL_MEM_READ_WRITE, 512*sizeof(float), nullptr, &e);
+        ok = e == CL_SUCCESS && o;
+    }
+    cl_image_format fmt{CL_RGBA, CL_FLOAT};
+    cl_image_desc desc{};
+    desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    desc.image_width = 1;
+    desc.buffer = a;
+    if (ok) {
+        ia = clCreateImage(ctx->context, CL_MEM_READ_ONLY, &fmt, &desc, nullptr, &e);
+        ok = e == CL_SUCCESS && ia;
+    }
+    fmt.image_channel_order = CL_R;
+    desc.image_width = 512;
+    desc.buffer = o;
+    if (ok) {
+        io = clCreateImage(ctx->context, CL_MEM_WRITE_ONLY, &fmt, &desc, nullptr, &e);
+        ok = e == CL_SUCCESS && io;
+    }
+    int zero = 0, probe = -1, m = 128, kk = 576, n = 256, da = 1, db = 32, nb = 1152;
+    auto set = [&](cl_uint i, size_t z, const void * v) { return clSetKernelArg(k, i, z, v) == CL_SUCCESS; };
+    if (ok) {
+        ok = set(0, sizeof(ia), &ia) && set(1, sizeof(zero), &zero) && set(2, sizeof(b), &b) &&
+             set(3, sizeof(zero), &zero) && set(4, sizeof(io), &io) && set(5, sizeof(probe), &probe) &&
+             set(6, sizeof(m), &m) && set(7, sizeof(kk), &kk) && set(8, sizeof(n), &n) &&
+             set(9, sizeof(da), &da) && set(10, sizeof(db), &db) && set(11, sizeof(nb), &nb);
+    }
+    size_t global[3] = {64, 1, 2};
+    std::vector<float> lanes(512);
+    if (ok) {
+        ok = clEnqueueNDRangeKernel(ctx->queue, k, 3, nullptr, global, local, 0, nullptr, nullptr) == CL_SUCCESS &&
+             clEnqueueReadBuffer(ctx->queue, o, CL_TRUE, 0, lanes.size()*sizeof(float), lanes.data(), 0, nullptr, nullptr) == CL_SUCCESS;
+    }
+    if (ok) {
+        for (int i = 0; i < 128; ++i) {
+            if (lanes[4*i] != 64 || lanes[4*i+1] != 2 || lanes[4*i+2] != float(i/64) || lanes[4*i+3] != float(i%64)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (io) { clReleaseMemObject(io); }
+    if (ia) { clReleaseMemObject(ia); }
+    if (o)  { clReleaseMemObject(o); }
+    if (b)  { clReleaseMemObject(b); }
+    if (a)  { clReleaseMemObject(a); }
+    return ok;
+}
+
+#endif
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     if (backend_ctx->kernels_loaded) {
@@ -2772,6 +2855,33 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kqv = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kqv, "mul_mm_f16_f32_kqv", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kq = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kq, "mul_mm_f16_f32_kq", &err), err));
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+
+        // Validated device/shape specialization; optional compilation must not
+        // prevent the original public kernel from serving other devices.
+        if (backend_ctx->device_name.find("X1-85") != std::string::npos) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+            const std::string mla_source {
+                #include "mla_qk_prefill.cl.h"
+            };
+#else
+            const std::string mla_source = read_file("mla_qk_prefill.cl");
+#endif
+            cl_program program = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
+                    mla_source.c_str(), compile_opts, false, "mla_qk_prefill");
+            if (program) {
+                cl_int error = CL_SUCCESS;
+                cl_kernel candidate = clCreateKernel(program, "mla_qk_prefill", &error);
+                if (error == CL_SUCCESS && candidate && mla_qk_prefill_qualify(backend_ctx, candidate)) {
+                    backend_ctx->kernel_mla_qk_prefill = candidate;
+                } else if (candidate) {
+                    clReleaseKernel(candidate);
+                }
+                clReleaseProgram(program);
+            }
+        }
+#endif
+
         GGML_LOG_CONT(".");
     }
 
@@ -19466,6 +19576,37 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     kernel = is_kq ? backend_ctx->kernel_mul_mm_f16_f32_kq
                    : backend_ctx->kernel_mul_mm_f16_f32_kqv;
+    // C06 preserves FP32 Q and the original accumulation order. Qualify
+    // exact packed head strides; a contiguous [K,N,H] Q is a different layout.
+    auto plain_range = [](cl_mem memory, size_t first, size_t bytes) {
+        cl_mem parent = nullptr;
+        size_t capacity = 0;
+        return clGetMemObjectInfo(memory, CL_MEM_ASSOCIATED_MEMOBJECT, sizeof(parent), &parent, nullptr) == CL_SUCCESS &&
+               !parent && clGetMemObjectInfo(memory, CL_MEM_SIZE, sizeof(capacity), &capacity, nullptr) == CL_SUCCESS &&
+               first <= capacity && bytes <= capacity - first;
+    };
+    auto disjoint = [](cl_mem a, size_t ao, size_t an, cl_mem b, size_t bo, size_t bn) {
+        return a != b || (ao <= bo ? an <= bo - ao : bn <= ao - bo);
+    };
+    const auto * a_extra = src0->view_src ? (ggml_tensor_extra_cl *) src0->view_src->extra : extra0;
+    const size_t ao = a_extra->offset + src0->view_offs;
+    const size_t bo = extra1->offset + src1->view_offs;
+    const size_t co = extrad->offset + dst->view_offs;
+    const size_t an = ggml_nbytes(src0), bn = ggml_nbytes(src1), cn = ggml_nbytes(dst);
+    const bool use_mla_qk = is_kq && backend_ctx->kernel_mla_qk_prefill &&
+        src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        M >= 128 && M <= 16384 && M % 128 == 0 && N == 256 && K == 576 && ne02 == 1 && ne12 == 32 &&
+        src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 && dst->ne[2] == 32 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(dst) &&
+        src1->nb[0] == 4 && src1->nb[1] == 576*32*4 && src1->nb[2] == 576*4 && src1->nb[3] == 576*32*256*4 &&
+        ao >= a_extra->offset && bo >= extra1->offset && co >= extrad->offset &&
+        plain_range(a_extra->data_device, ao, an) && plain_range(extra1->data_device, bo, bn) &&
+        plain_range(extrad->data_device, co, cn) &&
+        disjoint(a_extra->data_device, ao, an, extrad->data_device, co, cn) &&
+        disjoint(extra1->data_device, bo, bn, extrad->data_device, co, cn);
+    if (use_mla_qk) {
+        kernel = backend_ctx->kernel_mla_qk_prefill;
+    }
     // create sub-buffer for A
     // <--------------------------------------------> //
     extra0 = src0->view_src ? (ggml_tensor_extra_cl *)src0->view_src->extra : (ggml_tensor_extra_cl *)src0->extra;
@@ -19526,6 +19667,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     int offset_src0 = 0;
     int offset_src1 = 0;
+    const int offset_dst = 0;
 
     // set kernel args
     // <--------------------------------------------> //
@@ -19535,7 +19677,11 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem), &B_sub_buffer));
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &offset_src1));
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem), &D_image1d));
-    CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &extrad->offset));
+    if (use_mla_qk) {
+        CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int), &offset_dst));
+    } else {
+        CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &extrad->offset));
+    }
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &M));
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &K));
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &N));
@@ -19545,6 +19691,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     size_t global_work_size[3] = {64, static_cast<size_t>(((M+63)/64)), static_cast<size_t>(((N+31)/32)*ne12)};
     size_t local_work_size[3] = {64, 1, 2};
+    if (use_mla_qk) { global_work_size[1] = size_t(M/128); }
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 

@@ -61,6 +61,7 @@ function(ggml_opencl_add_kernel KNAME)
 endfunction()
 
 set(GGML_OPENCL_KERNELS
+    mla_qk_prefill
     add
     add_id
     moe_add_id_glu
