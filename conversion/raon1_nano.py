@@ -5,7 +5,10 @@ from typing import Iterable
 import torch
 from torch import Tensor
 
-from .base import ModelBase, TextModel, gguf
+import json
+from pathlib import Path
+
+from .base import LazyTorchTensor, ModelBase, TextModel, gguf, logger
 from .raon import Raon1Model
 
 
@@ -18,9 +21,53 @@ class Raon1NanoModel(Raon1Model):
     # per_layer_input_gate is not a Linear: its parameters have no .weight suffix
     _PLE_LAYER = {"gate": gguf.MODEL_TENSOR.PER_LAYER_INP_GATE, "projection": gguf.MODEL_TENSOR.PER_LAYER_PROJ,
                   "output_norm.weight": gguf.MODEL_TENSOR.PER_LAYER_POST_NORM}
+    # the MTP block ships as mtp/model.safetensors (one MLA layer, prefix model.layers.{num_hidden_layers}.);
+    # it is converted as layer n_layer unless --no-mtp is given
+    supports_mtp_export = True
+    _MTP_FILE = ("mtp", "model.safetensors")
+
     _PLE_MODEL = {"model.per_layer_inputs.table": gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
                   "model.per_layer_inputs.embedding_projection": gguf.MODEL_TENSOR.PER_LAYER_MODEL_PROJ,
                   "model.per_layer_inputs.projection_norm.weight": gguf.MODEL_TENSOR.PER_LAYER_PROJ_NORM}
+
+    def _mtp_path(self) -> Path | None:
+        # called from the base constructor (index_tensors), so it reads only dir_model and hparams
+        if self.mtp_only:
+            raise ValueError("Raon-1 nano: --mtp (an MTP-only file) is not supported; the MTP block is converted with the model")
+        path = self.dir_model.joinpath(*self._MTP_FILE)
+        if self.no_mtp or not path.is_file():
+            return None
+        cfg = json.loads((path.parent / "mtp_config.json").read_text())
+        if (cfg.get("num_nextn_predict_layers") != 1 or cfg.get("weight_prefix") != f"model.layers.{self.hparams['num_hidden_layers']}."
+                or cfg.get("attention_type") != "mla" or cfg.get("per_layer_embedding_dim") or not cfg.get("shared_embeddings_and_lm_head")):
+            raise ValueError(f"Unsupported Raon-1 nano MTP variant: {path.parent / 'mtp_config.json'}")
+        return path
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._has_mtp = self._mtp_path() is not None
+        if self._has_mtp:
+            self.block_count = self.hparams["num_hidden_layers"] + 1
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None):
+        tensors = super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+        path = self._mtp_path()
+        if path is None:
+            return tensors
+        logger.info(f"gguf: indexing MTP block '{path}'")
+        prefix = f"model.layers.{self.hparams['num_hidden_layers']}."
+        with gguf.utility.SafetensorsLocal(path) as part:
+            for name in part.keys():
+                if not name.startswith(prefix) or name in tensors:
+                    raise ValueError(f"Unexpected MTP tensor {name}")
+                data = part[name]
+                if self.lazy:
+                    tensors[name] = lambda data=data: LazyTorchTensor.from_local_tensor(data)
+                else:
+                    dtype = LazyTorchTensor._dtype_str_map[data.dtype]
+                    tensors[name] = lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes()).view(dtype).reshape(data.shape)
+        return tensors
 
     def set_gguf_parameters(self):
         hp = self.hparams
@@ -38,8 +85,11 @@ class Raon1NanoModel(Raon1Model):
         TextModel.set_gguf_parameters(self)
         self.gguf_writer.add_vocab_size(hp["vocab_size"])
         # RDA and MLA head counts differ (16 and 32 in Raon-1 nano): per-layer arrays
-        self.gguf_writer.add_head_count([rda_config["num_heads"] if i + 1 in rda else hp["num_attention_heads"] for i in range(n_layer)])
-        self.gguf_writer.add_head_count_kv([0 if i + 1 in rda else 1 for i in range(n_layer)])
+        # the MTP block (layer n_layer) is an MLA layer
+        self.gguf_writer.add_head_count([rda_config["num_heads"] if i + 1 in rda else hp["num_attention_heads"] for i in range(self.block_count)])
+        self.gguf_writer.add_head_count_kv([0 if i + 1 in rda else 1 for i in range(self.block_count)])
+        if self._has_mtp:
+            self.gguf_writer.add_nextn_predict_layers(self.block_count - n_layer)
         self.gguf_writer.add_ssm_conv_kernel(rda_config["conv_kernel_size"])
         self.gguf_writer.add_ssm_time_step_rank(hp.get("rda_decay_rank", 128))
         self.gguf_writer.add_kda_head_dim(rda_config["head_dim"])

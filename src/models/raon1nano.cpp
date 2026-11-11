@@ -62,8 +62,10 @@ void llama_model_raon1_nano::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_raon1_nano::load_arch_tensors(llama_model_loader &) {
+void llama_model_raon1_nano::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_FN);
 
     const int64_t hc = hparams.dsv4_hc_mult;
     // selector width per mHC site: pre (hc) + post (hc) + combination ((hc-1)^2, Helmert coordinates)
@@ -74,7 +76,7 @@ void llama_model_raon1_nano::load_arch_tensors(llama_model_loader &) {
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, nf.trunk);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
     // tied head
     if (output == nullptr) {
@@ -82,22 +84,25 @@ void llama_model_raon1_nano::load_arch_tensors(llama_model_loader &) {
     }
 
     // the projection and its norm are repeating-layer tensors: named without, but created with, a layer number (as gemma3n)
-    per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {n_ple * n_layer, n_vocab}, 0);
-    per_layer_model_proj = create_tensor(tn(LLM_TENSOR_PER_LAYER_MODEL_PROJ, "weight", 0), {n_embd, n_ple * n_layer}, 0);
-    per_layer_proj_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM,  "weight", 0), {n_ple}, 0);
+    per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {n_ple * n_layer, n_vocab}, nf.trunk);
+    per_layer_model_proj = create_tensor(tn(LLM_TENSOR_PER_LAYER_MODEL_PROJ, "weight", 0), {n_embd, n_ple * n_layer}, nf.trunk);
+    per_layer_proj_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM,  "weight", 0), {n_ple}, nf.trunk);
 
-    for (int i = 0; i < n_layer; ++i) {
+    // the MTP block (layers n_layer..n_layer_all) is an MLA layer without the per-layer input
+    for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
+        const bool mtp = i >= n_layer;
+        const int flags = mtp ? nf.mtp : nf.trunk;
 
-        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-        layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, 0);
+        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
+        layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, flags);
 
-        layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc*n_embd, hc_mix_dim}, 0);
-        layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, 0);
-        layer.hc_attn_chart = create_tensor(tn(LLM_TENSOR_HC_ATTN_CHART, "weight", i), {hc_chart_dim}, 0);
-        layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc*n_embd, hc_mix_dim}, 0);
-        layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim}, 0);
-        layer.hc_ffn_chart  = create_tensor(tn(LLM_TENSOR_HC_FFN_CHART,  "weight", i), {hc_chart_dim}, 0);
+        layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc*n_embd, hc_mix_dim}, flags);
+        layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, flags);
+        layer.hc_attn_chart = create_tensor(tn(LLM_TENSOR_HC_ATTN_CHART, "weight", i), {hc_chart_dim}, flags);
+        layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc*n_embd, hc_mix_dim}, flags);
+        layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim}, flags);
+        layer.hc_ffn_chart  = create_tensor(tn(LLM_TENSOR_HC_FFN_CHART,  "weight", i), {hc_chart_dim}, flags);
 
         const int64_t n_head_l = hparams.n_head(i);
 
@@ -107,13 +112,13 @@ void llama_model_raon1_nano::load_arch_tensors(llama_model_loader &) {
 
             // q | k | v | g in one projection, q | k | v in one depthwise conv; ssm_f_a rows are [f_a | b | b + rda];
             // exp(A_log) is folded into ssm_f_b and the bias, so the decay gate is lower_bound * sigmoid(f_b(f_a(x)) + dt_bias)
-            layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", i), {n_embd, 4*d_inner}, 0);
-            layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {hparams.ssm_d_conv, 3*d_inner}, 0);
-            layer.ssm_f_a    = create_tensor(tn(LLM_TENSOR_SSM_F_A,    "weight", i), {n_embd, hparams.ssm_dt_rank + 2*n_head_l}, 0);
-            layer.ssm_f_b    = create_tensor(tn(LLM_TENSOR_SSM_F_B,    "weight", i), {hparams.ssm_dt_rank, d_inner}, 0);
-            layer.ssm_dt_b   = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   i), {d_inner}, 0);
-            layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", i), {head_dim}, 0);
-            layer.wo         = create_tensor(tn(LLM_TENSOR_ATTN_OUT,   "weight", i), {d_inner, n_embd}, 0);
+            layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", i), {n_embd, 4*d_inner}, flags);
+            layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {hparams.ssm_d_conv, 3*d_inner}, flags);
+            layer.ssm_f_a    = create_tensor(tn(LLM_TENSOR_SSM_F_A,    "weight", i), {n_embd, hparams.ssm_dt_rank + 2*n_head_l}, flags);
+            layer.ssm_f_b    = create_tensor(tn(LLM_TENSOR_SSM_F_B,    "weight", i), {hparams.ssm_dt_rank, d_inner}, flags);
+            layer.ssm_dt_b   = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   i), {d_inner}, flags);
+            layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", i), {head_dim}, flags);
+            layer.wo         = create_tensor(tn(LLM_TENSOR_ATTN_OUT,   "weight", i), {d_inner, n_embd}, flags);
         } else {
             const int64_t q_lora_rank      = hparams.n_lora_q;
             const int64_t kv_lora_rank     = hparams.n_lora_kv;
@@ -122,33 +127,45 @@ void llama_model_raon1_nano::load_arch_tensors(llama_model_loader &) {
             const int64_t qk_rope_head_dim = hparams.n_rot();
             const int64_t qk_nope_head_dim = n_embd_head_k - qk_rope_head_dim;
 
-            layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, 0);
-            layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, 0);
-            layer.wq_a      = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank}, 0);
-            layer.wq_b      = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head_l*n_embd_head_k}, 0);
-            layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + qk_rope_head_dim}, 0);
+            layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, flags);
+            layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, flags);
+            layer.wq_a      = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank}, flags);
+            layer.wq_b      = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head_l*n_embd_head_k}, flags);
+            layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + qk_rope_head_dim}, flags);
             // some files also carry an expanded kv_b; it is not used
-            if (ml->get_tensor_meta(tn(LLM_TENSOR_ATTN_KV_B, "weight", i).str().c_str())) {
+            if (ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_KV_B, "weight", i).str().c_str())) {
                 create_tensor(tn(LLM_TENSOR_ATTN_KV_B, "weight", i),
-                        {kv_lora_rank + qk_rope_head_dim, n_head_l*(n_embd_head_k + n_embd_head_v)}, TENSOR_SKIP);
+                        {kv_lora_rank + qk_rope_head_dim, n_head_l*(n_embd_head_k + n_embd_head_v)}, flags | TENSOR_SKIP);
             }
-            layer.wk_b      = create_tensor(tn(LLM_TENSOR_ATTN_K_B,  "weight", i), {qk_nope_head_dim, kv_lora_rank, n_head_l}, 0);
-            layer.wv_b      = create_tensor(tn(LLM_TENSOR_ATTN_V_B,  "weight", i), {kv_lora_rank, n_embd_head_v, n_head_l}, 0);
-            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_l*n_embd_head_v}, 0);
-            layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_head_l*n_embd_head_v, n_embd}, 0);
+            layer.wk_b      = create_tensor(tn(LLM_TENSOR_ATTN_K_B,  "weight", i), {qk_nope_head_dim, kv_lora_rank, n_head_l}, flags);
+            layer.wv_b      = create_tensor(tn(LLM_TENSOR_ATTN_V_B,  "weight", i), {kv_lora_rank, n_embd_head_v, n_head_l}, flags);
+            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_l*n_embd_head_v}, flags);
+            layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_head_l*n_embd_head_v, n_embd}, flags);
         }
 
-        layer.per_layer_inp_gate  = create_tensor(tn(LLM_TENSOR_PER_LAYER_INP_GATE,  "weight", i), {n_embd, n_ple}, 0);
-        layer.per_layer_proj      = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ,      "weight", i), {n_ple, n_embd}, 0);
-        layer.per_layer_post_norm = create_tensor(tn(LLM_TENSOR_PER_LAYER_POST_NORM, "weight", i), {n_embd}, 0);
+        if (!mtp) {
+            layer.per_layer_inp_gate  = create_tensor(tn(LLM_TENSOR_PER_LAYER_INP_GATE,  "weight", i), {n_embd, n_ple}, flags);
+            layer.per_layer_proj      = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ,      "weight", i), {n_ple, n_embd}, flags);
+            layer.per_layer_post_norm = create_tensor(tn(LLM_TENSOR_PER_LAYER_POST_NORM, "weight", i), {n_embd}, flags);
+        }
 
         // ffn_up rows are [gate | up], for one swiglu
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, 2*n_ff}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, 2*n_ff}, flags);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, flags);
+
+        if (mtp) {
+            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, flags);
+            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, flags);
+            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, flags);
+            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, flags);
+        }
     }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_raon1_nano::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -413,13 +430,93 @@ llama_model_raon1_nano::graph::graph(const llama_model & model, const llm_graph_
     res->t_layer_inp[n_layer] = inp;
 
     ggml_tensor * cur = ggml_scale(ctx0, stream_sum(inp), 1.0f/hc);
-    if (out_ids) {
+    if (crop_before_nextn(out_ids)) {
         cur = ggml_get_rows(ctx0, cur, out_ids);
     }
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    // the MTP head reads the final-normed hidden state (the lm_head input)
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+    if (crop_after_nextn(out_ids)) {
+        cur = ggml_get_rows(ctx0, cur, out_ids);
+    }
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
     cur = build_lora_mm(model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+}
+
+// MTP block: h = the trunk's final-normed hidden at position i, e = the embedding of token i+1;
+// x = eh_proj([enorm(e) ; hnorm(h)]) is copied to every mHC stream, runs one MLA layer (no per-layer input),
+// and the stream mean goes through shared_head_norm to the tied head. That normed state is also the next draft step's h.
+llama_model_raon1_nano::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
+    graph(params, no_build{}) {
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "Raon-1 nano MTP has a single block");
+    ASSERT_EMBD_OR_TOKEN(ubatch);
+
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const int il = hparams.n_layer();
+    const auto & layer = model.layers[il];
+    GGML_ASSERT(!hparams.is_recr(il));
+    GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm && layer.nextn.shared_head_norm &&
+            "MTP block missing, load the model with MTP enabled");
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * tok_embd = ubatch.token ? ggml_get_rows(ctx0, model.tok_embd, inp->tokens) : inp->embd;
+    cb(tok_embd, "mtp_tok_embd", il);
+    ggml_tensor * h_norm = build_norm(inp->h, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    res->add_input(std::move(inp));
+
+    ggml_tensor * x = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0));
+    cb(x, "mtp_eh_proj", il);
+
+    ggml_tensor * out_ids = build_inp_out_ids();
+    auto * inp_attn = build_attn_inp_k();
+
+    ggml_tensor * stream = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, x, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    ggml_tensor * post;
+    ggml_tensor * comb;
+    ggml_tensor * cur = build_hc_pre(stream, layer.hc_attn_fn, layer.hc_attn_base, layer.hc_attn_chart, layer.attn_norm, &post, &comb, il);
+    cur = build_mla_layer(cur, layer, inp_attn, il);
+    stream = build_hc_post(stream, cur, post, comb, il);
+    cur = build_hc_pre(stream, layer.hc_ffn_fn, layer.hc_ffn_base, layer.hc_ffn_chart, layer.ffn_norm, &post, &comb, il);
+    // the MTP SwiGLU output exceeds the F16 range (1e5 seen), which an F16 ffn_down turns into inf on backends
+    // that round the activation to half (Metal); a power-of-two scale around ffn_down is exact
+    const float ffn_scale = 64.0f;
+    cur = ggml_swiglu(ctx0, build_lora_mm(layer.ffn_up, cur));
+    cb(cur, "ffn_swiglu", il);
+    cur = build_lora_mm(layer.ffn_down, ggml_scale(ctx0, cur, 1.0f/ffn_scale));
+    ggml_prec_set_acc(cur, GGML_PREC_F32);
+    cur = ggml_scale(ctx0, cur, ffn_scale);
+    cb(cur, "ffn_out", il);
+    stream = build_hc_post(stream, cur, post, comb, il);
+
+    cur = nullptr;
+    for (int64_t i = 0; i < hc; ++i) {
+        ggml_tensor * xi = ggml_view_2d(ctx0, stream, n_embd, n_tokens, stream->nb[2], i*stream->nb[1]);
+        cur = cur ? ggml_add(ctx0, cur, xi) : xi;
+    }
+    cur = ggml_scale(ctx0, cur, 1.0f/hc);
+    cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "h_nextn", -1);
+
+    ggml_tensor * cur_out = out_ids ? ggml_get_rows(ctx0, cur, out_ids) : cur;
+    res->t_h_nextn = cparams.embeddings_nextn_masked ? cur_out : cur;
+    ggml_build_forward_expand(gf, res->t_h_nextn);
+    cb(cur_out, "result_norm", -1);
+    res->t_embd = cur_out;
+
+    cur = build_lora_mm(model.output, cur_out);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

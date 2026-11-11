@@ -1598,6 +1598,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // raon1nano: the MTP block was trained on (h_i, x_{i+1}) pairs only, so position 0 (no h) is not decoded
+    bool skip_pos0 = false;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1610,6 +1613,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+        {
+            char arch[64] = {0};
+            skip_pos0 = llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch)) > 0 &&
+                        std::string(arch) == "raon1nano";
+        }
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -1757,6 +1765,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const llama_seq_id seq_id = t.seq_id;
 
+                if (skip_pos0 && t.pos[0] == 0) {
+                    continue;
+                }
+
                 // vision tokens carry an embedding instead of an id
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
                     ? batch.add(t.id, t.pos[0], seq_id, false)
@@ -1772,7 +1784,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
+            for (int head = 0; head < n_mtp_layers && batch.size() > 0; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

@@ -2867,6 +2867,10 @@ struct llama_model_raon1_nano : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // the helpers only, for graph_mtp
+        struct no_build {};
+        graph(const llm_graph_params & params, no_build) : llm_build_delta_net_base(params) {}
+
         // returns the branch input already RMS-normed with norm_w
         ggml_tensor * build_hc_pre(ggml_tensor * x, ggml_tensor * fn, ggml_tensor * base, ggml_tensor * chart,
                                    ggml_tensor * norm_w, ggml_tensor ** post, ggml_tensor ** comb, int il);
@@ -2879,6 +2883,11 @@ struct llama_model_raon1_nano : public llama_model_base {
 
         ggml_tensor * build_mla_layer(ggml_tensor * cur, const llama_layer & layer,
                                       llm_graph_input_attn_k * inp_attn_k, int il);
+    };
+
+    // LLM_GRAPH_TYPE_DECODER_MTP: the single MLA MTP block (layer n_layer), fed by [enorm(e) ; hnorm(h)]
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 };
 
