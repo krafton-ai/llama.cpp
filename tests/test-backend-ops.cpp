@@ -9003,6 +9003,48 @@ struct test_rms_norm_mul_add_bcast : public test_case {
     }
 };
 
+// GGML_OP_CONCAT(conv state, new token) + CPY(new conv state -> cache) + SSM_CONV + SILU: one decode step of a short
+// conv, in the node order of build_conv_state
+struct test_concat_ssm_conv_silu : public test_case {
+    const int64_t d_conv;
+    const int64_t n_ch;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_SSM_CONV_SILU";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(d_conv, n_ch);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_concat_ssm_conv_silu(int64_t d_conv, int64_t n_ch)
+        : d_conv(d_conv), n_ch(n_ch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv - 1, n_ch);
+        ggml_set_name(state, "state");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_ch);
+        ggml_set_name(w, "w");
+        ggml_tensor * cache = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (d_conv - 1)*n_ch);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * cat  = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        ggml_tensor * last = ggml_view_2d(ctx, cat, d_conv - 1, n_ch, cat->nb[1], ggml_element_size(cat));
+        ggml_tensor * cpy  = ggml_cpy(ctx, last, cache);
+        ggml_tensor * act  = ggml_silu(ctx, ggml_ssm_conv(ctx, cat, w));
+
+        // both results in one output, the copy first
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, cpy, d_conv - 1, n_ch), ggml_reshape_2d(ctx, act, 1, n_ch), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12590,6 +12632,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add_bcast(512, 4, 1));
     test_cases.emplace_back(new test_rms_norm_mul_add_bcast(2048, 4, 6));
     test_cases.emplace_back(new test_rms_norm_mul_add_bcast(64, 8, 3));
+
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 96));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 3000));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(3, 64));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(8, 50));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

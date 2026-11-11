@@ -472,3 +472,45 @@ kernel void kernel_dsv4_hc_post_sum(
         *(global float *) (sdst + offset_sd + i * sizeof(float) + t * nbs1) = tot;
     }
 }
+
+//------------------------------------------------------------------------------
+// concat_ssm_conv_silu: one token of CONCAT(state, x^T) -> CPY(new state) -> SSM_CONV -> SILU.
+// Item c: v = [state[0..nc-2, c], x[c]], y[c] = silu(sum_k v[k] w[k, c]), new state = v[1..nc-1]
+//------------------------------------------------------------------------------
+kernel void kernel_concat_ssm_conv_silu(
+        global const char * state,
+        ulong offset_s,
+        ulong nbs0,
+        ulong nbs1,
+        global const char * x,
+        ulong offset_x,
+        ulong nbx1,
+        global const char * w,
+        ulong offset_w,
+        ulong nbw1,
+        global char * y,
+        ulong offset_y,
+        global char * sdst,
+        ulong offset_sd,
+        int nc,
+        int nch) {
+    const int c = get_global_id(0);
+    if (c >= nch) {
+        return;
+    }
+    float v[FUSED_MAX_HC];
+    for (int k = 0; k < nc - 1; ++k) {
+        v[k] = *(global const float *) (state + offset_s + k * nbs0 + c * nbs1);
+    }
+    v[nc - 1] = *(global const float *) (x + offset_x + c * nbx1);
+    global const float * wc = (global const float *) (w + offset_w + c * nbw1);
+    float acc = 0.0f;
+    for (int k = 0; k < nc; ++k) {
+        acc += v[k] * wc[k];
+    }
+    *((global float *) (y + offset_y) + c) = acc / (1.0f + exp(-acc));
+    global float * s = (global float *) (sdst + offset_sd) + c * (nc - 1);
+    for (int k = 0; k < nc - 1; ++k) {
+        s[k] = v[k + 1];
+    }
+}

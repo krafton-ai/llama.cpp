@@ -867,6 +867,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_dsv4_hc_pre_rms_norm          = nullptr;
     cl_kernel kernel_rms_norm_mul_sigmoid_mul      = nullptr;
     cl_kernel kernel_rms_norm_mul_add_bcast        = nullptr;
+    cl_kernel kernel_concat_ssm_conv_silu          = nullptr;
     cl_kernel kernel_dsv4_hc_post_sum              = nullptr;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
@@ -1760,6 +1761,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_dsv4_hc_pre_rms_norm = clCreateKernel(prog, "kernel_dsv4_hc_pre_rms_norm", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_sigmoid_mul = clCreateKernel(prog, "kernel_rms_norm_mul_sigmoid_mul", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_add_bcast = clCreateKernel(prog, "kernel_rms_norm_mul_add_bcast", &err), err));
+        CL_CHECK((backend_ctx->kernel_concat_ssm_conv_silu = clCreateKernel(prog, "kernel_concat_ssm_conv_silu", &err), err));
         CL_CHECK((backend_ctx->kernel_dsv4_hc_post_sum = clCreateKernel(prog, "kernel_dsv4_hc_post_sum", &err), err));
         // the fusion kernels use 256-wide work-groups; without them the unfused graph runs
         cl_kernel * fused[] = {
@@ -1772,6 +1774,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             &backend_ctx->kernel_dsv4_hc_pre_rms_norm,
             &backend_ctx->kernel_rms_norm_mul_sigmoid_mul,
             &backend_ctx->kernel_rms_norm_mul_add_bcast,
+            &backend_ctx->kernel_concat_ssm_conv_silu,
         };
         for (size_t i = 0; i < sizeof(fused)/sizeof(fused[0]); ++i) {
             size_t max_wg = 0;
@@ -8914,6 +8917,147 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// [first, last) byte range of a tensor in its device buffer
+struct ggml_cl_range {
+    cl_mem   buf;
+    cl_ulong first, last;
+};
+
+static ggml_cl_range ggml_cl_tensor_range(const ggml_tensor * t) {
+    const ggml_tensor_extra_cl * e     = (const ggml_tensor_extra_cl *) t->extra;
+    const cl_ulong               first = e->offset + t->view_offs;
+    return { e->data_device, first, first + ggml_nbytes(t) };
+}
+
+static bool ggml_cl_ranges_overlap(const ggml_cl_range & a, const ggml_cl_range & b) {
+    return a.buf == b.buf && a.first < b.last && b.first < a.last;
+}
+
+// the next node after i that graph_compute runs (it skips views, reshapes and empty tensors, e.g. the zero-sized
+// state clear of build_rs), or -1
+static int ggml_opencl_next_compute(const ggml_cgraph * cgraph, int i) {
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op != GGML_OP_VIEW && n->op != GGML_OP_RESHAPE && n->op != GGML_OP_PERMUTE &&
+            n->op != GGML_OP_TRANSPOSE && n->op != GGML_OP_NONE && !ggml_is_empty(n) &&
+            (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+// true when no compute node other than a and b reads t (directly or through a view)
+static bool ggml_opencl_only_users(const ggml_cgraph * cgraph,
+                                   const ggml_tensor * t,
+                                   const ggml_tensor * a,
+                                   const ggml_tensor * b) {
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE ||
+            n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE || n == a || n == b) {
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s && (s == t || s->view_src == t)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// one decode token of the delta-net short conv: CONCAT(conv state, x^T) at node i, then the CPY of the new state
+// into the recurrent cache, SSM_CONV and SILU. Returns the SILU node, the CPY and the SSM_CONV in nodes[]
+static bool ggml_opencl_match_concat_ssm_conv_silu(const ggml_cgraph * cgraph, int i, const ggml_tensor * nodes[3]) {
+    const ggml_tensor * cat = cgraph->nodes[i];
+    const ggml_tensor * st  = cat->src[0];
+    const ggml_tensor * x   = cat->src[1];
+    const int64_t       nc = cat->ne[0], nch = cat->ne[1];
+    if (ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || st->type != GGML_TYPE_F32 ||
+        x->type != GGML_TYPE_F32 || nc < 2 || nc > 8 || x->ne[0] != 1 || st->ne[0] != nc - 1 || cat->ne[2] != 1 ||
+        cat->ne[3] != 1) {
+        return false;
+    }
+    const int j1 = ggml_opencl_next_compute(cgraph, i);
+    // the recurrent state gather of the layer (SCALE, GET_ROWS, CPY) may sit between the state copy and the conv
+    int       j2 = -1;
+    for (int j = j1 < 0 ? cgraph->n_nodes : j1 + 1; j < cgraph->n_nodes && j <= j1 + 16; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_SSM_CONV) {
+            j2 = j;
+            break;
+        }
+    }
+    const int j3 = j2 < 0 ? -1 : ggml_opencl_next_compute(cgraph, j2);
+    if (j3 < 0) {
+        return false;
+    }
+    const ggml_tensor * cpy  = cgraph->nodes[j1];
+    const ggml_tensor * conv = cgraph->nodes[j2];
+    const ggml_tensor * act  = cgraph->nodes[j3];
+    const ggml_tensor * last = cpy->src[0];
+    if (cpy->op != GGML_OP_CPY || last == nullptr || last->view_src != cat || last->view_offs != sizeof(float) ||
+        last->ne[0] != nc - 1 || last->ne[1] != nch || last->nb[1] != cat->nb[1] || cpy->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(cpy) || ggml_nelements(cpy) != (nc - 1) * nch || cpy->src[1] == nullptr ||
+        cpy->src[1]->extra == nullptr) {
+        return false;
+    }
+    if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != cat || conv->src[1]->type != GGML_TYPE_F32 ||
+        conv->src[1]->ne[0] != nc || conv->src[1]->ne[1] != nch || conv->src[1]->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (act->op != GGML_OP_UNARY || ggml_get_unary_op(act) != GGML_UNARY_OP_SILU || act->src[0] != conv ||
+        !ggml_is_contiguous(act) || act->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_opencl_only_users(cgraph, cat, cpy, conv) || !ggml_opencl_only_users(cgraph, conv, act, nullptr)) {
+        return false;
+    }
+    // the fused kernel writes the outputs while it reads the inputs: no output may overlap an input, except the
+    // same element read and written by one work item (x[c] -> y[c], or the new state over the old one in place)
+    const ggml_cl_range rs = ggml_cl_tensor_range(st), rx = ggml_cl_tensor_range(x),
+                        rw = ggml_cl_tensor_range(conv->src[1]);
+    const ggml_cl_range ry = ggml_cl_tensor_range(act), rd = ggml_cl_tensor_range(cpy);
+    const bool          y_on_x = ry.buf == rx.buf && ry.first == rx.first && x->nb[1] == sizeof(float);
+    const bool          s_on_s = rd.buf == rs.buf && rd.first == rs.first && ggml_is_contiguous(st);
+    if ((ggml_cl_ranges_overlap(ry, rx) && !y_on_x) || ggml_cl_ranges_overlap(ry, rs) ||
+        ggml_cl_ranges_overlap(ry, rw) || ggml_cl_ranges_overlap(ry, rd) ||
+        (ggml_cl_ranges_overlap(rd, rs) && !s_on_s) || ggml_cl_ranges_overlap(rd, rx) ||
+        ggml_cl_ranges_overlap(rd, rw)) {
+        return false;
+    }
+    // nodes between run after the fused kernel: none may touch the outputs or overwrite the inputs
+    for (int j = j1 + 1; j < j2; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (!(n->flags & GGML_TENSOR_FLAG_COMPUTE) || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE ||
+            n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE || ggml_is_empty(n)) {
+            continue;
+        }
+        const ggml_cl_range rn = ggml_cl_tensor_range(n);
+        if (ggml_cl_ranges_overlap(rn, ry) || ggml_cl_ranges_overlap(rn, rd) || ggml_cl_ranges_overlap(rn, rs) ||
+            ggml_cl_ranges_overlap(rn, rx) || ggml_cl_ranges_overlap(rn, rw)) {
+            return false;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (n->src[k] && n->src[k]->extra) {
+                const ggml_cl_range rk = ggml_cl_tensor_range(n->src[k]);
+                if (ggml_cl_ranges_overlap(rk, ry) || ggml_cl_ranges_overlap(rk, rd)) {
+                    return false;
+                }
+            }
+        }
+    }
+    nodes[0] = act;
+    nodes[1] = cpy;
+    nodes[2] = conv;
+    return true;
+}
+
+static void                ggml_opencl_fused_concat_ssm_conv_silu(ggml_backend_t            backend,
+                                                                  const ggml_tensor *       cat,
+                                                                  const ggml_tensor * const nodes[3]);
+
 // Fused op chains (kernels/fused_ops.cl): each matcher checks one chain, each runner computes it with one kernel.
 
 // work-group sizes of the fused kernels (FUSED_WG, FUSED_WG_ROW in kernels/fused_ops.cl)
@@ -9583,8 +9727,44 @@ static void ggml_opencl_fused_rms_norm_mul_mat_add(ggml_backend_t backend, const
     }
 }
 
+static void ggml_opencl_fused_concat_ssm_conv_silu(ggml_backend_t            backend,
+                                                   const ggml_tensor *       cat,
+                                                   const ggml_tensor * const nodes[3]) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    cl_kernel                     kernel      = backend_ctx->kernel_concat_ssm_conv_silu;
+    const ggml_tensor *           st          = cat->src[0];
+    const ggml_tensor *           x           = cat->src[1];
+    const ggml_tensor *           w           = nodes[2]->src[1];
+
+    const int      nc   = (int) cat->ne[0];
+    const int      nch  = (int) cat->ne[1];
+    const cl_ulong nbs0 = st->nb[0];
+    const cl_ulong nbs1 = st->nb[1];
+    const cl_ulong nbx1 = x->nb[1];
+    const cl_ulong nbw1 = w->nb[1];
+
+    cl_uint idx = 0;
+    ggml_opencl_arg_tensor(kernel, idx, st);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbs0));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbs1));
+    ggml_opencl_arg_tensor(kernel, idx, x);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbx1));
+    ggml_opencl_arg_tensor(kernel, idx, w);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbw1));
+    ggml_opencl_arg_tensor(kernel, idx, nodes[0]);
+    ggml_opencl_arg_tensor(kernel, idx, nodes[1]);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &nc));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &nch));
+
+    size_t lws[1] = { 64 };
+    size_t gws[1] = { (size_t) (nch + 63) / 64 * 64 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, nodes[0]);
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    // nodes already computed by a fused kernel at an earlier node
+    const ggml_tensor *          fused_skip[3]   = {};
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -9602,6 +9782,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
+        if (node == fused_skip[0] || node == fused_skip[1] || node == fused_skip[2]) {
+            continue;
+        }
         if (!backend_ctx->disable_fusion && node->op == GGML_OP_UNARY) {
             const int last = ggml_opencl_match_sigmoid_div_mul(backend_ctx, cgraph, i);
             if (last > 0) {
@@ -9646,6 +9829,11 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             ggml_opencl_match_dsv4_hc_pre_rms_norm(backend_ctx, cgraph, i)) {
             ggml_opencl_fused_dsv4_hc_pre_rms_norm(backend, cgraph, i);
             i += 2;
+            continue;
+        }
+        if (!backend_ctx->disable_fusion && backend_ctx->kernel_concat_ssm_conv_silu && node->op == GGML_OP_CONCAT &&
+            ggml_opencl_match_concat_ssm_conv_silu(cgraph, i, fused_skip)) {
+            ggml_opencl_fused_concat_ssm_conv_silu(backend, node, fused_skip);
             continue;
         }
 
