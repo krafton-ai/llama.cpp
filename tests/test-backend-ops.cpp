@@ -13654,6 +13654,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // MMA-eligible GDN shapes: whole heads, value slices, tails, and the HIP prefill threshold.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 1, 1));
+    // KDA (vector gate) at 16 heads of 128: the chunked MMA path from 64 tokens
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 2, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  100, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  257, 2, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 1, 2, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 4, 4, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 3, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  257, 1, 3));
@@ -13812,6 +13822,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32, 512, 4, 0, 1, 1));
     test_cases.emplace_back(new test_delta_net_layer(1536, 128, 16, 64,   1, 4, 0, 1, 1));
     test_cases.emplace_back(new test_delta_net_layer(1536, 128, 16, 64,   7, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer(1536, 128, 16, 64,  64, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer(1536, 128, 16, 64, 512, 4, 0, 1, 1));
     test_cases.emplace_back(new test_delta_net_layer( 256,  64,  4, 32,   1, 3, 0, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net_state_rows(4, 128, 1, true,  1, 1));
     test_cases.emplace_back(new test_gated_delta_net_state_rows(4, 128, 1, true,  0, 2));

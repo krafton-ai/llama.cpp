@@ -30,6 +30,7 @@ struct ggml_cuda_gdn_mma_args {
     int64_t sb3;
     float   scale;
     bool    eligible;
+    bool    kda;       // one log gate per key dimension (g is [D, H, n_tokens, n_seqs])
 };
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);
