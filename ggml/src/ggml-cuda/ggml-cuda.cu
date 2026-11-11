@@ -7,6 +7,7 @@
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
+#include "ggml-cuda/mla-expand-kv.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/binbcast.cuh"
@@ -2526,6 +2527,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_MLA_EXPAND_KV:
+            ggml_cuda_op_mla_expand_kv(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -5967,6 +5971,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_MLA_EXPAND_KV:
+            return op->src[0]->type == GGML_TYPE_F16 && op->src[0]->nb[1] % 2 == 0 &&
+                (op->src[1]->type == GGML_TYPE_F16 || ggml_get_to_fp16_cuda(op->src[1]->type) != nullptr) &&
+                (op->src[2]->type == GGML_TYPE_F16 || ggml_get_to_fp16_cuda(op->src[2]->type) != nullptr);
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
