@@ -696,14 +696,37 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         if (!cparams.flash_attn || cparams.n_ubatch < llm_fused_op_mla_expand_probe.n_tokens_per_seq*n_seqs_mla) {
             cparams.mla_expand = false;
         } else {
-            resolve(llm_fused_op_mla_expand_probe, cparams.mla_expand, n_seqs_mla);
+            const auto & probe = llm_fused_op_mla_expand_probe;
+            const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs_mla;
 
-            bool found = false;
-            for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
-                found = found || node.op == LLM_FUSED_OP_MLA_EXPAND_KV;
+            if (!graph_reserve(n_tokens_probe, n_seqs_mla, n_tokens_probe, mctx, true)) {
+                throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
             }
+
+            // support depends on the weight types and the cache layout of the reserved node, so ask the layer's
+            // device directly instead of reporting the scheduler's fallback assignment
+            bool found     = false;
+            bool supported = true;
+            for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+                if (node.op != probe.op) {
+                    continue;
+                }
+                found = true;
+
+                ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+                if (device_layer && !ggml_backend_dev_supports_op(device_layer, node.tensor)) {
+                    supported = false;
+                    break;
+                }
+            }
+
+            cparams.mla_expand = found && supported;
             if (!found) {
-                cparams.mla_expand = false;
+                LLAMA_LOG_DEBUG("%s: %s not used by this graph, set to disabled\n", func, probe.name);
+            } else if (!supported) {
+                LLAMA_LOG_INFO("%s: %s not supported, set to disabled\n", func, probe.name);
+            } else {
+                LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
             }
         }
         cparams.auto_mla_expand = false;
