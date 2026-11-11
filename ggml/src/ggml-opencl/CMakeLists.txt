@@ -67,6 +67,7 @@ set(GGML_OPENCL_KERNELS
     moe_add_id_glu
     argsort
     tri
+    dsv4_hc
     fill
     clamp
     cpy

@@ -851,6 +851,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gelu_quick, kernel_gelu_quick_4;
     cl_kernel kernel_relu;
     cl_kernel kernel_sigmoid_f32, kernel_sigmoid_f16;
+    cl_kernel kernel_dsv4_hc_pre_f32 = nullptr, kernel_dsv4_hc_post_f32 = nullptr, kernel_dsv4_hc_comb_f32 = nullptr;
     cl_kernel kernel_tri;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
@@ -3247,6 +3248,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_sigmoid_f32 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_sigmoid_f16 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f16", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // dsv4_hc (mHC pre / post / comb): built without the fast-math options so that the results follow
+    // the CPU reference (explicit fma, IEEE exp and division)
+    {
+        const std::string exact_opts = std::string("-cl-std=") + opencl_c_std;
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "dsv4_hc.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("dsv4_hc.cl");
+#endif
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), exact_opts);
+        CL_CHECK((backend_ctx->kernel_dsv4_hc_pre_f32  = clCreateKernel(prog, "kernel_dsv4_hc_pre_f32",  &err), err));
+        CL_CHECK((backend_ctx->kernel_dsv4_hc_post_f32 = clCreateKernel(prog, "kernel_dsv4_hc_post_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_dsv4_hc_comb_f32 = clCreateKernel(prog, "kernel_dsv4_hc_comb_f32", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
 
@@ -9352,6 +9372,18 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
         case GGML_OP_TRI:
             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+        case GGML_OP_DSV4_HC_PRE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+        case GGML_OP_DSV4_HC_POST:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
+                   op->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_HC_COMB:
+            // the kernel is written for hc = 4, like the CUDA one
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->ne[0] == 4 && op->ne[1] == 4 &&
+                   op->src[0]->ne[0] == (2 + 4) * 4;
         case GGML_OP_FILL:
             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_CLAMP:
@@ -15156,6 +15188,200 @@ static void ggml_cl_relu(ggml_backend_t backend, const ggml_tensor * src0, const
     }
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
+}
+
+static void ggml_cl_dsv4_hc_pre(ggml_backend_t      backend,
+                                const ggml_tensor * src0,
+                                const ggml_tensor * src1,
+                                ggml_tensor *       dst) {
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    ggml_tensor_extra_cl * extrax = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extraw = (ggml_tensor_extra_cl *) src1->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong offx = extrax->offset + src0->view_offs;
+    const cl_ulong offw = extraw->offset + src1->view_offs;
+    const cl_ulong offd = extrad->offset + dst->view_offs;
+
+    const int n_embd   = src0->ne[0];
+    const int hc       = src0->ne[1];
+    const int n_tokens = src0->ne[2];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const int   gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const cl_ulong nbx0 = src0->nb[0], nbx1 = src0->nb[1], nbx2 = src0->nb[2];
+    const cl_ulong nbw0 = src1->nb[0], nbw1 = src1->nb[1], nbw2 = src1->nb[2];
+    const cl_ulong nbd0 = dst->nb[0], nbd1 = dst->nb[1];
+
+    cl_kernel kernel = backend_ctx->kernel_dsv4_hc_pre_f32;
+
+    int i = 0;
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extrax->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offx));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extraw->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offw));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &n_embd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &hc));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &n_tokens));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbw0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbw1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbw2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(float), &scale));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &gated));
+
+    size_t local_work_size[2]  = { 64, 1 };
+    size_t global_work_size[2] = { ((size_t) n_embd + 63) / 64 * 64, (size_t) n_tokens };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_dsv4_hc_post(ggml_backend_t      backend,
+                                 const ggml_tensor * src0,
+                                 const ggml_tensor * src1,
+                                 ggml_tensor *       dst) {
+    const ggml_tensor * post = dst->src[2];
+    const ggml_tensor * comb = dst->src[3];
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(post && post->extra);
+    GGML_ASSERT(comb == nullptr || comb->extra);
+    GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    ggml_tensor_extra_cl * extrax = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extrar = (ggml_tensor_extra_cl *) src1->extra;
+    ggml_tensor_extra_cl * extrap = (ggml_tensor_extra_cl *) post->extra;
+    ggml_tensor_extra_cl * extrac =
+        comb ? (ggml_tensor_extra_cl *) comb->extra : extrap;  // any valid buffer when comb is null
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong offx = extrax->offset + src0->view_offs;
+    const cl_ulong offr = extrar->offset + src1->view_offs;
+    const cl_ulong offp = extrap->offset + post->view_offs;
+    const cl_ulong offc = comb ? extrac->offset + comb->view_offs : offp;
+    const cl_ulong offd = extrad->offset + dst->view_offs;
+
+    const int n_embd   = src0->ne[0];
+    const int n_tokens = src0->ne[1];
+    const int hc       = src1->ne[1];
+    const int has_comb = comb != nullptr;
+
+    const cl_ulong nbx0 = src0->nb[0], nbx1 = src0->nb[1];
+    const cl_ulong nbr0 = src1->nb[0], nbr1 = src1->nb[1], nbr2 = src1->nb[2];
+    const cl_ulong nbp0 = post->nb[0], nbp1 = post->nb[1];
+    const cl_ulong nbc0 = comb ? comb->nb[0] : 0, nbc1 = comb ? comb->nb[1] : 0, nbc2 = comb ? comb->nb[2] : 0;
+    const cl_ulong nbd0 = dst->nb[0], nbd1 = dst->nb[1], nbd2 = dst->nb[2];
+
+    cl_kernel kernel = backend_ctx->kernel_dsv4_hc_post_f32;
+
+    int i = 0;
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extrax->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offx));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extrar->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offr));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extrap->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offp));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extrac->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offc));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &n_embd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &hc));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &n_tokens));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbr0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbr1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbr2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbp0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbp1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbc0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbc1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbc2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &has_comb));
+
+    size_t local_work_size[2]  = { 64, 1 };
+    size_t global_work_size[2] = { ((size_t) n_embd + 63) / 64 * 64, (size_t) hc * n_tokens };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_dsv4_hc_comb(ggml_backend_t      backend,
+                                 const ggml_tensor * src0,
+                                 const ggml_tensor * src1,
+                                 ggml_tensor *       dst) {
+    const ggml_tensor * base = dst->src[2];
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(base && base->extra);
+    GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    ggml_tensor_extra_cl * extram = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extras = (ggml_tensor_extra_cl *) src1->extra;
+    ggml_tensor_extra_cl * extrab = (ggml_tensor_extra_cl *) base->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong offm = extram->offset + src0->view_offs;
+    const cl_ulong offs = extras->offset + src1->view_offs;
+    const cl_ulong offb = extrab->offset + base->view_offs;
+    const cl_ulong offd = extrad->offset + dst->view_offs;
+
+    const int   n_tokens = src0->ne[1];
+    const float eps      = ggml_get_op_params_f32(dst, 0);
+    const int   n_iter   = ggml_get_op_params_i32(dst, 1);
+
+    const cl_ulong nbm0 = src0->nb[0], nbm1 = src0->nb[1];
+    const cl_ulong nbs0 = src1->nb[0];
+    const cl_ulong nbb0 = base->nb[0];
+    const cl_ulong nbd0 = dst->nb[0], nbd1 = dst->nb[1], nbd2 = dst->nb[2];
+
+    cl_kernel kernel = backend_ctx->kernel_dsv4_hc_comb_f32;
+
+    int i = 0;
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extram->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offm));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extras->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offs));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extrab->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offb));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem), &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &n_tokens));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbm0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbm1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbs0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbb0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(float), &eps));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int), &n_iter));
+
+    size_t local_work_size[1]  = { 64 };
+    size_t global_work_size[1] = { ((size_t) n_tokens + 63) / 64 * 64 };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, dst);
 }
 
 static void ggml_cl_sigmoid(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -30369,6 +30595,24 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_tri;
+            break;
+        case GGML_OP_DSV4_HC_POST:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_dsv4_hc_post;
+            break;
+        case GGML_OP_DSV4_HC_PRE:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_dsv4_hc_pre;
+            break;
+        case GGML_OP_DSV4_HC_COMB:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_dsv4_hc_comb;
             break;
         case GGML_OP_FILL:
             if (!any_on_device) {
