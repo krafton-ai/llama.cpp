@@ -1018,6 +1018,13 @@ struct vk_device_struct {
     size_t bar_max_buffer = 0;
     size_t bar_budget = 0;
     std::atomic<size_t> bar_used {0};
+
+    // small writes to a compute buffer outside host-visible memory, recorded together in front of the next graph
+    struct vk_pending_upload { vk_buffer dst; size_t dst_offset; size_t staging_offset; size_t size; };
+    std::vector<vk_pending_upload> pending_uploads;
+    vk_buffer upload_staging;
+    size_t upload_staging_used = 0;
+    std::atomic<int> n_backends {0};
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
 

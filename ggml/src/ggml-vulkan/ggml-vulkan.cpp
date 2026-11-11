@@ -5535,6 +5535,7 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->name = GGML_VK_NAME + std::to_string(idx);
 
     ctx->device = ggml_vk_get_device(idx);
+    ctx->device->n_backends++;
 
     ctx->semaphore_idx = 0;
     ctx->event_idx = 0;
@@ -13119,6 +13120,11 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+    if (--ctx->device->n_backends == 0) {
+        ctx->device->pending_uploads.clear();
+        ctx->device->upload_staging_used = 0;
+        ggml_vk_destroy_buffer(ctx->device->upload_staging);
+    }
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
@@ -13178,6 +13184,7 @@ bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
 void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_free_buffer()");
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+    ggml_vk_upload_drop(ctx->dev_buffer);
     ggml_vk_destroy_buffer(ctx->dev_buffer);
     delete ctx;
 }
@@ -13206,6 +13213,7 @@ void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_ten
     }
 
     uint32_t val32 = (uint32_t)value * 0x01010101;
+    ggml_vk_upload_flush(buf->device);
     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
 }
 
@@ -13218,7 +13226,14 @@ void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor
         return;
     }
 
-    ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    const size_t dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        !(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && ggml_vk_upload_defer(buf, dst_offset, data, size)) {
+        return;
+    }
+
+    ggml_vk_upload_flush(buf->device);
+    ggml_vk_buffer_write(buf, dst_offset, data, size);
 }
 
 void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset,
@@ -13232,6 +13247,7 @@ void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_ten
         return;
     }
 
+    ggml_vk_upload_flush(buf->device);
     ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
 }
 
@@ -13245,6 +13261,7 @@ void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
+    ggml_vk_upload_flush(buf->device);
     ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -13260,6 +13277,7 @@ void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const gg
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
+    ggml_vk_upload_flush(buf->device);
     ggml_vk_buffer_read_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_tensor, stride_data, size, n_copies);
 }
 
@@ -13275,6 +13293,7 @@ bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_
         vk_buffer src_buf = src_buf_ctx->dev_buffer;
         vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
 
+        ggml_vk_upload_flush(dst_buf->device);
         ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
 
         return true;
@@ -13287,6 +13306,7 @@ bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_
 void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
+    ggml_vk_upload_flush(ctx->dev_buffer->device);
     ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
 }
 
@@ -13438,6 +13458,8 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
+    ggml_vk_upload_flush(ctx->device);
+
     vk_context cpy_ctx;
 
     if (ctx->device->async_use_transfer_queue) {
@@ -13500,6 +13522,8 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
     }
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+
+    ggml_vk_upload_flush(ctx->device);
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
@@ -13569,6 +13593,8 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             return false;
         }
 
+        ggml_vk_upload_flush(ctx->device);
+
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
         ggml_vk_buffer_copy_async(compute_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs,
@@ -13598,6 +13624,12 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
         if ((backend_src == backend_dst || src_backend_synchronous) && backend_idle && dst_host_coherent && ggml_nbytes(src) <= max_cpu_copy_size) {
             ggml_vk_buffer_write(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src->data, ggml_nbytes(src));
+            return true;
+        }
+
+        // a copy recorded here would be submitted by the synchronize in front of the split's next input
+        if (src_backend_synchronous && !dst_host_coherent && ggml_backend_buffer_get_usage(dst->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_vk_upload_defer(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src->data, ggml_nbytes(src))) {
             return true;
         }
 
@@ -14755,6 +14787,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
 
+    if (!ctx->device->pending_uploads.empty()) {
+        vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+        ggml_vk_upload_record(ctx->device, compute_ctx);
+    }
+
     int last_node = cgraph->n_nodes - 1;
 
     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
@@ -14794,7 +14831,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
-        GGML_ASSERT(ctx->compute_ctx.expired());
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);

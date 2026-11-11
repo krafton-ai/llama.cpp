@@ -613,6 +613,65 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
     }
 }
 
+// Without resizable BAR a big compute buffer is not host-visible, and a staging write waits for its own submit. A graph has several
+// small inputs, so they wait here for ggml_vk_upload_record in front of the graph. Only with one backend on the device: its graph
+// is then the one that reads them. Other readers and writers of the device's buffers call ggml_vk_upload_flush first.
+bool ggml_vk_upload_defer(vk_buffer& dst, size_t offset, const void * src, size_t size) {
+    constexpr size_t staging_size = 1024*1024, max_write = 64*1024;
+    vk_device& device = dst->device;
+    if (size > max_write || device->n_backends != 1) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    if (device->upload_staging == nullptr) {
+        device->upload_staging = ggml_vk_create_buffer_check(device, staging_size,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    if (device->upload_staging_used + size > staging_size) {
+        return false;
+    }
+    memcpy((uint8_t *)device->upload_staging->ptr + device->upload_staging_used, src, size);
+    device->pending_uploads.push_back({ dst, offset, device->upload_staging_used, size });
+    device->upload_staging_used += size;
+    return true;
+}
+
+void ggml_vk_upload_record(vk_device& device, vk_context& subctx) {
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    if (device->pending_uploads.empty()) {
+        return;
+    }
+    for (const auto& up : device->pending_uploads) {
+        subctx->s->buffer->buf.copyBuffer(device->upload_staging->buffer, up.dst->buffer, { vk::BufferCopy(up.staging_offset, up.dst_offset, up.size) });
+    }
+    ggml_vk_sync_buffers(nullptr, subctx);
+    device->pending_uploads.clear();
+    device->upload_staging_used = 0;
+}
+
+void ggml_vk_upload_flush(vk_device& device) {
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    if (device->pending_uploads.empty()) {
+        return;
+    }
+    vk_context subctx = ggml_vk_create_temporary_context(device->transfer_queue->cmd_pool);
+    ggml_vk_ctx_begin(device, subctx);
+    ggml_vk_upload_record(device, subctx);
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, device->fence);
+    VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "vk_upload_flush waitForFences", device);
+    device->device.resetFences({ device->fence });
+    ggml_vk_queue_command_pools_cleanup(device);
+}
+
+void ggml_vk_upload_drop(vk_buffer& dst) {
+    vk_device device = dst->device;
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    auto& p = device->pending_uploads;
+    p.erase(std::remove_if(p.begin(), p.end(), [&](const auto& up) { return up.dst == dst; }), p.end());
+}
+
 void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_write(" << size << ")");
     ggml_vk_buffer_write_2d(dst, offset, src, size, size, size, 1);
