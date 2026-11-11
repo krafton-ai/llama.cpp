@@ -4054,6 +4054,37 @@ static bool ggml_cuda_match_hc_pre_norm(const ggml_cgraph * cgraph, int i, ggml_
     return true;
 }
 
+// the mix with its sigmoid directly followed by the pre-norm of the same site:
+// RMS_NORM -> MUL_MAT -> ADD -> VIEW -> SIGMOID -> VIEW(SIGMOID) -> DSV4_HC_PRE(., VIEW) -> RMS_NORM -> MUL
+// outputs: ADD (mixes), SIGMOID, MUL
+static bool ggml_cuda_match_hc_mix_pre_norm(const ggml_cgraph * cgraph, int i, ggml_cuda_hc_match & m) {
+    ggml_cuda_hc_match m_mix;
+    ggml_cuda_hc_match m_pre;
+    if (!ggml_cuda_match_rms_norm_mat_vec(cgraph, i, m_mix) || m_mix.n_nodes != 5 || i + 9 > cgraph->n_nodes ||
+            !ggml_cuda_match_hc_pre_norm(cgraph, i + 6, m_pre)) {
+        return false;
+    }
+    const ggml_tensor * sig  = cgraph->nodes[i + 4];
+    const ggml_tensor * view = cgraph->nodes[i + 5];
+    const ggml_tensor * pre  = cgraph->nodes[i + 6];
+    if (view->op != GGML_OP_VIEW || view->src[0] != sig || pre->src[1] != view ||
+            view->ne[0] != pre->src[0]->ne[1] || view->ne[1] != pre->src[0]->ne[2]) {
+        return false;
+    }
+    const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_UNARY,
+                            GGML_OP_VIEW, GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL };
+    const int outputs[] = { i + 2, i + 4, i + 8 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 9, ops, outputs, 3)) {
+        return false;
+    }
+    m = {};
+    m.n_nodes = 9;
+    m.outputs[0] = i + 2;
+    m.outputs[1] = i + 8;
+    m.n_outputs = 2;
+    return true;
+}
+
 // comb selector -> DSV4_HC_POST [-> stream sum], where
 //   comb selector: MUL_MAT(K, mixes) = e -> RESHAPE(e, hc, hc) -> VIEW r -> MUL(e, r) -> POOL_1D(MAX, hc*hc) ->
 //                  SCALE(s, b) -> RESHAPE(1, 1) -> DIV(RESHAPE(e), .) -> VIEW c0 -> ADD(., c0) = comb
@@ -4535,6 +4566,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     {
         ggml_cuda_hc_match m;
         ggml_cuda_hc_post_match pm;
+        if (node->op == GGML_OP_RMS_NORM && ggml_cuda_match_hc_mix_pre_norm(cgraph, i, m)) {
+            const ggml_tensor * mm  = cgraph->nodes[i + 1];
+            ggml_tensor *       add = cgraph->nodes[i + 2];
+            ggml_tensor *       sig = cgraph->nodes[i + 4];
+            const ggml_tensor * pre = cgraph->nodes[i + 6];
+            const ggml_tensor * rn  = cgraph->nodes[i + 7];
+            ggml_tensor *       mul = cgraph->nodes[i + 8];
+            const ggml_tensor * bias = add->src[0] == mm ? add->src[1] : add->src[0];
+            const ggml_tensor * nw   = mul->src[0] == rn ? mul->src[1] : mul->src[0];
+            if (ggml_cuda_hc_io_ok({ node->src[0], mm->src[0], bias, pre->src[0], nw }, { add, sig, mul }) &&
+                    ggml_cuda_hc_io_ok({ add, sig }, { mul })) {
+                ggml_cuda_op_rms_norm_mat_vec_pre_norm(*cuda_ctx, node, mm, add, sig, pre, rn, mul);
+                return m.n_nodes - 1;
+            }
+        }
         if (node->op == GGML_OP_RMS_NORM && ggml_cuda_match_rms_norm_mat_vec(cgraph, i, m)) {
             ggml_tensor * add = cgraph->nodes[m.outputs[0]];
             ggml_tensor * sig = m.n_outputs > 1 ? cgraph->nodes[m.outputs[1]] : nullptr;
@@ -5825,7 +5871,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_cuda_hc_match m;
             ggml_cuda_hc_post_match pm;
             int n_nodes = 0;
-            if (op == GGML_OP_RMS_NORM && ggml_cuda_match_rms_norm_mat_vec(cgraph, i, m)) {
+            if (op == GGML_OP_RMS_NORM && ggml_cuda_match_hc_mix_pre_norm(cgraph, i, m)) {
+                n_nodes = m.n_nodes;
+            } else if (op == GGML_OP_RMS_NORM && ggml_cuda_match_rms_norm_mat_vec(cgraph, i, m)) {
                 n_nodes = m.n_nodes;
             } else if (op == GGML_OP_DSV4_HC_PRE && ggml_cuda_match_hc_pre_norm(cgraph, i, m)) {
                 n_nodes = m.n_nodes;

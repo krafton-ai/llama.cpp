@@ -11298,6 +11298,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_site_ple(96, 3, 5, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_hc_site_ple(64, 2, 33, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_hc_site_ple(80, 5, 3, GGML_TYPE_F32, true));
+    // one token: the mix, sigmoid and pre-norm of a site in one kernel (odd input width: not chained)
+    test_cases.emplace_back(new test_hc_site_ple(96, 3, 1, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_hc_site_ple(80, 5, 1, GGML_TYPE_F32, false));
+    test_cases.emplace_back(new test_hc_site_ple(64, 2, 1, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_hc_site_ple(4096, 6, 1, GGML_TYPE_F16, false));
+    test_cases.emplace_back(new test_hc_site_ple(75, 3, 1, GGML_TYPE_F32, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

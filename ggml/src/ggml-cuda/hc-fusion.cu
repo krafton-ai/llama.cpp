@@ -275,20 +275,21 @@ void ggml_cuda_op_rms_norm_mat_vec_add(ggml_backend_cuda_context & ctx, const gg
 // ---------------------------------------------------------------------------------------------------------------------
 // DSV4_HC_PRE -> RMS_NORM -> MUL: one block per token
 
-template <int block_size>
-static __global__ void hc_pre_rms_norm_mul_f32(
+// token t of x [n, hc, tokens]: dst = rms_norm(scale_pre * sum_s x(., s) pre(s)) * w, one 1-D block of block_size threads.
+// coherent: pre was written by this block in the same kernel, read it from L2
+template <int block_size, bool coherent>
+static __device__ __forceinline__ void hc_pre_rms_norm_mul_row(
         const float * x, const float * pre, const float * w, float * dst,
         const int n, const int hc, const float scale_pre, const float eps,
-        const int64_t sx1, const int64_t sx2, const int64_t sp0, const int64_t sp1, const int64_t sd1) {
-    const int t = blockIdx.x;
-
-    __shared__ float s_pre[HC_MAX];
-    __shared__ float s_sum[32];
-
-    ggml_cuda_pdl_sync();
-
+        const int64_t sx1, const int64_t sx2, const int64_t sp0, const int64_t sp1, const int64_t sd1, const int t,
+        float * s_pre, float * s_sum) {
     if ((int) threadIdx.x < hc) {
-        s_pre[threadIdx.x] = pre[threadIdx.x*sp0 + t*sp1];
+        const float * p = pre + threadIdx.x*sp0 + t*sp1;
+        if constexpr (coherent) {
+            s_pre[threadIdx.x] = __ldcg(p);
+        } else {
+            s_pre[threadIdx.x] = *p;
+        }
     }
     __syncthreads();
 
@@ -310,6 +311,20 @@ static __global__ void hc_pre_rms_norm_mul_f32(
     for (int i = threadIdx.x; i < n; i += block_size) {
         y[i] = y[i]*scale*w[i];
     }
+}
+
+template <int block_size>
+static __global__ void hc_pre_rms_norm_mul_f32(
+        const float * x, const float * pre, const float * w, float * dst,
+        const int n, const int hc, const float scale_pre, const float eps,
+        const int64_t sx1, const int64_t sx2, const int64_t sp0, const int64_t sp1, const int64_t sd1) {
+    __shared__ float s_pre[HC_MAX];
+    __shared__ float s_sum[32];
+
+    ggml_cuda_pdl_sync();
+
+    hc_pre_rms_norm_mul_row<block_size, false>(x, pre, w, dst, n, hc, scale_pre, eps, sx1, sx2, sp0, sp1, sd1,
+            blockIdx.x, s_pre, s_sum);
 }
 
 void ggml_cuda_op_hc_pre_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * hc_pre,
@@ -336,6 +351,163 @@ void ggml_cuda_op_hc_pre_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggm
             (int64_t) (x->nb[1]/sizeof(float)), (int64_t) (x->nb[2]/sizeof(float)),
             (int64_t) (pre->nb[0]/sizeof(float)), (int64_t) (pre->nb[1]/sizeof(float)),
             (int64_t) (mul->nb[1]/sizeof(float)));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// one token: RMS_NORM -> MUL_MAT -> ADD -> VIEW -> SIGMOID -> VIEW(pre) -> DSV4_HC_PRE -> RMS_NORM -> MUL in one kernel.
+// Every block computes the partial dot products of one split and one group of rows (as rms_norm_mat_vec_part_f32<1>),
+// then the last block to finish (block counter, zero before the launch) reduces them into the mixes and the sigmoid
+// (as rms_norm_mat_vec_reduce_f32) and runs the pre-norm row (as hc_pre_rms_norm_mul_f32).
+
+static constexpr int HC_CHAIN_BLOCK = 256;
+
+struct hc_chain_pre_norm_params {
+    const float * x;        // DSV4_HC_PRE input [n, hc]
+    const float * pre;      // view of the sigmoid output
+    const float * w;        // norm weight
+    float       * dst;      // MUL
+    int     n;
+    int     hc;
+    float   scale_pre;
+    float   eps;
+    int64_t sx1;
+    int64_t sp0;
+};
+
+template <typename T>
+static __global__ void rms_norm_mat_vec_pre_norm_f32(
+        const float * x, const T * w, float * part, unsigned int * counter, const int nrows_w, const int chunk,
+        const int64_t sw1, const float * bias, float * mix, float * sig, const int n_sig, const int n_in, const float eps,
+        const hc_chain_pre_norm_params pn) {
+    constexpr int n_warps = HC_CHAIN_BLOCK/WARP_SIZE;
+    const int s      = blockIdx.x;
+    const int lane   = threadIdx.x % WARP_SIZE;
+    const int k      = blockIdx.y*n_warps + threadIdx.x/WARP_SIZE;
+    const int nsplit = gridDim.x;
+
+    __shared__ bool  s_last;
+    __shared__ float s_pre[HC_MAX];
+    __shared__ float s_sum[32];
+
+    ggml_cuda_pdl_sync();
+
+    if (k <= nrows_w) {
+        const T     * wr = w + (int64_t) min(k, nrows_w - 1)*sw1 + (int64_t) s*chunk;
+        const float * xr = x + (int64_t) s*chunk;
+        float a = 0.0f;
+        for (int i = 2*lane; i < chunk; i += 2*WARP_SIZE) {
+            const float2 xv = *(const float2 *) (xr + i);
+            float2 wv = xv;
+            if (k < nrows_w) {
+                if constexpr (std::is_same_v<T, half>) {
+                    wv = __half22float2(*(const half2 *) (wr + i));
+                } else {
+                    wv = *(const float2 *) (wr + i);
+                }
+            }
+            a = fmaf(wv.x, xv.x, a);
+            a = fmaf(wv.y, xv.y, a);
+        }
+        a = warp_reduce_sum(a);
+        if (lane == 0) {
+            part[(int64_t) s*(nrows_w + 1) + k] = a;
+            __threadfence();
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        s_last = atomicAdd(counter, 1u) == gridDim.x*gridDim.y - 1;
+    }
+    __syncthreads();
+    if (!s_last) {
+        return;
+    }
+    __threadfence();
+
+    float ss = 0.0f;
+    for (int i = 0; i < nsplit; ++i) {
+        ss += __ldcg(part + i*(nrows_w + 1) + nrows_w);
+    }
+    const float scale = rsqrtf(ss/n_in + eps);
+    for (int r = threadIdx.x; r < nrows_w; r += HC_CHAIN_BLOCK) {
+        float v = 0.0f;
+        for (int i = 0; i < nsplit; ++i) {
+            v += __ldcg(part + i*(nrows_w + 1) + r);
+        }
+        const float y = v*scale + bias[r];
+        mix[r] = y;
+        if (r < n_sig) {
+            sig[r] = hc_sigmoid(y);
+        }
+    }
+    __syncthreads();
+
+    hc_pre_rms_norm_mul_row<HC_CHAIN_BLOCK, true>(pn.x, pn.pre, pn.w, pn.dst, pn.n, pn.hc, pn.scale_pre, pn.eps,
+            pn.sx1, 0, pn.sp0, 0, 0, 0, s_pre, s_sum);
+}
+
+void ggml_cuda_op_rms_norm_mat_vec_pre_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
+        const ggml_tensor * mul_mat, ggml_tensor * add, ggml_tensor * sig,
+        const ggml_tensor * hc_pre, const ggml_tensor * rms_norm_pre, ggml_tensor * mul) {
+    const ggml_tensor * x    = rms_norm->src[0];
+    const ggml_tensor * w    = mul_mat->src[0];
+    const ggml_tensor * bias = add->src[0] == mul_mat ? add->src[1] : add->src[0];
+    const ggml_tensor * hx   = hc_pre->src[0];
+    const ggml_tensor * pre  = hc_pre->src[1];
+    const ggml_tensor * nw   = mul->src[0] == rms_norm_pre ? mul->src[1] : mul->src[0];
+
+    const int     n       = x->ne[0];
+    const int     nrows_w = w->ne[1];
+    const int64_t sw1     = w->nb[1]/ggml_element_size(w);
+
+    // same split as ggml_cuda_op_rms_norm_mat_vec_add for one token
+    int nsplit = 16;
+    while (nsplit > 1 && (n % (4*nsplit) != 0 || n/nsplit < 256)) {
+        nsplit /= 2;
+    }
+    const int chunk = n/nsplit;
+
+    const bool chain = ggml_nrows(x) == 1 && hx->ne[2] == 1 && chunk % 2 == 0 && sw1 % 2 == 0 &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(add) && ggml_is_contiguous(sig) && ggml_is_contiguous(mul) &&
+        ggml_is_contiguous(nw) && hx->nb[0] == sizeof(float) && hx->ne[1] <= HC_MAX && sig->ne[0] <= nrows_w;
+    if (!chain) {
+        ggml_cuda_op_rms_norm_mat_vec_add(ctx, rms_norm, mul_mat, add, sig);
+        ggml_cuda_op_hc_pre_rms_norm_mul(ctx, hc_pre, rms_norm_pre, mul);
+        return;
+    }
+
+    GGML_ASSERT(w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32 && pre->type == GGML_TYPE_F32 && nw->type == GGML_TYPE_F32);
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<float>        part(ctx.pool(), (size_t) nsplit*(nrows_w + 1));
+    ggml_cuda_pool_alloc<unsigned int> counter(ctx.pool(), 1);
+    CUDA_CHECK(cudaMemsetAsync(counter.get(), 0, sizeof(unsigned int), stream));
+
+    hc_chain_pre_norm_params pn;
+    pn.x         = (const float *) hx->data;
+    pn.pre       = (const float *) pre->data;
+    pn.w         = (const float *) nw->data;
+    pn.dst       = (float *) mul->data;
+    pn.n         = hx->ne[0];
+    pn.hc        = hx->ne[1];
+    pn.scale_pre = ggml_get_op_params_f32(hc_pre, 0);
+    pn.eps       = ggml_get_op_params_f32(rms_norm_pre, 0);
+    pn.sx1       = hx->nb[1]/sizeof(float);
+    pn.sp0       = pre->nb[0]/sizeof(float);
+
+    const float eps = ggml_get_op_params_f32(rms_norm, 0);
+    const dim3 grid(nsplit, (nrows_w + 1 + HC_CHAIN_BLOCK/WARP_SIZE - 1)/(HC_CHAIN_BLOCK/WARP_SIZE));
+    const ggml_cuda_kernel_launch_params lp(grid, dim3(HC_CHAIN_BLOCK), 0, stream);
+    if (w->type == GGML_TYPE_F16) {
+        ggml_cuda_kernel_launch(rms_norm_mat_vec_pre_norm_f32<half>, lp, (const float *) x->data, (const half *) w->data,
+                part.get(), counter.get(), nrows_w, chunk, sw1, (const float *) bias->data, (float *) add->data,
+                (float *) sig->data, (int) sig->ne[0], n, eps, pn);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_mat_vec_pre_norm_f32<float>, lp, (const float *) x->data, (const float *) w->data,
+                part.get(), counter.get(), nrows_w, chunk, sw1, (const float *) bias->data, (float *) add->data,
+                (float *) sig->data, (int) sig->ne[0], n, eps, pn);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

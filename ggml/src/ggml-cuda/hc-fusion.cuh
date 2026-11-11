@@ -14,6 +14,12 @@ void ggml_cuda_op_rms_norm_mat_vec_add(ggml_backend_cuda_context & ctx, const gg
 void ggml_cuda_op_hc_pre_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * hc_pre,
         const ggml_tensor * rms_norm, ggml_tensor * mul);
 
+// one token: RMS_NORM -> MUL_MAT -> ADD -> VIEW -> SIGMOID -> VIEW(pre) -> DSV4_HC_PRE -> RMS_NORM -> MUL in one kernel
+// (the two functions above chained through a block counter); other shapes run the two functions above
+void ggml_cuda_op_rms_norm_mat_vec_pre_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
+        const ggml_tensor * mul_mat, ggml_tensor * add, ggml_tensor * sig,
+        const ggml_tensor * hc_pre, const ggml_tensor * rms_norm_pre, ggml_tensor * mul);
+
 // the comb input of DSV4_HC_POST computed from the mix vector:
 // e = MUL_MAT(K, mixes); comb = RESHAPE(e) / (scale*POOL_1D_MAX(e*r) + bias) + c0
 struct ggml_cuda_hc_select_args {
