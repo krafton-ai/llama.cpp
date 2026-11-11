@@ -8948,6 +8948,10 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+            // small K-quant matrices (from 256 x 256) are faster in the noshuffle GEMV than in the flat mul_mv kernel
+            threashold_ok = threashold_ok ||
+                            (tensor->ne[0] >= 256 && tensor->ne[1] >= 256 && tensor->ne[2] == 1 && tensor->ne[3] == 1);
+            return threashold_ok && tensor->ne[1] % 64 == 0;
         case GGML_TYPE_Q8_0:
             return threashold_ok && tensor->ne[1] % 64 == 0;
         default:

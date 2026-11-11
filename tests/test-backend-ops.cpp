@@ -12249,6 +12249,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 1, k, {2, 1}, {1, 1}));
     }
 
+    // small K-quant matrices
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n : {1, 4}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 256, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 320, n, 512, {1, 1}, {1, 1}));
+        }
+    }
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));
