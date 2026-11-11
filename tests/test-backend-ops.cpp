@@ -5599,6 +5599,112 @@ struct test_rms_norm_gate : public test_case {
     }
 };
 
+// The recurrent state of a KDA delta net read from the state cache as llama builds it (llm_graph_context::build_rs,
+// llm_build_delta_net_base::build_recurrent_attn, one sequence, n_rs_seq == 0): GET_ROWS(cache, ids), a view of the first
+// row reshaped as the state, a zero-sized CPY of the extra states, the delta net (with_gates: with the Raon-1 nano delta net gates in
+// front, one token) and the CPY of its final state into cell kv of the cache. A backend may let the delta net read cell
+// ids[0] of the cache itself (Vulkan); same_cell: ids[0] == kv, the state is read and written in place
+struct test_gdn_state_rows : public test_case {
+    const int64_t head_count, head_size, n_seq_tokens;
+    const bool with_gates, same_cell;
+
+    static constexpr int64_t n_cells = 4;
+    ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * out_node = nullptr;
+
+    std::string vars() override { return VARS_TO_STR5(head_count, head_size, n_seq_tokens, with_gates, same_cell); }
+    std::string op_desc(ggml_tensor *) override { return "GDN_STATE_ROWS"; }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return with_gates; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, out_node }; }
+
+    test_gdn_state_rows(int64_t head_count = 4, int64_t head_size = 128, int64_t n_seq_tokens = 1, bool with_gates = false, bool same_cell = false)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), with_gates(with_gates), same_cell(same_cell) {}
+
+    int64_t kv() const { return same_cell ? 2 : 3; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_w) override {
+        const int64_t H = head_count, S = head_size, T = with_gates ? 1 : n_seq_tokens, D = S*S*H;
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_cells);
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(cache, "cache");
+        ggml_set_name(ids, "ids");
+        ggml_tensor * q = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1), 1e-6f);
+        ggml_tensor * k = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1), 1e-6f);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, q);
+            ggml_build_forward_expand(gf, k);
+        }
+
+        // build_rs: the gathered states, the state of the sequence, the extra states (none)
+        ggml_tensor * states     = ggml_reshape_2d(ctx, cache, D, n_cells);
+        ggml_tensor * states_all = ggml_get_rows(ctx, states, ids);
+        ggml_tensor * state      = ggml_view_2d(ctx, states_all, D, 1, states_all->nb[1], 0);
+        ggml_tensor * extra      = ggml_cpy(ctx, ggml_view_2d(ctx, states_all, D, 0, states_all->nb[1], states_all->nb[1]),
+                                            ggml_view_2d(ctx, cache, D, 0, cache->nb[1], (kv() + 1)*cache->nb[1]));
+        state = ggml_reshape_4d(ctx, state, S, S, H, 1);
+        if (mode == MODE_TEST) {
+            // as the backend may order them: right before the delta net and its gates
+            ggml_build_forward_expand(gf, state);
+            ggml_build_forward_expand(gf, extra);
+        }
+
+        ggml_tensor * v, * g, * beta;
+        if (with_gates) {
+            const int64_t rank = 8, d = H*S;
+            ggml_tensor * fab  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank + 2*H, 1);
+            ggml_tensor * fbo  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, 1);
+            ggml_tensor * dt   = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, d);
+            ggml_tensor * conv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*d, 1);
+            v = ggml_view_4d(ctx, conv, S, H, 1, 1, S*sizeof(float), 3*d*sizeof(float), 3*d*sizeof(float), 2*d*sizeof(float));
+            g = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_add(ctx, fbo, dt)), -5.0f);
+            g = ggml_reshape_4d(ctx, g, S, H, 1, 1);
+            beta = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, H, 1, fab->nb[1], rank*sizeof(float)));
+            ggml_tensor * write = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, H, 1, fab->nb[1], (rank + H)*sizeof(float)));
+            ggml_tensor * ratio = ggml_reshape_4d(ctx, ggml_div(ctx, write, beta), 1, H, 1, 1);
+            v = ggml_mul(ctx, v, ratio);
+            beta = ggml_reshape_4d(ctx, beta, 1, H, 1, 1);
+        } else {
+            v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1);
+            g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1);
+            beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, T, 1);
+            ggml_set_name(g, "g");
+            ggml_set_name(beta, "beta");
+        }
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+
+        // build_recurrent_attn: the final state into cell kv, the attention output
+        ggml_tensor * new_state = ggml_view_4d(ctx, gdn, S, S, H, 1, S*sizeof(float), S*S*sizeof(float), D*sizeof(float),
+                                               S*H*T*sizeof(float));
+        cpy_node = ggml_cpy(ctx, new_state, ggml_view_2d(ctx, cache, D, 1, cache->nb[1], kv()*cache->nb[1]));
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, cpy_node);
+        }
+        out_node = ggml_view_4d(ctx, gdn, S, H, T, 1, S*sizeof(float), S*H*sizeof(float), S*H*T*sizeof(float), 0);
+        return out_node;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                const int32_t id = same_cell ? (int32_t) kv() : 1;
+                ggml_backend_tensor_set(t, &id, 0, sizeof(id));
+            } else if (strcmp(t->name, "cache") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -2.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -13614,6 +13720,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nt : { 1, 3, 8 }) {
         test_cases.emplace_back(new test_rms_norm_gate(128, 16, nt));
         test_cases.emplace_back(new test_rms_norm_gate(64, 4, nt));
+    }
+    // the delta net state read from the state cache through the GET_ROWS ids (one sequence)
+    for (bool same_cell : { false, true }) {
+        test_cases.emplace_back(new test_gdn_state_rows(4, 128, 1, false, same_cell));
+        test_cases.emplace_back(new test_gdn_state_rows(4, 32, 3, false, same_cell));
+        test_cases.emplace_back(new test_gdn_state_rows(4, 128, 1, true, same_cell));
+        test_cases.emplace_back(new test_gdn_state_rows(2, 64, 1, true, same_cell));
     }
     // mHC selector (Raon-1 nano): decode, speculative verify and prefill token counts
     for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_F16 }) {

@@ -1343,6 +1343,7 @@ struct ggml_backend_vk_context {
     bool fused_gdn_gates {};
     vk_gdn_gates gdn_gates {};          // fused_gdn_gates: the gate inputs; gdn_gates_idx the delta net
     int gdn_gates_idx {};
+    const ggml_tensor * gdn_state_rows {}; // the GET_ROWS of the initial state of the delta net at gdn_gates_idx, read through its ids
     bool fused_cont_mul {};
     bool fused_mul_mat_cpy_f16 = false; // a MUL_MAT and the CPY of its result to f16 as one multiply writing f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

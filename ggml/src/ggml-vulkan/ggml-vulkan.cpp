@@ -10678,8 +10678,9 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
 
 // cpy: the CPY of the final state into the state cache, fused (ggml_vk_fuse_gdn_state_cpy).
 // gates: the delta net gate inputs, the gates computed here instead of by the nodes before (ggml_vk_match_gdn_gates)
+// rows: the GET_ROWS that gathers the initial state (ggml_vk_gdn_state_rows), read here from its source through its ids instead
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * cpy,
-        const vk_gdn_gates * gates) {
+        const vk_gdn_gates * gates, const ggml_tensor * rows) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = gates ? gates->v : dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -10721,6 +10722,11 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         src_buf[3] = ggml_vk_tensor_subbuffer(ctx, gates->fbo);
         src_buf[4] = ggml_vk_tensor_subbuffer(ctx, gates->fab);
     }
+    // the initial states are cells ids[s] of the whole state cache
+    const ggml_tensor * ids = rows ? rows->src[1] : dst->src[6];
+    if (rows) {
+        src_buf[5] = ggml_vk_tensor_subbuffer(ctx, rows->src[0]);
+    }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
@@ -10744,7 +10750,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         neq1, rq3,
         scale,
         K,
-        dst->src[6] ? 1u : 0u,
+        ids ? 1u : 0u,
         cpy ? 1u : 0u,
         cpy ? (uint32_t) (get_misalign_bytes(ctx, cpy->src[1]) / sizeof(float)) : 0u,
         gates ? gates->rank : 0u,
@@ -10753,8 +10759,8 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         gates ? (uint32_t) (gates->fbo->nb[1] / sizeof(float)) : 0u,
     };
 
-    // ids (ggml_gated_delta_net_ids): src[5] is the whole state cache; without ids the slot is bound to dst, unused
-    const vk_subbuffer ids_buf = dst->src[6] ? ggml_vk_tensor_subbuffer(ctx, dst->src[6]) : dst_buf;
+    // ids (ggml_gated_delta_net_ids or rows): binding 5 is the whole state cache; without ids the slot is bound to dst, unused
+    const vk_subbuffer ids_buf = ids ? ggml_vk_tensor_subbuffer(ctx, ids) : dst_buf;
 
     const vk_subbuffer sout_buf = cpy ? ggml_vk_tensor_subbuffer(ctx, cpy->src[1], true) : dst_buf;
     const vk_subbuffer dt_buf = gates ? ggml_vk_tensor_subbuffer(ctx, gates->dt) : dst_buf;
@@ -12902,10 +12908,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     // closed explicitly below, and by the destructor on the early returns
     ggml_vk_debug_label dbg(compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops);
 
-    if (ctx->fused_gdn_gates) {
-        // the run of delta net gate nodes and their delta net (and the state CPY): one delta net computing the gates
+    if (ctx->fused_gdn_gates || ctx->gdn_state_rows) {
+        // the GET_ROWS of the initial state and/or the run of delta net gate nodes, their delta net (and the state CPY): one delta
+        // net reading the state cache through the ids and/or computing the gates
         ggml_vk_gated_delta_net(ctx, compute_ctx, cgraph->nodes[ctx->gdn_gates_idx],
-                ctx->fused_gdn_state_cpy ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr, &ctx->gdn_gates);
+                ctx->fused_gdn_state_cpy ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr,
+                ctx->fused_gdn_gates ? &ctx->gdn_gates : nullptr, ctx->gdn_state_rows);
     } else switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
@@ -13321,7 +13329,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_GATED_DELTA_NET:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node,
-                ctx->fused_gdn_state_cpy ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr, nullptr);
+                ctx->fused_gdn_state_cpy ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr, nullptr, nullptr);
 
         break;
 
@@ -14660,6 +14668,112 @@ static int ggml_vk_fuse_gdn_state_cpy(const ggml_backend_vk_context * ctx, const
     return j;
 }
 
+// The initial state of a delta net with one sequence and one final state (K == 1), gathered from the state cache
+// (llm_graph_context::build_rs): GATED_DELTA_NET(..., views of GET_ROWS(cache, ids)), the state the first gathered row.
+// The delta net reads cell ids[0] of the cache itself instead (gated_delta_net.comp use_ids). Returns the GET_ROWS, or nullptr
+static const ggml_tensor * ggml_vk_gdn_state_rows(const ggml_tensor * gdn) {
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) != 1 ||
+            gdn->src[2]->ne[3] != 1 || gdn->src[6] != nullptr) {
+        return nullptr;
+    }
+    const ggml_tensor * s = gdn->src[5];
+    const ggml_tensor * rows = s->view_src;
+    if (!rows || rows->op != GGML_OP_GET_ROWS || rows->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 ||
+            s->view_offs != 0 || !ggml_is_contiguous(s)) {
+        return nullptr;
+    }
+    for (const ggml_tensor * t = s; t != rows; t = t->src[0]) {
+        if ((t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE) || !t->src[0]) {
+            return nullptr;
+        }
+    }
+    // one cache cell is one state, rows of the cache contiguous
+    const ggml_tensor * cache = rows->src[0];
+    const ggml_tensor * ids = rows->src[1];
+    const int64_t n = ggml_nelements(s);
+    if (cache->type != GGML_TYPE_F32 || cache->ne[0] != n || cache->nb[0] != sizeof(float) || cache->nb[1] != n*sizeof(float) ||
+            cache->ne[2] != 1 || cache->ne[3] != 1 || ids->type != GGML_TYPE_I32 || !ggml_is_vector(ids) ||
+            !ggml_is_contiguous(ids) || ids->ne[0] < 1) {
+        return nullptr;
+    }
+    return rows;
+}
+
+// The GET_ROWS of ggml_vk_gdn_state_rows at node_idx, then in a row its views to the delta net state and zero-sized nodes
+// (ggml_vk_graph_optimize puts them right before the delta net or its delta net gate run): the delta net reads the cache through
+// the ids instead, the GET_ROWS is skipped. Returns the index of the first node after them (the delta net or the first
+// delta net gate node), or -1; *gdn_idx gets the delta net's index
+static int ggml_vk_match_gdn_state_rows(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int * gdn_idx) {
+    const ggml_tensor * rows = cgraph->nodes[node_idx];
+    if (rows->op != GGML_OP_GET_ROWS || (rows->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    // with the CPY at most 6 nodes after the delta net, the fused run stays under 31 nodes (fused_ops_write_mask)
+    const int end = std::min(cgraph->n_nodes, node_idx + 25);
+    int next = -1;
+    int gi = -1;
+    for (int j = node_idx + 1; j < end; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (next < 0 && !ggml_is_empty(t) && !ggml_op_is_empty(t->op)) {
+            next = j;
+        }
+        if (t->op == GGML_OP_GATED_DELTA_NET) {
+            gi = j;
+            break;
+        }
+    }
+    if (gi < 0 || next < 0 || ggml_vk_gdn_state_rows(cgraph->nodes[gi]) != rows) {
+        return -1;
+    }
+    const ggml_tensor * gdn = cgraph->nodes[gi];
+    std::set<const ggml_tensor *> chain;
+    for (const ggml_tensor * t = gdn->src[5]; t != rows; t = t->src[0]) {
+        chain.insert(t);
+    }
+    // every reader of the GET_ROWS is in the run; the views to the state are read only along the chain and by the delta
+    // net, the other readers read nothing (zero-sized). Other views there (of the delta net gate inputs) are no concern
+    auto uses_in_run = [&](const ggml_tensor * t) {
+        int uses = 0;
+        for (int j = node_idx + 1; j < next; ++j) {
+            for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                uses += cgraph->nodes[j]->src[si] == t;
+            }
+        }
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            uses += gdn->src[si] == t;
+        }
+        return uses;
+    };
+    if (uses_in_run(rows) != ggml_node_get_use_count(cgraph, node_idx)) {
+        return -1;
+    }
+    size_t n_chain = 0;
+    for (int j = node_idx + 1; j < next; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (chain.count(t)) {
+            if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || uses_in_run(t) != ggml_node_get_use_count(cgraph, j)) {
+                return -1;
+            }
+            ++n_chain;
+            continue;
+        }
+        bool reads = false;
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            reads = reads || (t->src[si] && (t->src[si] == rows || chain.count(t->src[si])));
+        }
+        if (reads && !ggml_is_empty(t)) {
+            return -1;
+        }
+    }
+    // the delta net binds the cache and the ids without an offset
+    if (n_chain != chain.size() || !rows->src[0]->buffer || !rows->src[1]->buffer ||
+            get_misalign_bytes(ctx, rows->src[0]) != 0 || get_misalign_bytes(ctx, rows->src[1]) != 0) {
+        return -1;
+    }
+    *gdn_idx = gi;
+    return next;
+}
+
 
 // The conv of a delta net (llm_build_delta_net_base::build_conv_state, n_rs_seq == 0), views between:
 // CONCAT(state, x^T) -> CPY of the last nc - 1 columns into the state cache -> SSM_CONV -> SILU.
@@ -15718,6 +15832,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ssm_conv_state = false;
         ctx->fused_gdn_state_cpy = false;
         ctx->fused_gdn_gates = false;
+        ctx->gdn_state_rows = nullptr;
         ctx->fused_cont_mul = false;
         ctx->fused_mul_mat_cpy_f16 = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -15726,18 +15841,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             int hc_last = 0;
             int gates_gdn = 0;
-            if (ggml_vk_match_gdn_gates(cgraph, i, &ctx->gdn_gates, &gates_gdn) &&
-                ctx->device->pipeline_gated_delta_net[0][2] != nullptr) {
+            // the GET_ROWS of the delta net state and its views (ggml_vk_match_gdn_state_rows), maybe the delta net gates after them
+            int rows_gdn = -1;
+            const int rows_next = ggml_vk_match_gdn_state_rows(ctx, cgraph, i, &rows_gdn);
+            const bool with_gates = ggml_vk_match_gdn_gates(cgraph, rows_next > 0 ? rows_next : i, &ctx->gdn_gates, &gates_gdn) &&
+                             ctx->device->pipeline_gated_delta_net[0][2] != nullptr && (rows_next < 0 || gates_gdn == rows_gdn);
+            if (rows_next > 0 && (with_gates || rows_next == rows_gdn)) {
+                ctx->gdn_state_rows = cgraph->nodes[i];
+                gates_gdn = rows_gdn;
+            }
+            if (with_gates || ctx->gdn_state_rows) {
                 ctx->num_additional_fused_ops = gates_gdn - i;
-                ctx->fused_gdn_gates = true;
+                ctx->fused_gdn_gates = with_gates;
                 ctx->gdn_gates_idx = gates_gdn;
-                fusion_string = "GDN_GATES_GATED_DELTA_NET";
-                if (const int i_scpy = ggml_vk_fuse_gdn_state_cpy(ctx, cgraph, gates_gdn); i_scpy > 0) {
+                const int i_scpy = ggml_vk_fuse_gdn_state_cpy(ctx, cgraph, gates_gdn);
+                const bool scpy = i_scpy > 0;
+                if (scpy) {
                     ctx->num_additional_fused_ops = i_scpy - i;
                     ctx->fused_gdn_state_cpy = true;
                     ctx->fused_ops_write_mask |= 1 << (gates_gdn - i);
-                    fusion_string = "GDN_GATES_GATED_DELTA_NET_CPY";
                 }
+                fusion_string = !ctx->gdn_state_rows ? (scpy ? "GDN_GATES_GATED_DELTA_NET_CPY" : "GDN_GATES_GATED_DELTA_NET") :
+                                with_gates ? (scpy ? "GET_ROWS_GDN_GATES_GATED_DELTA_NET_CPY" : "GET_ROWS_GDN_GATES_GATED_DELTA_NET") :
+                                      (scpy ? "GET_ROWS_GATED_DELTA_NET_CPY" : "GET_ROWS_GATED_DELTA_NET");
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 // a fused CPY node is a view of its destination
                 op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = ctx->fused_gdn_state_cpy;
@@ -16059,6 +16185,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         if (ctx->fused_gdn_state_cpy && cgraph->nodes[i + k]->op == GGML_OP_GATED_DELTA_NET && s == 5) {
                             continue;
                         }
+                        // so does it reading its state (one sequence) from the cache through the ids of the GET_ROWS;
+                        // the zero-sized nodes in that run read nothing
+                        if (ctx->gdn_state_rows && ((cgraph->nodes[i + k] == ctx->gdn_state_rows && s == 0) ||
+                                                    ggml_is_empty(cgraph->nodes[i + k]))) {
+                            continue;
+                        }
                         if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                             bool found = false;
                             for (int n = 0; n < k; ++n) {
@@ -16087,6 +16219,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         ctx->fused_ssm_conv_state = false;
                 ctx->fused_gdn_state_cpy = false;
                 ctx->fused_gdn_gates = false;
+                ctx->gdn_state_rows = nullptr;
                 ctx->fused_cont_mul = false;
                 ctx->fused_mul_mat_cpy_f16 = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -16389,6 +16522,62 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t), graph->nodes[gi]);
             }
             gdn_gate_runs.emplace_back(run, graph->nodes[gi]);
+        }
+    }
+
+    // The GET_ROWS of the initial state of a delta net (ggml_vk_gdn_state_rows) with its views to the state and the
+    // zero-sized nodes that read it: they go right before the delta net or its delta net gate run below (rows_runs), where the
+    // delta net reads the state from the cache through the ids instead (ggml_vk_match_gdn_state_rows)
+    std::vector<std::pair<std::vector<ggml_tensor *>, ggml_tensor *>> rows_runs;   // GET_ROWS and its readers in order, delta net
+    if (!ctx->device->disable_fusion) {
+        for (int gi = 0; gi < graph->n_nodes; ++gi) {
+            ggml_tensor * gdn = graph->nodes[gi];
+            const ggml_tensor * rows = ggml_vk_gdn_state_rows(gdn);
+            if (!rows) {
+                continue;
+            }
+            std::set<const ggml_tensor *> chain;
+            for (const ggml_tensor * t = gdn->src[5]; t != rows; t = t->src[0]) {
+                chain.insert(t);
+            }
+            // every reader of the GET_ROWS comes before the delta net: a view on the way to the state or a zero-sized
+            // node, whose readers are such nodes too
+            std::set<const ggml_tensor *> m;
+            std::vector<ggml_tensor *> run;
+            bool ok = true;
+            for (int i = 0; i < graph->n_nodes && ok; ++i) {
+                ggml_tensor * n = graph->nodes[i];
+                if (n == rows) {
+                    m.insert(n);
+                    run.push_back(n);
+                    ok = i < gi && !(n->flags & GGML_TENSOR_FLAG_OUTPUT);
+                    continue;
+                }
+                if (n == gdn) {
+                    // the delta net reads only the state among them
+                    for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                        ok = ok && (si == 5 || !(n->src[si] && m.count(n->src[si])));
+                    }
+                    continue;
+                }
+                bool reads = false;
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    reads = reads || (n->src[si] && m.count(n->src[si]));
+                }
+                if (!reads) {
+                    continue;
+                }
+                ok = i < gi && !(n->flags & GGML_TENSOR_FLAG_OUTPUT) && (chain.count(n) || ggml_is_empty(n));
+                m.insert(n);
+                run.push_back(n);
+            }
+            if (!ok || run.empty() || run[0] != rows) {
+                continue;
+            }
+            // the fused delta net reads the ids
+            ggml_tensor * ids = rows->src[1];
+            params->add_alloc_dep(params->user_data, ids->view_src ? ids->view_src : ids, gdn);
+            rows_runs.emplace_back(run, gdn);
         }
     }
 
@@ -17108,6 +17297,70 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             for (const ggml_tensor * e : ext_srcs) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(e), out);
             }
+        }
+    }
+    // Each delta net state GET_ROWS run right before its delta net, or before the delta net gate run of the delta net, when
+    // nothing it passes writes what the run reads and the run's other sources are ready there
+    std::unordered_map<const ggml_tensor *, size_t> rows_pos;
+    if (!rows_runs.empty()) {
+        rows_pos.reserve(new_order.size());
+        for (size_t k = 0; k < new_order.size(); ++k) {
+            rows_pos[new_order[k]] = k;
+        }
+    }
+    for (const auto & rr : rows_runs) {
+        const auto & run = rr.first;
+        const auto in_run = [&](const ggml_tensor * t) { return std::find(run.begin(), run.end(), t) != run.end(); };
+        const ggml_tensor * anchor = rr.second;
+        for (const auto & ra : gdn_gate_runs) {
+            if (ra.second == rr.second && !ra.first.empty()) {
+                anchor = ra.first[0];
+            }
+        }
+        const size_t a = rows_pos.at(anchor);
+        size_t first = a, last = a;
+        std::set<const ggml_tensor *> read;   // the bases of the run's sources from outside it
+        bool ok = true;
+        for (const ggml_tensor * t : run) {
+            first = std::min(first, rows_pos.at(t));
+            last  = std::max(last,  rows_pos.at(t));
+            for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                const ggml_tensor * src = t->src[si];
+                if (!src || in_run(src)) {
+                    continue;
+                }
+                read.insert(src->view_src ? src->view_src : src);
+                auto it = rows_pos.find(src);
+                ok = ok && (it == rows_pos.end() || it->second < a);
+            }
+        }
+        for (size_t k = first; k < a && ok; ++k) {
+            const ggml_tensor * t = new_order[k];
+            ok = in_run(t) || is_empty(t) || ggml_is_empty(t) || !read.count(t->view_src ? t->view_src : t);
+        }
+        if (!ok) {
+            continue;   // the GET_ROWS stays, unfused
+        }
+        // only the nodes from the run's first node to the anchor (or the run's last node) move: the run goes right
+        // before the anchor, in its present order
+        std::vector<ggml_tensor *> order;
+        order.reserve(last - first + 1);
+        for (size_t k = first; k <= last; ++k) {
+            ggml_tensor * t = new_order[k];
+            if (t == anchor) {
+                for (size_t j = first; j <= last; ++j) {
+                    if (in_run(new_order[j])) {
+                        order.push_back(new_order[j]);
+                    }
+                }
+                order.push_back(t);
+            } else if (!in_run(t)) {
+                order.push_back(t);
+            }
+        }
+        for (size_t k = first; k <= last; ++k) {
+            new_order[k] = order[k - first];
+            rows_pos[new_order[k]] = k;
         }
     }
     // Replace the graph with the new order.
