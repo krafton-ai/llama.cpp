@@ -139,6 +139,41 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// dim 0 with a transposed src1 (dim 1 contiguous, e.g. a conv state followed by the transposed new tokens):
+// a 32x32 tile is read along dim 1 and written along dim 0, so both sides are coalesced.
+template <typename T>
+static __global__ void concat_dim0_transposed_src1(
+        const char * src0, const char * src1, T * dst,
+        const int64_t ne00, const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2) {
+    __shared__ T tile[32][33];
+
+    const int64_t i0_base = (int64_t) blockIdx.x * 32;
+    const int64_t i1_base = (int64_t) blockIdx.y * 32;
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+
+    const int64_t i1 = i1_base + threadIdx.x;
+    for (int r = threadIdx.y; r < 32; r += blockDim.y) {
+        const int64_t i0 = i0_base + r;
+        if (i0 < ne0 && i1 < ne1) {
+            tile[r][threadIdx.x] = i0 < ne00 ?
+                *(const T *) (src0 + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03) :
+                *(const T *) (src1 + (i0 - ne00)*nb10 + i1*nb11 + i2*nb12 + i3*nb13);
+        }
+    }
+    __syncthreads();
+
+    const int64_t i0 = i0_base + threadIdx.x;
+    for (int r = threadIdx.y; r < 32; r += blockDim.y) {
+        const int64_t i1w = i1_base + r;
+        if (i0 < ne0 && i1w < ne1) {
+            dst[((i3*ne2 + i2)*ne1 + i1w)*ne0 + i0] = tile[threadIdx.x][r];
+        }
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -154,6 +189,14 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                     ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2],
                     ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2], dim, stream);
         }
+    } else if (dim == 0 && src1->nb[1] == sizeof(T) && src1->nb[0] != sizeof(T) && ggml_is_contiguous(dst) &&
+               (dst->ne[1] + 31) / 32 <= 65535 && dst->ne[2]*dst->ne[3] <= 65535) {
+        const dim3 grid_dim((dst->ne[0] + 31) / 32, (dst->ne[1] + 31) / 32, dst->ne[2]*dst->ne[3]);
+        concat_dim0_transposed_src1<T><<<grid_dim, dim3(32, 8, 1), 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (T *) dst->data,
+            src0->ne[0], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->ne[0], dst->ne[1], dst->ne[2]);
     } else if (dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         const size_t size0 = ggml_nbytes(src0);
         const size_t size1 = ggml_nbytes(src1);

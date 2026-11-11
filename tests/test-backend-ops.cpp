@@ -7892,6 +7892,29 @@ struct test_concat : public test_case {
     }
 };
 
+// GGML_OP_CONCAT along dim 0 of a state and a transposed input (e.g. a conv state followed by the new tokens: concat(state, x^T))
+struct test_concat_dim0_transposed : public test_case {
+    const ggml_type type;
+    const int64_t k, n, t, s;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, k, n, t, s);
+    }
+
+    test_concat_dim0_transposed(ggml_type type = GGML_TYPE_F32, int64_t k = 3, int64_t n = 6144, int64_t t = 512, int64_t s = 1)
+        : type(type), k(k), n(n), t(t), s(s) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type, k, n, s);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type, n, t, s);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, b), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -13051,6 +13074,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {20000, 3, 2, 1}, dim == 0 ? 333 : 1, dim, 1));
         test_cases.emplace_back(new test_concat(GGML_TYPE_Q8_0, {8192, 2, 1, 1}, dim == 0 ? 4096 : 1, dim, 0));
     }
+
+    for (int64_t t : {1, 7, 64, 512}) {
+        test_cases.emplace_back(new test_concat_dim0_transposed(GGML_TYPE_F32, 3, 6144, t, 1));
+        test_cases.emplace_back(new test_concat_dim0_transposed(GGML_TYPE_F32, 3,  100, t, 2));
+    }
+    test_cases.emplace_back(new test_concat_dim0_transposed(GGML_TYPE_F16, 3, 1000, 33, 1));
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
