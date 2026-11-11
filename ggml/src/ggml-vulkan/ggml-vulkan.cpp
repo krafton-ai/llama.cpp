@@ -11325,21 +11325,35 @@ void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
 
-        std::array<uint32_t, 3> elements = { num_wgs, nrows_x, 1 };
-
         vk_pipeline pipeline1 = src1 && src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_large1_f32_f16 : ctx->device->pipeline_soft_max_large1_f32;
         vk_pipeline pipeline2 = src1 && src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_large2_f32_f16 : ctx->device->pipeline_soft_max_large2_f32;
         vk_pipeline pipeline3 = src1 && src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_large3_f32_f16 : ctx->device->pipeline_soft_max_large3_f32;
 
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline1, 1);
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline2, 1);
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline3, 1);
+        // on 60+ cores the three passes run over groups of rows of about 32 MB of scores each, so the second and
+        // third read rows the first has just read while they can still be in the last level cache; every row is
+        // computed as without groups. Smaller GPUs keep one group (0)
+        const uint64_t chunk_mb = ctx->device->shader_core_count >= 60 ? 32 : 0;
+        const uint64_t row_bytes = (uint64_t)ncols * sizeof(float);
+        const uint32_t chunk_rows = chunk_mb == 0 ? nrows_x :
+                (uint32_t)std::min<uint64_t>(nrows_x, std::max<uint64_t>(1, (chunk_mb << 20) / row_bytes));
+        const uint32_t n_chunks = CEIL_DIV(nrows_x, chunk_rows);
 
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline1, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
-        ggml_vk_sync_buffers(ctx, subctx);
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline2, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
-        ggml_vk_sync_buffers(ctx, subctx);
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline3, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline1, n_chunks);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline2, n_chunks);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline3, n_chunks);
+
+        for (uint32_t r0 = 0; r0 < nrows_x; r0 += chunk_rows) {
+            pc.row0 = r0;
+            std::array<uint32_t, 3> elements = { num_wgs, std::min(chunk_rows, nrows_x - r0), 1 };
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline1, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline2, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline3, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
+            if (r0 + chunk_rows < nrows_x) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+        }
 
         ctx->prealloc_x_need_sync = true;
         ctx->prealloc_y_need_sync = true;

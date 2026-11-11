@@ -19,6 +19,7 @@ layout (push_constant) uniform parameter
     uint n_head_log2;
     uint nrows_x;
     uint has_sinks;
+    uint row0;
 } p;
 
 #include "types.glsl"

@@ -511,6 +511,7 @@ struct vk_op_soft_max_push_constants {
     uint32_t n_head_log2;
     uint32_t nrows_x;
     uint32_t has_sinks;
+    uint32_t row0;      // first row of the dispatch (large softmax)
 };
 
 struct vk_op_argsort_push_constants {

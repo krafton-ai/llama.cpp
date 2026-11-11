@@ -6,7 +6,7 @@ shared FLOAT_TYPE sumsh[BLOCK_SIZE];
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint rowx = gl_WorkGroupID.y;
+    const uint rowx = gl_WorkGroupID.y + p.row0;
     const uint wg_start = gl_WorkGroupID.x * BLOCK_SIZE * num_iters;
 
     const uint32_t i03 = rowx / (p.ne01 * p.ne02);
@@ -52,7 +52,10 @@ void main() {
     }
 
     FLOAT_TYPE rcpdivisor = 1.0/sum;
+    float slope = get_slope(rowx);
 
+    // exp(x - max) as in the second pass, read from x instead of a stored copy; each element is read and written by the
+    // same invocation, so x may be the destination
     [[unroll]] for (uint col0 = wg_start, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
         const uint col = col0 + tid;
 
@@ -60,6 +63,9 @@ void main() {
             continue;
         }
 
-        data_d[rowx*p.KX + col] *= D_TYPE(rcpdivisor);
+        const uint i = rowx * p.KX + col;
+        FLOAT_TYPE val;
+        val = exp(FLOAT_TYPE(data_a[i]) * p.scale + (p.KY > 0 ? slope * FLOAT_TYPE(data_b[rowy_start + col]) : FLOAT_TYPE(0.0f)) - max_val);
+        data_d[i] = D_TYPE(val) * D_TYPE(rcpdivisor);
     }
 }

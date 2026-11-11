@@ -4,7 +4,7 @@
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint rowx = gl_WorkGroupID.y;
+    const uint rowx = gl_WorkGroupID.y + p.row0;
     const uint wg_start = gl_WorkGroupID.x * BLOCK_SIZE * num_iters;
 
     const uint32_t i03 = rowx / (p.ne01 * p.ne02);

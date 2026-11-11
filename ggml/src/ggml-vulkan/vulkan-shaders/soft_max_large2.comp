@@ -4,7 +4,7 @@
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint rowx = gl_WorkGroupID.y;
+    const uint rowx = gl_WorkGroupID.y + p.row0;
     const uint wg_start = gl_WorkGroupID.x * BLOCK_SIZE * num_iters;
 
     const uint32_t i03 = rowx / (p.ne01 * p.ne02);
@@ -46,7 +46,7 @@ void main() {
 
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
 
-    // Compute sum{exp(x - max)}
+    // Compute sum{exp(x - max)}; the third pass computes the same exp again and writes the result once
     [[unroll]] for (uint col0 = wg_start, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
         const uint col = col0 + tid;
 
@@ -59,7 +59,6 @@ void main() {
         FLOAT_TYPE val;
         val = exp(FLOAT_TYPE(data_a[i]) * p.scale + (p.KY > 0 ? slope * FLOAT_TYPE(data_b[rowy_start + col]) : FLOAT_TYPE(0.0f)) - max_val);
         sum += val;
-        data_d[i] = D_TYPE(val);
     }
 
     // reduce across the workgroup
