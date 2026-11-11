@@ -8465,6 +8465,259 @@ static bool ggml_vk_fa_mla_decode(ggml_backend_vk_context * ctx, vk_context& sub
     return true;
 }
 
+// Many query rows (prefill) without cooperative matrices: the scalar flash attention is slow there, the tiled matmul is not.
+// Per group of heads (and of query rows, so that the f32 scores fit in a bound): S = K^T Q, S = softmax(S*scale + mask), O = V S.
+// V is transposed first (prealloc_x) so that the matmul reads it along the cells. S is in prealloc_split_k, O is written in place into dst.
+static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k,
+        const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    const vk_device & device = ctx->device;
+    if (device->coopmat2 || device->coopmat_support) {
+        return false;
+    }
+    float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+
+    const uint32_t N  = (uint32_t) q->ne[1];
+    const uint32_t H  = (uint32_t) q->ne[2];
+    const uint32_t KV = (uint32_t) k->ne[1];
+    const uint32_t DK = (uint32_t) q->ne[0];
+    const uint32_t DV = (uint32_t) v->ne[0];
+
+    if (N < 256 || sinks || max_bias != 0.0f || logit_softcap != 0.0f || n_kv_max != 0 ||
+        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
+        DK > 576 || DV > 512 || KV == 0 || k->ne[2] != H || v->ne[2] != H || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+        dst->ne[0] != DV || dst->ne[1] != H || dst->ne[2] != N ||
+        (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < KV || mask->ne[1] < N || mask->ne[2] != 1 || mask->ne[3] != 1))) {
+        return false;
+    }
+    const uint64_t max_range = device->properties.limits.maxStorageBufferRange;
+    if (ggml_nbytes(q) > max_range || ggml_nbytes(k) > max_range || ggml_nbytes(v) > max_range || ggml_nbytes(dst) > max_range ||
+        (mask && ggml_nbytes(mask) > max_range)) {
+        return false;
+    }
+
+    // q, k, mask and dst are bound at per-chunk offsets: these must stay aligned (16 bytes for the vector loads of the aligned matmul)
+    const uint64_t min_align = device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t A = std::max<uint64_t>(min_align, 16);
+    if (ggml_vk_tensor_buffer_offset(ctx, q) % A != 0 || ggml_vk_tensor_buffer_offset(ctx, k) % A != 0 ||
+        ggml_vk_tensor_buffer_offset(ctx, dst) % A != 0 || (mask && ggml_vk_tensor_buffer_offset(ctx, mask) % A != 0)) {
+        return false;
+    }
+    // smallest count of heads (rows) whose byte offset is a multiple of A (A is a power of two)
+    auto step = [A](uint64_t stride) -> uint32_t {
+        uint32_t s = 1;
+        while ((stride * s) % A != 0) {
+            s *= 2;
+        }
+        return s;
+    };
+    const uint32_t h_step = std::max({ step(k->nb[2]), step(q->nb[2]), step(dst->nb[1]) });
+    const uint32_t r_step = std::max({ step(q->nb[1]), step(dst->nb[2]), mask ? step(mask->nb[1]) : 1u });
+
+    // the f32 scores of one chunk and the transposed V of its heads stay within this bound
+    const uint64_t bound   = std::min<uint64_t>({ uint64_t(256) << 20, max_range, device->max_buffer_size });
+    const uint64_t s_head  = (uint64_t) N * KV * sizeof(float);
+    const uint64_t vt_head = (uint64_t) KV * DV * sizeof(ggml_fp16_t);
+    if (vt_head > bound || (uint64_t) KV * sizeof(float) > bound) {
+        return false;
+    }
+    uint32_t hc = H;
+    uint32_t rc = N;
+    if (s_head * H > bound || vt_head * H > bound) {
+        hc = (uint32_t) std::min<uint64_t>(bound / s_head, bound / vt_head);
+        if (hc == 0) {
+            hc = 1;
+            rc = (uint32_t) (bound / ((uint64_t) KV * sizeof(float)));
+            rc = rc / r_step * r_step;
+            if (rc == 0) {
+                return false;
+            }
+        }
+        hc = hc / h_step * h_step;
+        if (hc == 0) {
+            return false;
+        }
+    }
+
+    const std::vector<vk_matmul_pipeline_pair> * mmp = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_F16, GGML_TYPE_F32, GGML_PREC_F32);
+    if (mmp == nullptr) {
+        return false;
+    }
+    auto pick_matmul = [&](uint32_t m, uint32_t n, uint32_t kk, bool strides_ok) -> vk_pipeline {
+        const uint32_t align = ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp, m, n, false);
+        const bool aligned = strides_ok && kk == ggml_vk_align_size(kk, align) && m > 8 && n > 8;
+        return ggml_vk_guess_matmul_pipeline_map(ctx, *mmp, m, n, aligned, false);
+    };
+    const bool qk_strides_ok = (k->nb[1] / sizeof(ggml_fp16_t)) % 8 == 0 && (k->nb[2] / sizeof(ggml_fp16_t)) % 8 == 0 &&
+                               (q->nb[1] / sizeof(float)) % 8 == 0 && (q->nb[2] / sizeof(float)) % 8 == 0;
+
+    const uint32_t n_hchunks = CEIL_DIV(H, hc);
+    const uint32_t n_rchunks = CEIL_DIV(N, rc);
+    const uint64_t s_size  = (uint64_t) hc * rc * KV * sizeof(float);
+    const uint64_t vt_size = (uint64_t) hc * KV * DV * sizeof(ggml_fp16_t);
+
+    // softmax rows above 16384 columns: the three pass softmax with its partial max/sum in prealloc_y
+    const bool sm_large = KV > 16384;
+    const uint32_t sm_wgs = CEIL_DIV(KV, 128 * 4);
+    const uint64_t sm_tmp = (uint64_t) sm_wgs * hc * rc * sizeof(float);
+    const uint64_t sm_off = ggml_vk_align_size(sm_tmp, A);
+    const uint32_t max_wg1 = device->properties.limits.maxComputeWorkGroupCount[1];
+
+    bool grow = false;
+    if (ctx->prealloc_size_split_k < s_size) {
+        ctx->prealloc_size_split_k = s_size;
+        grow = true;
+    }
+    if (ctx->prealloc_size_x < vt_size) {
+        ctx->prealloc_size_x = vt_size;
+        grow = true;
+    }
+    if (sm_large && ctx->prealloc_size_y < sm_off + sm_tmp) {
+        ctx->prealloc_size_y = sm_off + sm_tmp;
+        grow = true;
+    }
+    if (grow) {
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    vk_pipeline sm_pipeline = mask ? (KV > 1024 ? device->pipeline_soft_max_f32_f16_wg512 : device->pipeline_soft_max_f32_f16)
+                                   : (KV > 1024 ? device->pipeline_soft_max_f32_wg512     : device->pipeline_soft_max_f32);
+    vk_pipeline sm_pipeline1 = mask ? device->pipeline_soft_max_large1_f32_f16 : device->pipeline_soft_max_large1_f32;
+    vk_pipeline sm_pipeline2 = mask ? device->pipeline_soft_max_large2_f32_f16 : device->pipeline_soft_max_large2_f32;
+    vk_pipeline sm_pipeline3 = mask ? device->pipeline_soft_max_large3_f32_f16 : device->pipeline_soft_max_large3_f32;
+
+    ggml_pipeline_request_descriptor_sets(ctx, device->pipeline_cpy_transpose_16, n_hchunks);
+    if (sm_large) {
+        const uint32_t n_sm = n_hchunks * n_rchunks * CEIL_DIV(hc * rc, max_wg1);
+        ggml_pipeline_request_descriptor_sets(ctx, sm_pipeline1, n_sm);
+        ggml_pipeline_request_descriptor_sets(ctx, sm_pipeline2, n_sm);
+        ggml_pipeline_request_descriptor_sets(ctx, sm_pipeline3, n_sm);
+    } else {
+        ggml_pipeline_request_descriptor_sets(ctx, sm_pipeline, n_hchunks * n_rchunks);
+    }
+
+    if (ctx->prealloc_x_need_sync || ctx->prealloc_y_need_sync || ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    const vk_subbuffer q_sb = ggml_vk_tensor_subbuffer(ctx, q);
+    const vk_subbuffer k_sb = ggml_vk_tensor_subbuffer(ctx, k);
+    const vk_subbuffer v_sb = ggml_vk_tensor_subbuffer(ctx, v, true);
+    const vk_subbuffer d_sb = ggml_vk_tensor_subbuffer(ctx, dst);
+    const vk_subbuffer m_sb = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_sb;
+    const uint64_t v_off = ggml_vk_tensor_buffer_offset(ctx, v);
+
+    const vk_subbuffer s_buf  = { ctx->prealloc_split_k, 0, s_size };
+    const vk_subbuffer vt_buf = { ctx->prealloc_x, 0, vt_size };
+
+    for (uint32_t h0 = 0; h0 < H; h0 += hc) {
+        const uint32_t nh = std::min(hc, H - h0);
+
+        // V^T of these heads: [KV, DV, nh] f16, contiguous
+        {
+            const uint64_t off  = v_off + (uint64_t) h0 * v->nb[2];
+            const uint64_t desc = ggml_vk_descriptor_offset(off, min_align, sizeof(ggml_fp16_t));
+            vk_op_unary_push_constants pc{};
+            pc.ne   = KV * DV * nh;
+            pc.ne00 = KV; pc.ne01 = DV; pc.ne02 = nh; pc.ne03 = 1;
+            pc.nb00 = (uint32_t) (v->nb[1] / sizeof(ggml_fp16_t)); pc.nb01 = 1; pc.nb02 = (uint32_t) (v->nb[2] / sizeof(ggml_fp16_t)); pc.nb03 = 0;
+            pc.ne10 = KV; pc.ne11 = DV; pc.ne12 = nh; pc.ne13 = 1;
+            pc.nb10 = 1; pc.nb11 = KV; pc.nb12 = KV * DV; pc.nb13 = KV * DV * nh;
+            pc.misalign_offsets = (uint32_t) ((off - desc) / sizeof(ggml_fp16_t)) << 16;
+            init_pushconst_fastdiv(pc);
+            const std::array<uint32_t, 3> elements = {
+                std::min(CEIL_DIV(KV, 32u), device->properties.limits.maxComputeWorkGroupCount[0]),
+                std::min(CEIL_DIV(DV, 32u), device->properties.limits.maxComputeWorkGroupCount[1]),
+                std::min(nh, device->properties.limits.maxComputeWorkGroupCount[2]),
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, device->pipeline_cpy_transpose_16, { ggml_vk_subbuffer(ctx, v_sb.buffer, desc), vt_buf }, pc, elements);
+        }
+
+        for (uint32_t r0 = 0; r0 < N; r0 += rc) {
+            const uint32_t nr = std::min(rc, N - r0);
+            const uint32_t rows = nr * nh;
+
+            // S = K^T Q: [KV, nr, nh]
+            ggml_vk_sync_buffers(ctx, subctx);
+            vk_pipeline p_qk = pick_matmul(KV, nr, DK, qk_strides_ok);
+            ggml_vk_matmul(ctx, subctx, p_qk,
+                ggml_vk_subbuffer(ctx, k_sb.buffer, k_sb.offset + (uint64_t) h0 * k->nb[2]),
+                ggml_vk_subbuffer(ctx, q_sb.buffer, q_sb.offset + (uint64_t) h0 * q->nb[2] + (uint64_t) r0 * q->nb[1]),
+                vk_subbuffer{ s_buf }, vk_subbuffer{ nullptr, 0, 0 },
+                KV, nr, DK,
+                (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)), (uint32_t) (q->nb[1] / sizeof(float)), KV,
+                (uint32_t) (k->nb[2] / sizeof(ggml_fp16_t)), (uint32_t) (q->nb[2] / sizeof(float)), KV * nr,
+                1, nh, nh, nh, 1, 1, nr,
+                (uint64_t) q->nb[1], (uint64_t) KV * sizeof(float));
+
+            // S = softmax(S*scale + mask), in place; the mask rows are shared by all heads
+            ggml_vk_sync_buffers(ctx, subctx);
+            vk_op_soft_max_push_constants pc = {
+                KV, mask ? nr : 0u,
+                KV, nr, nh,
+                1, 1,
+                mask ? (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)) : 0u, 0, 0,
+                scale, 0.0f,
+                1.0f, 1.0f,
+                1,
+                rows,
+                0,
+                0,
+            };
+            const vk_subbuffer m_buf = mask ? ggml_vk_subbuffer(ctx, m_sb.buffer, m_sb.offset + (uint64_t) r0 * mask->nb[1]) : s_buf;
+            if (!sm_large) {
+                std::array<uint32_t, 3> elements;
+                if (rows > 262144) {
+                    elements = { 512, 512, CEIL_DIV(rows, 262144) };
+                } else if (rows > 512) {
+                    elements = { 512, CEIL_DIV(rows, 512), 1 };
+                } else {
+                    elements = { rows, 1, 1 };
+                }
+                ggml_vk_dispatch_pipeline(ctx, subctx, sm_pipeline, { s_buf, m_buf, s_buf, s_buf }, pc, elements);
+            } else {
+                const vk_subbuffer sm_x = { ctx->prealloc_y, 0, sm_tmp };
+                const vk_subbuffer sm_y = { ctx->prealloc_y, sm_off, sm_tmp };
+                for (uint32_t row0 = 0; row0 < rows; row0 += max_wg1) {
+                    pc.row0 = row0;
+                    const std::array<uint32_t, 3> elements = { sm_wgs, std::min(max_wg1, rows - row0), 1 };
+                    ggml_vk_dispatch_pipeline(ctx, subctx, sm_pipeline1, { s_buf, m_buf, s_buf, s_buf, sm_x, sm_y }, pc, elements);
+                    ggml_vk_sync_buffers(ctx, subctx);
+                    ggml_vk_dispatch_pipeline(ctx, subctx, sm_pipeline2, { s_buf, m_buf, s_buf, s_buf, sm_x, sm_y }, pc, elements);
+                    ggml_vk_sync_buffers(ctx, subctx);
+                    ggml_vk_dispatch_pipeline(ctx, subctx, sm_pipeline3, { s_buf, m_buf, s_buf, s_buf, sm_x, sm_y }, pc, elements);
+                    ggml_vk_sync_buffers(ctx, subctx);
+                }
+            }
+
+            // O = V S: [DV, nr] per head, written at dst[:, h, r]
+            ggml_vk_sync_buffers(ctx, subctx);
+            vk_pipeline p_pv = pick_matmul(DV, nr, KV, true);
+            ggml_vk_matmul(ctx, subctx, p_pv,
+                vk_subbuffer{ vt_buf }, vk_subbuffer{ s_buf },
+                ggml_vk_subbuffer(ctx, d_sb.buffer, d_sb.offset + (uint64_t) h0 * dst->nb[1] + (uint64_t) r0 * dst->nb[2]),
+                vk_subbuffer{ nullptr, 0, 0 },
+                DV, nr, KV,
+                KV, KV, (uint32_t) (dst->nb[2] / sizeof(float)),
+                KV * DV, KV * nr, (uint32_t) (dst->nb[1] / sizeof(float)),
+                1, nh, nh, nh, 1, 1, nr,
+                (uint64_t) KV * sizeof(float), (uint64_t) dst->nb[2]);
+        }
+    }
+
+    ctx->prealloc_x_need_sync = true;
+    ctx->prealloc_split_k_need_sync = true;
+    if (sm_large) {
+        ctx->prealloc_y_need_sync = true;
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
+    }
+    return true;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -8518,6 +8771,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     assert(q->type == GGML_TYPE_F32);
 
     if (ggml_vk_fa_mla_decode(ctx, subctx, q, k, v, mask, sinks, dst)) {
+        return;
+    }
+    if (ggml_vk_fa_prefill_matmul(ctx, subctx, q, k, v, mask, sinks, dst)) {
         return;
     }
     uint32_t gqa_ratio = 1;
