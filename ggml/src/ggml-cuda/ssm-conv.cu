@@ -283,13 +283,91 @@ static __global__ void conv_state_f32(const ggml_cuda_conv_state_args a) {
     }
 }
 
-void ggml_cuda_op_conv_state(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state_args & args) {
-    const bool fuse_l2 = args.y_l2 != nullptr;
-    GGML_ASSERT(!fuse_l2 || (args.l2_n % WARP_SIZE == 0 && args.l2_n <= 32*WARP_SIZE));
+// the same for many tokens, as ssm_conv_long_token_f32 with the window read from the state and x: one block per
+// threads channels and split_n_t tokens, one thread per channel. Only the blocks of the first tokens read the state,
+// and they write all the copies after the thread has read its channel, so the cache row read may be one that is written
+template <int nc, int threads, int split_n_t>
+static __global__ void conv_state_long_f32(const ggml_cuda_conv_state_args a) {
+    constexpr int n_cols = nc - 1 + split_n_t;
+    __shared__ float smem[threads*n_cols];
 
-    const int    threads = fuse_l2 ? args.l2_n : 128;
-    const dim3   blocks((args.n_ch + threads - 1) / threads, 1, 1);
+    const int     tid   = threadIdx.x;
+    const int64_t c     = (int64_t) blockIdx.x*threads + tid;
+    const int     p0    = blockIdx.y*split_n_t;
+    const bool    valid = c < a.n_ch;
+    if (!valid) {
+        return;
+    }
+
+    const float * state = a.state;
+    if (a.state_row != nullptr) {
+        state += (int64_t) a.state_row[0]*a.state_row_stride;
+    }
+
+    // column p of [state | x] is smem[tid*n_cols + p - p0]; with x transposed the loads are contiguous over channels
+    float * win = smem + tid*n_cols;
+#pragma unroll
+    for (int col = 0; col < n_cols; ++col) {
+        const int p = p0 + col;
+        float v = 0.0f;
+        if (p < nc - 1) {
+            v = state[c*a.state_stride_c + p];
+        } else if (p - (nc - 1) < a.n_t) {
+            v = a.x[(int64_t) (p - (nc - 1))*a.x_stride_t + c*a.x_stride_c];
+        }
+        win[col] = v;
+    }
+
+    float w[nc];
+#pragma unroll
+    for (int j = 0; j < nc; ++j) {
+        w[j] = a.w[c*a.w_stride_c + j];
+    }
+
+    const int local_n_t = min(split_n_t, a.n_t - p0);
+    for (int i = 0; i < local_n_t; ++i) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < nc; ++j) {
+            sumf += win[i + j]*w[j];
+        }
+        a.y[(int64_t) (p0 + i)*a.y_stride_t + c] = ggml_cuda_op_silu_single(sumf);
+    }
+
+    if (blockIdx.y != 0) {
+        return;
+    }
+    for (int k = 0; k < a.n_copies; ++k) {
+#pragma unroll
+        for (int j = 0; j < nc - 1; ++j) {
+            const int p = a.copy_start[k] + j;
+            a.copy_dst[k][c*(nc - 1) + j] = p < n_cols ? win[p] : a.x[(int64_t) (p - (nc - 1))*a.x_stride_t + c*a.x_stride_c];
+        }
+    }
+}
+
+void ggml_cuda_op_conv_state(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state_args & args) {
+    const bool   fuse_l2 = args.y_l2 != nullptr;
     cudaStream_t stream  = ctx.stream();
+    GGML_ASSERT(!fuse_l2 || (args.l2_n % WARP_SIZE == 0 && args.l2_n <= 32*WARP_SIZE));
+    GGML_ASSERT(!fuse_l2 || args.n_t <= GGML_CUDA_CONV_STATE_SHORT_MAX_TOKENS);
+
+    if (args.n_t > GGML_CUDA_CONV_STATE_SHORT_MAX_TOKENS) {
+        constexpr int threads   = 128;
+        constexpr int split_n_t = 32;
+        const dim3    blocks((args.n_ch + threads - 1) / threads, (args.n_t + split_n_t - 1) / split_n_t, 1);
+        switch (args.nc) {
+            case 3: conv_state_long_f32<3, threads, split_n_t><<<blocks, threads, 0, stream>>>(args); break;
+            case 4: conv_state_long_f32<4, threads, split_n_t><<<blocks, threads, 0, stream>>>(args); break;
+            case 5: conv_state_long_f32<5, threads, split_n_t><<<blocks, threads, 0, stream>>>(args); break;
+            default: GGML_ABORT("unsupported conv width %d", args.nc);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    const int  threads = fuse_l2 ? args.l2_n : 128;
+    const dim3 blocks((args.n_ch + threads - 1) / threads, 1, 1);
 
     auto launch = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;

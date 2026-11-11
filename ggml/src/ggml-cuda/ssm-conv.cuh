@@ -3,8 +3,10 @@
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
 
 // CONCAT(state, x) -> CPY(columns of the concat -> state cache) -> SSM_CONV -> SILU [-> L2_NORM of rows of the output]
-// for one sequence, as one kernel (see ggml_cuda_match_conv_state in ggml-cuda.cu)
+// for one sequence, as one kernel (see ggml_cuda_match_conv_state in ggml-cuda.cu). Above SHORT_MAX_TOKENS tokens a
+// kernel tiled over tokens runs, without the L2_NORM
 #define GGML_CUDA_CONV_STATE_MAX_COPIES 8
+#define GGML_CUDA_CONV_STATE_SHORT_MAX_TOKENS 32
 
 struct ggml_cuda_conv_state_args {
     const float   * state;            // element (j, c) of the old state at state[c*state_stride_c + j]

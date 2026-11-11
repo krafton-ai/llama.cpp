@@ -14265,6 +14265,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,   7, 4, 3, 2, 1));
     test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,  33, 4, 0, 1, 1));
     test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32, 512, 4, 0, 1, 1));
+    // conv state over many tokens (tiled over tokens): partial last tile, rollback slots, other conv widths, a channel
+    // count that is not a multiple of the 128 channels of a block
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,  64, 4, 0, 0, 2));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32, 513, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,  64, 4, 3, 2, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,  33, 3, 2, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256, 128,  4, 32,  97, 5, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256,  64,  3, 32,  64, 4, 0, 1, 1));
+    test_cases.emplace_back(new test_delta_net_layer( 256,  64,  3, 32, 513, 4, 2, 0, 2));
     test_cases.emplace_back(new test_delta_net_layer(1536, 128, 16, 64,   1, 4, 0, 1, 1));
     test_cases.emplace_back(new test_delta_net_layer(1536, 128, 16, 64,   7, 4, 0, 1, 1));
     test_cases.emplace_back(new test_delta_net_layer(1536, 128, 16, 64,  33, 4, 0, 1, 1));

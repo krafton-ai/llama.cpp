@@ -3186,12 +3186,13 @@ struct ggml_cuda_conv_state_match {
     ggml_cuda_conv_state_args args;
 };
 
-// conv state update of one sequence of up to 32 tokens, as the graph has it (llm_build_delta_net_base::build_conv_state):
+// conv state update of one sequence, as the graph has it (llm_build_delta_net_base::build_conv_state):
 //   CONCAT(state, x, dim 0) -> one or more CPY(VIEW(concat, nc - 1 columns), state cache view)
 //   ... nodes that do not touch the cache, x or the state ...
 //   SSM_CONV(concat, w) -> SILU [-> L2_NORM(VIEW(silu, rows at its start))]
 // The CONCAT and the copies are skipped, and the kernel computes the copies, the conv, the SILU and the L2_NORM at the
-// SSM_CONV. If the state is a GET_ROWS of one cache row, the kernel reads that row and the GET_ROWS is skipped too
+// SSM_CONV (the L2_NORM only up to GGML_CUDA_CONV_STATE_SHORT_MAX_TOKENS tokens). If the state is a GET_ROWS of one
+// cache row, the kernel reads that row and the GET_ROWS is skipped too
 static bool ggml_cuda_match_conv_state(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i,
         ggml_cuda_conv_state_match & m) {
     const ggml_tensor * cat = cgraph->nodes[i];
@@ -3205,7 +3206,7 @@ static bool ggml_cuda_match_conv_state(ggml_backend_cuda_context * cuda_ctx, con
     const int     n_t  = (int) x->ne[0];
     const int64_t n_ch = cat->ne[1];
     if (st->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || cat->ne[2] != 1 || cat->ne[3] != 1 || nc < 3 || nc > 5 ||
-            n_t < 1 || n_t > 32 || st->nb[0] != sizeof(float) || st->nb[1] % sizeof(float) != 0 ||
+            x->ne[0] < 1 || x->ne[0] > (1 << 20) || st->nb[0] != sizeof(float) || st->nb[1] % sizeof(float) != 0 ||
             x->nb[0] % sizeof(float) != 0 || x->nb[1] % sizeof(float) != 0) {
         return false;
     }
@@ -3315,7 +3316,7 @@ static bool ggml_cuda_match_conv_state(ggml_backend_cuda_context * cuda_ctx, con
     // the L2 norm of rows at the start of each token of the output (the q and k heads of a gated delta net)
     const ggml_tensor * l2    = nullptr;
     const int           j_l2  = ggml_cuda_next_compute_node(cgraph, j_silu);
-    if (j_l2 >= 0 && cgraph->nodes[j_l2]->op == GGML_OP_L2_NORM) {
+    if (n_t <= GGML_CUDA_CONV_STATE_SHORT_MAX_TOKENS && j_l2 >= 0 && cgraph->nodes[j_l2]->op == GGML_OP_L2_NORM) {
         const ggml_tensor * n = cgraph->nodes[j_l2];
         const ggml_tensor * q = n->src[0];
         if (q->view_src == silu && q->view_offs == 0 && q->nb[0] == sizeof(float) && q->nb[1] == q->ne[0]*sizeof(float) &&
