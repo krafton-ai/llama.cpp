@@ -3522,6 +3522,60 @@ static int ggml_cuda_match_sigmoid_ratio_mul(const ggml_cgraph * cgraph, int i, 
     return j_mul;
 }
 
+// the two gates of a gated delta net layer with a write/erase ratio (Raon-1 nano):
+//   SIGMOID(a) ... MUL(v, ratio) as ggml_cuda_match_sigmoid_ratio_mul -> MUL_MAT(f) -> ADD(f, bias) -> SIGMOID -> SCALE
+// with the MUL_MAT reading none of the ratio nodes. The MUL_MAT runs first and one kernel computes both gates.
+// Returns the index of the SCALE or -1
+static int ggml_cuda_match_rda_gates(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i, int j_b,
+        int j_ratio, int j_mul, int & j_mm) {
+    if (!cuda_ctx->stream_context().concurrent_events.empty()) {
+        return -1;
+    }
+    j_mm = ggml_cuda_next_compute_node(cgraph, j_mul);
+    if (j_mm < 0 || j_mm + 3 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[j_mm];
+    const ggml_tensor * add = cgraph->nodes[j_mm + 1];
+    if (mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || add->op != GGML_OP_ADD ||
+            add->src[0] != mm || ggml_cuda_match_add_sigmoid_scale(cgraph, j_mm + 1) != 3) {
+        return -1;
+    }
+    // the computed ratio nodes: the two SIGMOIDs, the DIV (the RESHAPE's source) and the MUL
+    const ggml_tensor * ratio_nodes[] = { cgraph->nodes[i], cgraph->nodes[j_b], cgraph->nodes[j_ratio]->view_src, cgraph->nodes[j_mul] };
+    for (const ggml_tensor * src : { mm->src[0], mm->src[1] }) {
+        for (const ggml_tensor * t : ratio_nodes) {
+            if (ggml_cuda_view_root(src) == t) {
+                return -1;
+            }
+        }
+    }
+    // nodes between the ratio MUL and the MUL_MAT are views
+    for (int j = j_mul + 1; j < j_mm; ++j) {
+        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            return -1;
+        }
+    }
+    const ggml_tensor * scale = cgraph->nodes[j_mm + 3];
+    const ggml_tensor * sb    = cgraph->nodes[j_b];
+    const ggml_tensor * mul   = cgraph->nodes[j_mul];
+    const ggml_tensor * a     = cgraph->nodes[i]->src[0];
+    const ggml_tensor * b     = sb->src[0];
+    const ggml_tensor * v     = mul->src[0] == cgraph->nodes[j_ratio] ? mul->src[1] : mul->src[0];
+    for (const ggml_tensor * in : { a, b, v }) {
+        if (ggml_cuda_tensors_overlap(scale, in)) {
+            return -1;
+        }
+    }
+    for (const ggml_tensor * out : { sb, mul }) {
+        if (ggml_cuda_tensors_overlap(out, mm) || ggml_cuda_tensors_overlap(out, add->src[1]) ||
+                ggml_cuda_tensors_overlap(out, scale)) {
+            return -1;
+        }
+    }
+    return j_mm + 3;
+}
+
 // expert group selection from build_moe_ffn (n_expert_groups > 1)
 // src0/src1 index into this table, -1 is the (biased) probs, -2 is not checked
 static const struct {
@@ -4861,6 +4915,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         int j_b, j_ratio;
         const int j_mul = ggml_cuda_match_sigmoid_ratio_mul(cgraph, i, j_b, j_ratio);
         if (j_mul > 0) {
+            int j_mm;
+            const int j_scale = ggml_cuda_match_rda_gates(cuda_ctx, cgraph, i, j_b, j_ratio, j_mul, j_mm);
+            if (j_scale > 0) {
+                const bool ok = ggml_cuda_compute_forward(*cuda_ctx, cgraph->nodes[j_mm]);
+                GGML_ASSERT(ok);
+                ggml_cuda_op_sigmoid_ratio_mul_add_sigmoid_scale(*cuda_ctx, node, cgraph->nodes[j_b], cgraph->nodes[j_ratio],
+                        cgraph->nodes[j_mul], cgraph->nodes[j_mm + 1], cgraph->nodes[j_mm + 2], cgraph->nodes[j_scale]);
+                return j_scale - i;
+            }
             ggml_cuda_op_sigmoid_ratio_mul(*cuda_ctx, node, cgraph->nodes[j_b], cgraph->nodes[j_ratio], cgraph->nodes[j_mul]);
             return j_mul - i;
         }

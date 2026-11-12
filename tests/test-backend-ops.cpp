@@ -6382,6 +6382,65 @@ struct test_sigmoid_ratio_mul : public test_case {
     }
 };
 
+// the two gates of a Raon-1 nano gated delta net layer, in graph order: the write/erase ratio applied to v as in
+// test_sigmoid_ratio_mul, then the decay gate SCALE(SIGMOID(MUL_MAT(f_b, f_a) + dt)) with f_a the first rows of the same
+// projection
+struct test_rda_gates : public test_case {
+    const ggml_type type_f_b;
+    const int64_t   head_dim;
+    const int64_t   n_head;
+    const int64_t   n_tokens;
+
+    std::vector<ggml_tensor *> checked;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RDA_GATES";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_f_b, head_dim, n_head, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+
+    test_rda_gates(ggml_type type_f_b = GGML_TYPE_F16, int64_t head_dim = 128, int64_t n_head = 4, int64_t n_tokens = 1)
+        : type_f_b(type_f_b), head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+        const int64_t rank = 32;
+        const int64_t d    = head_dim*n_head;
+        ggml_tensor * fab = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank + 2*n_head, n_tokens);
+        ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*d, n_tokens);
+        ggml_tensor * f_b = ggml_new_tensor_2d(ctx, type_f_b, rank, d);
+        ggml_tensor * dt  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
+        ggml_set_name(fab, "fab");
+        ggml_set_name(x, "x");
+        ggml_set_name(f_b, "f_b");
+        ggml_set_name(dt, "dt");
+        ggml_tensor * v = ggml_view_4d(ctx, x, head_dim, n_head, n_tokens, 1, ggml_row_size(x->type, head_dim), x->nb[1],
+                x->nb[1]*n_tokens, 2*ggml_row_size(x->type, d));
+
+        ggml_tensor * beta  = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, n_head, n_tokens, fab->nb[1], rank*fab->nb[0]));
+        ggml_tensor * write = ggml_sigmoid(ctx, ggml_view_2d(ctx, fab, n_head, n_tokens, fab->nb[1], (rank + n_head)*fab->nb[0]));
+        ggml_tensor * ratio = ggml_reshape_4d(ctx, ggml_div(ctx, write, beta), 1, n_head, n_tokens, 1);
+        ggml_tensor * vs    = ggml_mul(ctx, v, ratio);
+
+        ggml_tensor * f_a = ggml_view_2d(ctx, fab, rank, n_tokens, fab->nb[1], 0);
+        ggml_tensor * g   = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_add(ctx, ggml_mul_mat(ctx, f_b, f_a), dt)), -5.0f);
+        checked.push_back(vs);
+        checked.push_back(beta);
+        checked.push_back(g);
+
+        ggml_tensor * out = ggml_add(ctx, vs, ggml_reshape_4d(ctx, g, head_dim, n_head, n_tokens, 1));
+        out = ggml_add(ctx, out, ggml_sum(ctx, ggml_reshape_4d(ctx, beta, 1, n_head, n_tokens, 1)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // SCALE(SIGMOID(x [+ bias])), the decay gate of a gated delta net layer (lower bound * sigmoid(f + dt))
 struct test_bias_sigmoid_scale : public test_case {
     const int64_t ne0;
@@ -14436,6 +14495,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sigmoid_ratio_mul(128,  4,   1));
     test_cases.emplace_back(new test_sigmoid_ratio_mul(128, 16,   7));
     test_cases.emplace_back(new test_sigmoid_ratio_mul( 64,  4, 512));
+    for (ggml_type type_f_b : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        test_cases.emplace_back(new test_rda_gates(type_f_b, 128,  4,   1));
+        test_cases.emplace_back(new test_rda_gates(type_f_b, 128, 16,   1));
+        test_cases.emplace_back(new test_rda_gates(type_f_b, 128, 16,   7));
+        test_cases.emplace_back(new test_rda_gates(type_f_b,  64,  4, 512));
+    }
     test_cases.emplace_back(new test_bias_sigmoid_scale( 512,   1, true));
     test_cases.emplace_back(new test_bias_sigmoid_scale(2048,   7, true));
     test_cases.emplace_back(new test_bias_sigmoid_scale( 512, 512, true));

@@ -835,14 +835,19 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
 
 /* fused [add] + sigmoid + scale */
 
+static __device__ __forceinline__ void add_sigmoid_scale_one(const float * x, const float * bias, float * dst, const int64_t i,
+                                                              const int64_t bias_n, const float scale, const float offset) {
+    const float v = bias ? x[i] + bias[i % bias_n] : x[i];
+    dst[i] = scale*op_sigmoid(v) + offset;
+}
+
 static __global__ void add_sigmoid_scale_f32(const float * x, const float * bias, float * dst, const int64_t k,
                                              const int64_t bias_n, const float scale, const float offset) {
     const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
     if (i >= k) {
         return;
     }
-    const float v = bias ? x[i] + bias[i % bias_n] : x[i];
-    dst[i] = scale*op_sigmoid(v) + offset;
+    add_sigmoid_scale_one(x, bias, dst, i, bias_n, scale, offset);
 }
 
 void ggml_cuda_op_add_sigmoid_scale(
@@ -867,33 +872,19 @@ void ggml_cuda_op_add_sigmoid_scale(
 /* fused sigmoid ratio + mul */
 
 // a and b: [na0, *] with row stride s1; dst = v * (sigmoid(a)/sigmoid(b)), the ratio of row r of dst being element r of a/b
-static __global__ void sigmoid_ratio_mul_f32(
-        const float * a, const float * b, const float * v, float * dst, float * sig_b,
-        const int64_t k, const int ne0, const int ne1, const int ne2, const int na0, const int64_t sa1, const int64_t sb1,
-        const int64_t sv1, const int64_t sv2, const int64_t sv3) {
-    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
-    if (i >= k) {
-        return;
-    }
-    const int64_t r  = i / ne0;
-    const int     i0 = i - r*ne0;
-    const int64_t i1 = r % ne1;
-    const int64_t i2 = (r / ne1) % ne2;
-    const int64_t i3 = r / ((int64_t) ne1*ne2);
+struct sigmoid_ratio_mul_args {
+    const float * a;
+    const float * b;
+    const float * v;
+    float *       dst;
+    float *       sig_b;
+    int64_t       k;
+    int           ne0, ne1, ne2, na0;
+    int64_t       sa1, sb1, sv1, sv2, sv3;
+};
 
-    const int64_t ra = r % na0;
-    const int64_t rb = r / na0;
-    const float   sa = op_sigmoid(a[ra + rb*sa1]);
-    const float   sb = op_sigmoid(b[ra + rb*sb1]);
-
-    dst[i] = v[i0 + i1*sv1 + i2*sv2 + i3*sv3]*(sa/sb);
-    if (i0 == 0) {
-        sig_b[r] = sb;
-    }
-}
-
-void ggml_cuda_op_sigmoid_ratio_mul(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_a, ggml_tensor * sigmoid_b,
-                                    const ggml_tensor * ratio, ggml_tensor * mul_node) {
+static sigmoid_ratio_mul_args sigmoid_ratio_mul_get_args(const ggml_tensor * sigmoid_a, ggml_tensor * sigmoid_b,
+                                                         const ggml_tensor * ratio, ggml_tensor * mul_node) {
     const ggml_tensor * a = sigmoid_a->src[0];
     const ggml_tensor * b = sigmoid_b->src[0];
     const ggml_tensor * v = mul_node->src[0] == ratio ? mul_node->src[1] : mul_node->src[0];
@@ -903,10 +894,78 @@ void ggml_cuda_op_sigmoid_ratio_mul(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(ggml_is_contiguous(sigmoid_b) && ggml_is_contiguous(mul_node));
     GGML_ASSERT(ggml_nelements(a) == ggml_nrows(mul_node));
 
-    const int64_t k = ggml_nelements(mul_node);
-    const int num_blocks = (k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
-    sigmoid_ratio_mul_f32<<<num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, ctx.stream()>>>(
-        (const float *) a->data, (const float *) b->data, (const float *) v->data, (float *) mul_node->data, (float *) sigmoid_b->data,
-        k, mul_node->ne[0], mul_node->ne[1], mul_node->ne[2], a->ne[0],
-        a->nb[1]/sizeof(float), b->nb[1]/sizeof(float), v->nb[1]/sizeof(float), v->nb[2]/sizeof(float), v->nb[3]/sizeof(float));
+    return {
+        (const float *) a->data, (const float *) b->data, (const float *) v->data, (float *) mul_node->data,
+        (float *) sigmoid_b->data, ggml_nelements(mul_node), (int) mul_node->ne[0], (int) mul_node->ne[1],
+        (int) mul_node->ne[2], (int) a->ne[0], (int64_t) (a->nb[1]/sizeof(float)), (int64_t) (b->nb[1]/sizeof(float)),
+        (int64_t) (v->nb[1]/sizeof(float)), (int64_t) (v->nb[2]/sizeof(float)), (int64_t) (v->nb[3]/sizeof(float)),
+    };
+}
+
+static __device__ __forceinline__ void sigmoid_ratio_mul_one(const sigmoid_ratio_mul_args & p, const int64_t i) {
+    const int64_t r  = i / p.ne0;
+    const int     i0 = i - r*p.ne0;
+    const int64_t i1 = r % p.ne1;
+    const int64_t i2 = (r / p.ne1) % p.ne2;
+    const int64_t i3 = r / ((int64_t) p.ne1*p.ne2);
+
+    const int64_t ra = r % p.na0;
+    const int64_t rb = r / p.na0;
+    const float   sa = op_sigmoid(p.a[ra + rb*p.sa1]);
+    const float   sb = op_sigmoid(p.b[ra + rb*p.sb1]);
+
+    p.dst[i] = p.v[i0 + i1*p.sv1 + i2*p.sv2 + i3*p.sv3]*(sa/sb);
+    if (i0 == 0) {
+        p.sig_b[r] = sb;
+    }
+}
+
+static __global__ void sigmoid_ratio_mul_f32(const sigmoid_ratio_mul_args p) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= p.k) {
+        return;
+    }
+    sigmoid_ratio_mul_one(p, i);
+}
+
+void ggml_cuda_op_sigmoid_ratio_mul(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_a, ggml_tensor * sigmoid_b,
+                                    const ggml_tensor * ratio, ggml_tensor * mul_node) {
+    const sigmoid_ratio_mul_args p = sigmoid_ratio_mul_get_args(sigmoid_a, sigmoid_b, ratio, mul_node);
+    const int num_blocks = (p.k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
+    sigmoid_ratio_mul_f32<<<num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, ctx.stream()>>>(p);
+}
+
+/* the two gates of a gated delta net layer with a write/erase ratio in one kernel */
+
+static __global__ void sigmoid_ratio_mul_add_sigmoid_scale_f32(const sigmoid_ratio_mul_args p, const float * x,
+        const float * bias, float * dst, const int64_t k, const int64_t bias_n, const float scale, const float offset) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i < p.k) {
+        sigmoid_ratio_mul_one(p, i);
+    }
+    if (i < k) {
+        add_sigmoid_scale_one(x, bias, dst, i, bias_n, scale, offset);
+    }
+}
+
+void ggml_cuda_op_sigmoid_ratio_mul_add_sigmoid_scale(ggml_backend_cuda_context & ctx,
+        ggml_tensor * sigmoid_a, ggml_tensor * sigmoid_b, const ggml_tensor * ratio, ggml_tensor * mul_node,
+        ggml_tensor * add_node, ggml_tensor * sigmoid_node, ggml_tensor * scale_node) {
+    GGML_UNUSED(sigmoid_node);
+    const sigmoid_ratio_mul_args p = sigmoid_ratio_mul_get_args(sigmoid_a, sigmoid_b, ratio, mul_node);
+
+    const ggml_tensor * x    = add_node->src[0];
+    const ggml_tensor * bias = add_node->src[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(scale_node) && ggml_is_contiguous(bias));
+
+    const int64_t k      = ggml_nelements(scale_node);
+    const float   scale  = ggml_get_op_params_f32(scale_node, 0);
+    const float   offset = ggml_get_op_params_f32(scale_node, 1);
+
+    const int64_t n = std::max(p.k, k);
+    const int num_blocks = (n + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
+    sigmoid_ratio_mul_add_sigmoid_scale_f32<<<num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, ctx.stream()>>>(
+        p, (const float *) x->data, (const float *) bias->data, (float *) scale_node->data, k, ggml_nelements(bias),
+        scale, offset);
 }

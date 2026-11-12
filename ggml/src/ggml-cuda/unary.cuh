@@ -135,3 +135,8 @@ void ggml_cuda_op_add_sigmoid_scale(
 // MUL(v, SIGMOID(a) / SIGMOID(b)) with the ratio broadcast along dim 0 of v; also writes SIGMOID(b)
 void ggml_cuda_op_sigmoid_ratio_mul(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_a, ggml_tensor * sigmoid_b,
                                     const ggml_tensor * ratio, ggml_tensor * mul_node);
+
+// both of the above in one kernel: the ratio MUL and SCALE(SIGMOID(ADD(x, bias)))
+void ggml_cuda_op_sigmoid_ratio_mul_add_sigmoid_scale(ggml_backend_cuda_context & ctx,
+        ggml_tensor * sigmoid_a, ggml_tensor * sigmoid_b, const ggml_tensor * ratio, ggml_tensor * mul_node,
+        ggml_tensor * add_node, ggml_tensor * sigmoid_node, ggml_tensor * scale_node);
