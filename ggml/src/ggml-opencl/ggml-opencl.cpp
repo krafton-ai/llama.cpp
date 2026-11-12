@@ -1108,6 +1108,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_f32_f32_l4_lm;
     cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
+    cl_kernel kernel_mul_mm_f16_f32_smallm = nullptr;
     cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_1_f32_l4_lm;
@@ -3001,6 +3002,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_l4_lm, "kernel_mul_mm_f16_f32_l4_lm", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mm_f16_f32_smallm (optional: an f16 matrix with few rows against many columns)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mm_f16_f32_smallm.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mm_f16_f32_smallm.cl");
+#endif
+        backend_ctx->kernel_mul_mm_f16_f32_smallm = ggml_cl_build_optional_kernel(
+            backend_ctx, kernel_src, compile_opts, "kernel_mul_mm_f16_f32_smallm", 64);
         GGML_LOG_CONT(".");
     }
 
@@ -26828,6 +26843,35 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 return;
             }
             case GGML_TYPE_F16: {
+                // few rows (the mHC mixing weights, 17 x 4*n_embd) against many columns: the 64-row tiles of the GEMMs
+                // below would leave the GPU nearly idle; this kernel accumulates in F32, so it also serves GGML_PREC_F32
+                if (backend_ctx->kernel_mul_mm_f16_f32_smallm && ne01 <= 24 && ne11 >= 32 && ne00 % 4 == 0 &&
+                    ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && nb00 == sizeof(ggml_fp16_t) &&
+                    nb10 == sizeof(float) && dst->nb[0] == sizeof(float) && nb01 % 8 == 0 && nb11 % 16 == 0 &&
+                    offset0 % 8 == 0 && offset1 % 16 == 0) {
+                    cl_kernel      k    = backend_ctx->kernel_mul_mm_f16_f32_smallm;
+                    const cl_ulong nbd1 = dst->nb[1];
+                    const int      K    = ne00;
+                    const int      M    = ne01;
+                    const int      N    = ne11;
+                    cl_uint        idx  = 0;
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_mem), &extra0->data_device));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_ulong), &offset0));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_ulong), &nb01));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_mem), &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_ulong), &nb11));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_mem), &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(cl_ulong), &nbd1));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &K));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &M));
+                    CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &N));
+                    size_t lws[1] = { 64 };
+                    size_t gws[1] = { (size_t) CEIL_DIV(N, 2) * 64 };
+                    backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, dst);
+                    return;
+                }
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
                 // the xmem GEMM accumulates in half; with GGML_PREC_F32 use the F32-accumulator l4_lm kernel below
                 if (ggml_get_op_params_i32(dst, 0) != GGML_PREC_F32 &&

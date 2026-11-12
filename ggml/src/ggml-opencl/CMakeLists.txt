@@ -162,6 +162,7 @@ set(GGML_OPENCL_KERNELS
     moe_sort_by_expert
     mul_mm_f32_f32_l4_lm
     mul_mm_f16_f32_l4_lm
+    mul_mm_f16_f32_smallm
     mul_mm_q1_0_f32_l4_lm
     mul_mm_q4_0_f32_l4_lm
     mul_mm_q4_1_f32_l4_lm

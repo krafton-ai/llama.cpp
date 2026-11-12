@@ -13067,6 +13067,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mla_kqv_decode(n_kv));
     }
 
+    // An f16 matrix with few rows against many columns (the mHC mixing weights in prefill)
+    for (int64_t m : {1, 17, 24}) {
+        for (int64_t n : {32, 33, 256}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, n, 6144, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
     // Single-column Q5_K GEMV with row counts around multiples of the rows per subgroup and per workgroup.
     for (int64_t m : {31, 32, 33, 63, 64, 65, 67}) {
         for (int64_t k : {256, 512, 1536}) {
