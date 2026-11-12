@@ -888,6 +888,13 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // one warp per row. dst_q8_1 != nullptr: dst (contiguous) is also written as one q8_1 row of ncols_padded values, zero
 // past the last row; ncols is a multiple of QK8_1 and the warps of rows >= nrows write that zero padding
 template <bool gate_silu>
+static __device__ __forceinline__ float rms_norm_mul_gate_act(const float gv) {
+    return gate_silu ? gv/(1.0f + expf(-gv)) : 1.0f/(1.0f + expf(-gv));
+}
+
+// vec4: ncols % (4*WARP_SIZE) == 0 (every lane takes part in each step), 16-byte aligned rows. Each lane handles 4
+// consecutive values, so a q8_1 block of dst_q8_1 is 8 lanes
+template <bool gate_silu, bool vec4>
 static __global__ void rms_norm_mul_gate_f32(
         const float * x, const float * w, const float * g, float * dst, const int ncols, const int64_t nrows,
         const int ne1, const int ne2, const int64_t sx1, const int64_t sx2, const int64_t sx3,
@@ -911,6 +918,43 @@ static __global__ void rms_norm_mul_gate_f32(
     const float * gr = g + i1*sg1 + i2*sg2 + i3*sg3;
     float       * yr = dst + row*ncols;
 
+    if constexpr (vec4) {
+        float sum = 0.0f;
+        for (int col = 4*threadIdx.x; col < ncols; col += 4*WARP_SIZE) {
+            const float4 xv = *(const float4 *) (xr + col);
+            sum += xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+        }
+        sum = warp_reduce_sum(sum);
+        const float scale = rsqrtf(sum/ncols + eps);
+
+        for (int col = 4*threadIdx.x; col < ncols; col += 4*WARP_SIZE) {
+            const float4 xv = *(const float4 *) (xr + col);
+            const float4 wv = *(const float4 *) (w  + col);
+            const float4 gv = *(const float4 *) (gr + col);
+            const float4 y  = make_float4((scale*xv.x)*wv.x*rms_norm_mul_gate_act<gate_silu>(gv.x),
+                                          (scale*xv.y)*wv.y*rms_norm_mul_gate_act<gate_silu>(gv.y),
+                                          (scale*xv.z)*wv.z*rms_norm_mul_gate_act<gate_silu>(gv.z),
+                                          (scale*xv.w)*wv.w*rms_norm_mul_gate_act<gate_silu>(gv.w));
+            *(float4 *) (yr + col) = y;
+            if (dst_q8_1 != nullptr) {
+                const int64_t i    = row*ncols + col;
+                const float   amax = warp_reduce_max<QK8_1/4>(fmaxf(fmaxf(fabsf(y.x), fabsf(y.y)), fmaxf(fabsf(y.z), fabsf(y.w))));
+                const float   s    = warp_reduce_sum<QK8_1/4>(y.x + y.y + y.z + y.w);
+                const float   d    = amax / 127.0f;
+                block_q8_1 &  b    = dst_q8_1[i / QK8_1];
+                char4 q = make_char4(0, 0, 0, 0);
+                if (amax != 0.0f) {
+                    q = make_char4(roundf(y.x/d), roundf(y.y/d), roundf(y.z/d), roundf(y.w/d));
+                }
+                *(char4 *) (b.qs + i % QK8_1) = q;
+                if (i % QK8_1 == 0) {
+                    b.ds = make_half2(d, s);
+                }
+            }
+        }
+        return;
+    }
+
     float sum = 0.0f;
     for (int col = threadIdx.x; col < ncols; col += WARP_SIZE) {
         sum += xr[col]*xr[col];
@@ -919,9 +963,7 @@ static __global__ void rms_norm_mul_gate_f32(
     const float scale = rsqrtf(sum/ncols + eps);
 
     for (int col = threadIdx.x; col < ncols; col += WARP_SIZE) {
-        const float gv   = gr[col];
-        const float gate = gate_silu ? gv/(1.0f + expf(-gv)) : 1.0f/(1.0f + expf(-gv));
-        const float y    = (scale*xr[col])*w[col]*gate;
+        const float y = (scale*xr[col])*w[col]*rms_norm_mul_gate_act<gate_silu>(gr[col]);
         yr[col] = y;
         if (dst_q8_1 != nullptr) {
             quantize_q8_1_store(y, dst_q8_1, row*ncols + col);
@@ -962,9 +1004,16 @@ void ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor
             g->nb[1]/sizeof(float), g->nb[2]/sizeof(float), g->nb[3]/sizeof(float), eps,
             (block_q8_1 *) dst_q8_1, ncols_padded);
     };
+    bool vec4 = x->ne[0] % (4*WARP_SIZE) == 0;
+    for (const ggml_tensor * t : { x, w, g, (const ggml_tensor *) mul_out }) {
+        vec4 = vec4 && (uintptr_t) t->data % 16 == 0;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            vec4 = vec4 && t->nb[i] % 16 == 0;
+        }
+    }
     if (gate_silu) {
-        launch(rms_norm_mul_gate_f32<true>);
+        vec4 ? launch(rms_norm_mul_gate_f32<true, true>) : launch(rms_norm_mul_gate_f32<true, false>);
     } else {
-        launch(rms_norm_mul_gate_f32<false>);
+        vec4 ? launch(rms_norm_mul_gate_f32<false, true>) : launch(rms_norm_mul_gate_f32<false, false>);
     }
 }
