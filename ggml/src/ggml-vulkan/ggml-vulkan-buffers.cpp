@@ -225,8 +225,6 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                        vk::MemoryPropertyFlagBits::eDeviceLocal,
                                                        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-        } else if (device->bar_window && (size > device->bar_max_buffer || device->bar_used + size > device->bar_budget)) {
-            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
         } else if (device->disable_host_visible_vidmem) {
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
@@ -244,10 +242,6 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                            vk::MemoryPropertyFlagBits::eDeviceLocal});
             }
-        }
-        if (device->bar_window && (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
-            buf->bar_bytes = size;
-            device->bar_used.fetch_add(size);
         }
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Device memory allocation of size " << size << " failed." << std::endl;
