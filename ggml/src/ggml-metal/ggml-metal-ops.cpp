@@ -2869,7 +2869,9 @@ static int ggml_metal_op_hc_select(ggml_metal_op_t ctx, int idx, int n_fuse) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[1]), 3);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul),         4);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD((nth/32)*sizeof(float), 16), 0);
-        ggml_metal_encoder_dispatch_threadgroups(enc, nt, 1, 1, nth, 1, 1);
+        // few tokens: spread the output of each token over slices of 128 values (each slice repeats the sum of squares)
+        const int nsl = nt <= 8 ? std::max(1, std::min(16, (int) ((args.n + 127)/128))) : 1;
+        ggml_metal_encoder_dispatch_threadgroups(enc, nsl, nt, 1, nth, 1, 1);
     }
 
     return n_fuse;

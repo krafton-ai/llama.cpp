@@ -983,7 +983,8 @@ typedef decltype(kernel_hc_mix<float>) kernel_hc_mix_t;
 template [[host_name("kernel_hc_mix_f32")]] kernel kernel_hc_mix_t kernel_hc_mix<float>;
 template [[host_name("kernel_hc_mix_f16")]] kernel kernel_hc_mix_t kernel_hc_mix<half>;
 
-// GGML_METAL_FUSION_HC_SELECT, step 2: one threadgroup per token: y = RMS_NORM(sum_s x[:, s]*pre[s])*w with pre the first hc sigmoids
+// GGML_METAL_FUSION_HC_SELECT, step 2: y = RMS_NORM(sum_s x[:, s]*pre[s])*w with pre the first hc sigmoids. Threadgroups
+// (slice, token): every slice of a token computes the same full sum of squares (same threads, same order) and writes its part of y
 kernel void kernel_hc_pre_norm(
         constant ggml_metal_kargs_hc_select & args,
         device const char * x,
@@ -991,12 +992,14 @@ kernel void kernel_hc_pre_norm(
         device const char * w,
         device       char * y,
         threadgroup float * shmem [[threadgroup(0)]],
-        uint   tgpig[[threadgroup_position_in_grid]],
-        ushort tpitg[[thread_position_in_threadgroup]],
+        uint2  tgpig[[threadgroup_position_in_grid]],
+        uint2  ntgp [[threadgroups_per_grid]],
+        ushort tpitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
-        ushort   ntg[[threads_per_threadgroup]]) {
-    const int t   = tgpig;
+        ushort2 ntg2[[threads_per_threadgroup]]) {
+    const ushort ntg = ntg2.x;
+    const int t   = tgpig.y;
     const int n   = args.n;
     const int hc  = args.hc;
     const int nsg = ntg/32;
@@ -1028,7 +1031,9 @@ kernel void kernel_hc_pre_norm(
     }
     const float inv = 1.0f/sqrt(tot/n + args.eps1);
     device float * yt = (device float *) (y + (uint64_t) t*args.nb_y1);
-    for (int i = tpitg; i < n; i += ntg) {
+    const int chunk = (n + ntgp.x - 1)/ntgp.x;
+    const int i1 = min(n, (int) (tgpig.x + 1)*chunk);
+    for (int i = tgpig.x*chunk + tpitg; i < i1; i += ntg) {
         float h = 0.0f;
         for (int s = 0; s < hc; ++s) {
             h += *((device const float *) (xt + (uint64_t) s*args.nb_x1) + i)*p[s];
