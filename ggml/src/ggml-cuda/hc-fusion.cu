@@ -331,6 +331,60 @@ static __device__ __forceinline__ void hc_pre_rms_norm_mul_row(
     }
 }
 
+// the same for one token with one float4 per thread, kept in registers between the sum of squares and the write:
+// 4*blockDim.x >= n_padded (or >= n without q8), n % 4 == 0, 16-byte aligned x rows, w and dst. A q8_1 block of the copy
+// is 8 lanes. pre was written by this block in the same kernel: read it from L2
+static __device__ __forceinline__ void hc_pre_rms_norm_mul_row_vec4(
+        const float * x, const float * pre, const float * w, float * dst, const int n, const int hc, const float scale_pre,
+        const float eps, const int64_t sx1, const int64_t sp0, float * s_pre, float * s_sum, block_q8_1 * q8, const int n_padded) {
+    if ((int) threadIdx.x < hc) {
+        s_pre[threadIdx.x] = __ldcg(pre + threadIdx.x*sp0);
+    }
+    __syncthreads();
+
+    const int c = 4*threadIdx.x;
+    float4 h = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (c < n) {
+        for (int s = 0; s < hc; ++s) {
+            const float4 v = *(const float4 *) (x + s*sx1 + c);
+            const float  p = s_pre[s];
+            h.x = fmaf(v.x, p, h.x);
+            h.y = fmaf(v.y, p, h.y);
+            h.z = fmaf(v.z, p, h.z);
+            h.w = fmaf(v.w, p, h.w);
+        }
+        h = make_float4(h.x*scale_pre, h.y*scale_pre, h.z*scale_pre, h.w*scale_pre);
+    }
+    float ss = h.x*h.x + h.y*h.y + h.z*h.z + h.w*h.w;
+    ss = block_reduce<block_reduce_method::SUM>(ss, s_sum);
+    const float scale = rsqrtf(ss/n + eps);
+
+    float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (c < n) {
+        const float4 wv = *(const float4 *) (w + c);
+        o = make_float4(h.x*scale*wv.x, h.y*scale*wv.y, h.z*scale*wv.z, h.w*scale*wv.w);
+        *(float4 *) (dst + c) = o;
+    }
+    if (q8 == nullptr) {
+        return;
+    }
+    // all lanes take part in the reductions; the zero padding up to n_padded comes from the threads past n
+    const float amax = warp_reduce_max<QK8_1/4>(fmaxf(fmaxf(fabsf(o.x), fabsf(o.y)), fmaxf(fabsf(o.z), fabsf(o.w))));
+    const float sum  = warp_reduce_sum<QK8_1/4>(o.x + o.y + o.z + o.w);
+    if (c < n_padded) {
+        const float  d = amax / 127.0f;
+        block_q8_1 & b = q8[c / QK8_1];
+        char4 qv = make_char4(0, 0, 0, 0);
+        if (amax != 0.0f) {
+            qv = make_char4(roundf(o.x/d), roundf(o.y/d), roundf(o.z/d), roundf(o.w/d));
+        }
+        *(char4 *) (b.qs + c % QK8_1) = qv;
+        if (c % QK8_1 == 0) {
+            b.ds = make_half2(d, sum);
+        }
+    }
+}
+
 template <int block_size>
 static __global__ void hc_pre_rms_norm_mul_f32(
         const float * x, const float * pre, const float * w, float * dst,
@@ -397,12 +451,13 @@ struct hc_chain_pre_norm_params {
     int     n_padded;
 };
 
-template <typename T>
+// vec4: blockDim.x threads as hc_pre_rms_norm_mul_row_vec4 needs them, else HC_CHAIN_BLOCK
+template <typename T, bool vec4>
 static __global__ void rms_norm_mat_vec_pre_norm_f32(
         const float * x, const T * w, float * part, unsigned int * counter, const int nrows_w, const int chunk,
         const int64_t sw1, const float * bias, float * mix, float * sig, const int n_sig, const int n_in, const float eps,
         const hc_chain_pre_norm_params pn) {
-    constexpr int n_warps = HC_CHAIN_BLOCK/WARP_SIZE;
+    const int n_warps = blockDim.x/WARP_SIZE;
     const int s      = blockIdx.x;
     const int lane   = threadIdx.x % WARP_SIZE;
     const int k      = blockIdx.y*n_warps + threadIdx.x/WARP_SIZE;
@@ -455,7 +510,7 @@ static __global__ void rms_norm_mat_vec_pre_norm_f32(
         ss += __ldcg(part + i*(nrows_w + 1) + nrows_w);
     }
     const float scale = rsqrtf(ss/n_in + eps);
-    for (int r = threadIdx.x; r < nrows_w; r += HC_CHAIN_BLOCK) {
+    for (int r = threadIdx.x; r < nrows_w; r += blockDim.x) {
         float v = 0.0f;
         for (int i = 0; i < nsplit; ++i) {
             v += __ldcg(part + i*(nrows_w + 1) + r);
@@ -468,8 +523,13 @@ static __global__ void rms_norm_mat_vec_pre_norm_f32(
     }
     __syncthreads();
 
-    hc_pre_rms_norm_mul_row<HC_CHAIN_BLOCK, true>(pn.x, pn.pre, pn.w, pn.dst, pn.n, pn.hc, pn.scale_pre, pn.eps,
-            pn.sx1, 0, pn.sp0, 0, 0, 0, s_pre, s_sum, pn.q8, pn.n_padded);
+    if constexpr (vec4) {
+        hc_pre_rms_norm_mul_row_vec4(pn.x, pn.pre, pn.w, pn.dst, pn.n, pn.hc, pn.scale_pre, pn.eps, pn.sx1, pn.sp0,
+                s_pre, s_sum, pn.q8, pn.n_padded);
+    } else {
+        hc_pre_rms_norm_mul_row<HC_CHAIN_BLOCK, true>(pn.x, pn.pre, pn.w, pn.dst, pn.n, pn.hc, pn.scale_pre, pn.eps,
+                pn.sx1, 0, pn.sp0, 0, 0, 0, s_pre, s_sum, pn.q8, pn.n_padded);
+    }
 }
 
 void ggml_cuda_op_rms_norm_mat_vec_pre_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
@@ -541,16 +601,24 @@ void ggml_cuda_op_rms_norm_mat_vec_pre_norm(ggml_backend_cuda_context & ctx, con
     pn.n_padded  = (int) ncols_padded;
 
     const float eps = ggml_get_op_params_f32(rms_norm, 0);
-    const dim3 grid(nsplit, (nrows_w + 1 + HC_CHAIN_BLOCK/WARP_SIZE - 1)/(HC_CHAIN_BLOCK/WARP_SIZE));
-    const ggml_cuda_kernel_launch_params lp(grid, dim3(HC_CHAIN_BLOCK), 0, stream);
+    // the pre-norm row with one float4 per thread: blockDim.x covers n (and the q8_1 padding), in whole warps
+    const int  n_vec4  = (int) (dst_q8_1 ? ncols_padded : pn.n);
+    const int  block4  = (n_vec4/4 + WARP_SIZE - 1)/WARP_SIZE*WARP_SIZE;
+    const bool vec4    = pn.n % 4 == 0 && n_vec4 % 4 == 0 && block4 >= WARP_SIZE && block4 <= 1024 && pn.sx1 % 4 == 0 &&
+        (uintptr_t) pn.x % 16 == 0 && (uintptr_t) pn.w % 16 == 0 && (uintptr_t) pn.dst % 16 == 0;
+    const int  block   = vec4 ? block4 : HC_CHAIN_BLOCK;
+    const dim3 grid(nsplit, (nrows_w + 1 + block/WARP_SIZE - 1)/(block/WARP_SIZE));
+    const ggml_cuda_kernel_launch_params lp(grid, dim3(block), 0, stream);
+    auto launch = [&](auto kernel, const auto * wd) {
+        ggml_cuda_kernel_launch(kernel, lp, (const float *) x->data, wd, part.get(), counter, nrows_w, chunk, sw1,
+                (const float *) bias->data, (float *) add->data, (float *) sig->data, (int) sig->ne[0], n, eps, pn);
+    };
     if (w->type == GGML_TYPE_F16) {
-        ggml_cuda_kernel_launch(rms_norm_mat_vec_pre_norm_f32<half>, lp, (const float *) x->data, (const half *) w->data,
-                part.get(), counter, nrows_w, chunk, sw1, (const float *) bias->data, (float *) add->data,
-                (float *) sig->data, (int) sig->ne[0], n, eps, pn);
+        const half * wd = (const half *) w->data;
+        vec4 ? launch(rms_norm_mat_vec_pre_norm_f32<half, true>, wd) : launch(rms_norm_mat_vec_pre_norm_f32<half, false>, wd);
     } else {
-        ggml_cuda_kernel_launch(rms_norm_mat_vec_pre_norm_f32<float>, lp, (const float *) x->data, (const float *) w->data,
-                part.get(), counter, nrows_w, chunk, sw1, (const float *) bias->data, (float *) add->data,
-                (float *) sig->data, (int) sig->ne[0], n, eps, pn);
+        const float * wd = (const float *) w->data;
+        vec4 ? launch(rms_norm_mat_vec_pre_norm_f32<float, true>, wd) : launch(rms_norm_mat_vec_pre_norm_f32<float, false>, wd);
     }
 }
 
