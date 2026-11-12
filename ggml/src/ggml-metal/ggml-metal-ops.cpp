@@ -2831,13 +2831,18 @@ static int ggml_metal_op_hc_select(ggml_metal_op_t ctx, int idx, int n_fuse) {
         /*.eps1   =*/ ggml_get_op_params_f32(rn1, 0),
     };
 
-    const int nth = 256;
+    // few tokens (decode, speculative verify) give only nmix and nt threadgroups, so each one takes the largest size instead
+    const int nt = (int) ggml_nrows(mul);
+    auto get_nth = [nt](ggml_metal_pipeline_with_params pipeline) {
+        return nt <= 8 ? std::min(1024, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) : 256;
+    };
 
     ggml_metal_encoder_t enc = ctx->enc;
 
     // step 1: one threadgroup per projection row and token
     {
         auto pipeline = ggml_metal_library_get_pipeline_by_name(ctx->lib, fn->type == GGML_TYPE_F16 ? "kernel_hc_mix_f16" : "kernel_hc_mix_f32");
+        const int nth = get_nth(pipeline);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -2847,7 +2852,7 @@ static int ggml_metal_op_hc_select(ggml_metal_op_t ctx, int idx, int n_fuse) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(add),         4);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sg),          5);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(2*(nth/32)*sizeof(float), 16), 0);
-        ggml_metal_encoder_dispatch_threadgroups(enc, args.nmix, ggml_nrows(mul), 1, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, args.nmix, nt, 1, nth, 1, 1);
     }
 
     ggml_metal_op_concurrency_reset(ctx);
@@ -2855,6 +2860,7 @@ static int ggml_metal_op_hc_select(ggml_metal_op_t ctx, int idx, int n_fuse) {
     // step 2: one threadgroup per token
     {
         auto pipeline = ggml_metal_library_get_pipeline_by_name(ctx->lib, "kernel_hc_pre_norm");
+        const int nth = get_nth(pipeline);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -2863,7 +2869,7 @@ static int ggml_metal_op_hc_select(ggml_metal_op_t ctx, int idx, int n_fuse) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[1]), 3);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul),         4);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD((nth/32)*sizeof(float), 16), 0);
-        ggml_metal_encoder_dispatch_threadgroups(enc, ggml_nrows(mul), 1, 1, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, nt, 1, 1, nth, 1, 1);
     }
 
     return n_fuse;
