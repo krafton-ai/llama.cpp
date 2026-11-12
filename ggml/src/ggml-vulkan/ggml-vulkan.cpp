@@ -2613,6 +2613,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // f16 output, for a multiply fused with the copy of its result to f16 (fused_mul_mat_cpy_f16)
             sg_create({GGML_TYPE_F16, GGML_TYPE_F32, false, true, true},  tc_mm, "matmul_f16_f32_d16_f16acc", SPV_DOT2_F16ACC(matmul_f16_f32_d16), sizeof(vk_mat_mat_push_constants), 3);
             sg_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false, true}, tc_mm, "matmul_f16_f32_d16",        SPV_DOT2(matmul_f16_f32_d16),        sizeof(vk_mat_mat_push_constants), 3);
+            sg_create({GGML_TYPE_F16, GGML_TYPE_F16, false, true, true},  tc_mm, "matmul_f16_d16_f16acc",     SPV_DOT2_F16ACC(matmul_f16_d16),     sizeof(vk_mat_mat_push_constants), 3);
+            sg_create({GGML_TYPE_F16, GGML_TYPE_F16, false, false, true}, tc_mm, "matmul_f16_d16",            SPV_DOT2(matmul_f16_d16),            sizeof(vk_mat_mat_push_constants), 3);
             // BF16 - no dot2
             sg_create({GGML_TYPE_BF16, GGML_TYPE_BF16, false, false}, tc_mm, "matmul_bf16", matmul_bf16_len, matmul_bf16_data, sizeof(vk_mat_mat_push_constants), 3);
 
@@ -3204,6 +3206,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         sizeof(vk_op_mla_expand_kv_push_constants), {1, 1, 1}, { 0 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_mla_expand_kv[1], "mla_expand_kv_rope_f16", mla_expand_kv_f16_len, mla_expand_kv_f16_data, "main", 3,
         sizeof(vk_op_mla_expand_kv_push_constants), {256, 1, 1}, { 1 }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_mla_expand_kv[2], "mla_expand_kv_wk_f16", mla_expand_kv_f16_len, mla_expand_kv_f16_data, "main", 3,
+        sizeof(vk_op_mla_expand_kv_push_constants), {256, 1, 1}, { 2 }, 1, true);
     // 2 keys x HG heads per invocation in the score phase instead of 1 key x 2*HG heads: fewer shared memory reads per
     // fma on GPUs with many cores
     const uint32_t mla_kg = device->shader_core_count >= 60 ? 2 : 1;
@@ -8309,10 +8313,24 @@ static void ggml_vk_mla_expand_kv(ggml_backend_vk_context * ctx, vk_context& sub
     // the weights of the group in F16: K part then V part
     const uint64_t nwk = (uint64_t) nn*rank*g, nwv = (uint64_t) rank*nv*g;
     const bool deq = k_b->type != GGML_TYPE_F16 || v_b->type != GGML_TYPE_F16;
+
+    // with an f16-output matmul pipeline, K and V are two multiplies of the standard matmul: K = [W_UK | I] (built in
+    // prealloc_x, the identity rows copy the RoPE part) times the whole latent row, V = W_UV^T times its first rank values
+    const std::vector<vk_matmul_pipeline_pair> * mmp =
+        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_F16, GGML_TYPE_F16, GGML_PREC_F32, false, true);
+    const uint64_t A = std::max<uint64_t>(ctx->device->properties.limits.minStorageBufferOffsetAlignment, 16);
+    const uint32_t k2 = rank + nr;
+    const uint32_t ldk_kv = (uint32_t) (kv->nb[1]/sizeof(ggml_fp16_t));
+    const bool use_mm = mmp != nullptr && (uint32_t) kv->ne[0] == k2 && ldk_kv % 8 == 0 &&
+        ggml_vk_tensor_buffer_offset(ctx, kv) % A == 0 && ggml_vk_tensor_buffer_offset(ctx, dst) % A == 0 &&
+        (deq || (ggml_vk_tensor_buffer_offset(ctx, v_b) + (uint64_t) h0*rank*nv*sizeof(ggml_fp16_t)) % A == 0);
+    const uint64_t kw_off = deq ? ggml_vk_align_size((nwk + nwv) * sizeof(ggml_fp16_t), A) : 0;
+    const uint64_t kw_n   = (uint64_t) g*nk*k2;
+
     vk_subbuffer wk_buf, wv_buf;
     uint32_t wk_off = 0, wv_off = 0;
-    if (deq) {
-        const uint64_t x_sz = (nwk + nwv) * sizeof(ggml_fp16_t);
+    if (deq || use_mm) {
+        const uint64_t x_sz = use_mm ? kw_off + kw_n * sizeof(ggml_fp16_t) : (nwk + nwv) * sizeof(ggml_fp16_t);
         if (ctx->prealloc_size_x < x_sz) {
             ctx->prealloc_size_x = x_sz;
             ggml_vk_preallocate_buffers(ctx, subctx);
@@ -8320,6 +8338,8 @@ static void ggml_vk_mla_expand_kv(ggml_backend_vk_context * ctx, vk_context& sub
         if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
+    }
+    if (deq) {
         auto dequant = [&](const ggml_tensor * w, uint64_t n_per_head, uint64_t dst_off) {
             const uint64_t blk = ggml_blck_size(w->type);
             const uint64_t off = h0*n_per_head, n = n_per_head*g;
@@ -8345,6 +8365,45 @@ static void ggml_vk_mla_expand_kv(ggml_backend_vk_context * ctx, vk_context& sub
         wv_buf = ggml_vk_tensor_subbuffer(ctx, v_b, true);
         wk_off = get_misalign_bytes(ctx, k_b)/sizeof(ggml_fp16_t) + h0*nn*rank;
         wv_off = get_misalign_bytes(ctx, v_b)/sizeof(ggml_fp16_t) + h0*rank*nv;
+    }
+
+    if (use_mm) {
+        const vk_subbuffer kv_sb = ggml_vk_tensor_subbuffer(ctx, kv);
+        const vk_subbuffer d_sb  = ggml_vk_tensor_subbuffer(ctx, dst);
+        const vk_subbuffer kw_sb = { ctx->prealloc_x, kw_off, kw_n * sizeof(ggml_fp16_t) };
+
+        // [W_UK | I] of the group
+        vk_pipeline pw = ctx->device->pipeline_mla_expand_kv[2];
+        ggml_pipeline_request_descriptor_sets(ctx, pw, 1);
+        const vk_op_mla_expand_kv_push_constants pc = { 0, (uint32_t) kw_n, rank, 0, 1, nn, nn*rank, 0, 0, wk_off, 0, 0, g, nr, nn, nk };
+        const uint32_t wgx = std::min(CEIL_DIV((uint32_t) kw_n, 256u), 65535u);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pw, { wk_buf, kv_sb, kw_sb }, pc, { wgx*256, CEIL_DIV(CEIL_DIV((uint32_t) kw_n, 256u), wgx), 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        auto pick = [&](uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a) -> vk_pipeline {
+            const uint32_t align = ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp, m, n, false);
+            const bool aligned = k == ggml_vk_align_size(k, align) && stride_a % 8 == 0 && m > 8 && n > 8;
+            return ggml_vk_guess_matmul_pipeline_map(ctx, *mmp, m, n, aligned, false);
+        };
+        // K [nk, g, n_kv]
+        const uint32_t mk = g*nk;
+        vk_pipeline p_k = pick(mk, n_kv, k2, k2);
+        ggml_vk_matmul(ctx, subctx, p_k, vk_subbuffer{ kw_sb }, vk_subbuffer{ kv_sb },
+            vk_subbuffer{ d_sb.buffer, d_sb.offset, (uint64_t) mk*n_kv*sizeof(ggml_fp16_t) }, vk_subbuffer{ nullptr, 0, 0 },
+            mk, n_kv, k2, k2, ldk_kv, mk, mk*k2, ldk_kv*n_kv, mk*n_kv, 1, 1, 1, 1, 1, 1, n_kv,
+            (uint64_t) ldk_kv*sizeof(ggml_fp16_t), (uint64_t) mk*sizeof(ggml_fp16_t));
+        // V [nv, g, n_kv] after K
+        const uint32_t mv = g*nv;
+        const vk_subbuffer wv_sb = deq ? vk_subbuffer{ ctx->prealloc_x, nwk*sizeof(ggml_fp16_t), nwv*sizeof(ggml_fp16_t) }
+            : vk_subbuffer{ wv_buf.buffer, ggml_vk_tensor_buffer_offset(ctx, v_b) + (uint64_t) h0*rank*nv*sizeof(ggml_fp16_t), nwv*sizeof(ggml_fp16_t) };
+        vk_pipeline p_v = pick(mv, n_kv, rank, rank);
+        ggml_vk_matmul(ctx, subctx, p_v, vk_subbuffer{ wv_sb }, vk_subbuffer{ kv_sb },
+            vk_subbuffer{ d_sb.buffer, d_sb.offset + (uint64_t) mk*n_kv*sizeof(ggml_fp16_t), (uint64_t) mv*n_kv*sizeof(ggml_fp16_t) },
+            vk_subbuffer{ nullptr, 0, 0 },
+            mv, n_kv, rank, rank, ldk_kv, mv, mv*rank, ldk_kv*n_kv, mv*n_kv, 1, 1, 1, 1, 1, 1, n_kv,
+            (uint64_t) ldk_kv*sizeof(ggml_fp16_t), (uint64_t) mv*sizeof(ggml_fp16_t));
+        ctx->prealloc_x_need_sync = true;
+        return;
     }
 
     const vk_subbuffer kv_buf = ggml_vk_tensor_subbuffer(ctx, kv, true);
