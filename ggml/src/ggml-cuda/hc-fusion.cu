@@ -333,25 +333,24 @@ static __device__ __forceinline__ void hc_pre_rms_norm_mul_row(
 
 // the same for one token with one float4 per thread, kept in registers between the sum of squares and the write:
 // 4*blockDim.x >= n_padded (or >= n without q8), n % 4 == 0, 16-byte aligned x rows, w and dst. A q8_1 block of the copy
-// is 8 lanes. pre was written by this block in the same kernel: read it from L2
-static __device__ __forceinline__ void hc_pre_rms_norm_mul_row_vec4(
-        const float * x, const float * pre, const float * w, float * dst, const int n, const int hc, const float scale_pre,
-        const float eps, const int64_t sx1, const int64_t sp0, float * s_pre, float * s_sum, block_q8_1 * q8, const int n_padded) {
-    if ((int) threadIdx.x < hc) {
-        s_pre[threadIdx.x] = __ldcg(pre + threadIdx.x*sp0);
-    }
-    __syncthreads();
-
+// is 8 lanes. xv: the hc stream values of this thread's 4 inputs, wv: its 4 norm weights (both loaded if 4*threadIdx.x < n),
+// s_pre: the hc pre weights in shared memory
+static __device__ __forceinline__ void hc_pre_rms_norm_mul_row_vec4_regs(
+        const float4 * xv, const float4 wv, const float * s_pre, float * dst, const int n, const int hc,
+        const float scale_pre, const float eps, float * s_sum, block_q8_1 * q8, const int n_padded) {
     const int c = 4*threadIdx.x;
     float4 h = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (c < n) {
-        for (int s = 0; s < hc; ++s) {
-            const float4 v = *(const float4 *) (x + s*sx1 + c);
-            const float  p = s_pre[s];
-            h.x = fmaf(v.x, p, h.x);
-            h.y = fmaf(v.y, p, h.y);
-            h.z = fmaf(v.z, p, h.z);
-            h.w = fmaf(v.w, p, h.w);
+#pragma unroll
+        for (int s = 0; s < HC_MAX; ++s) {
+            if (s < hc) {
+                const float4 v = xv[s];
+                const float  p = s_pre[s];
+                h.x = fmaf(v.x, p, h.x);
+                h.y = fmaf(v.y, p, h.y);
+                h.z = fmaf(v.z, p, h.z);
+                h.w = fmaf(v.w, p, h.w);
+            }
         }
         h = make_float4(h.x*scale_pre, h.y*scale_pre, h.z*scale_pre, h.w*scale_pre);
     }
@@ -361,7 +360,6 @@ static __device__ __forceinline__ void hc_pre_rms_norm_mul_row_vec4(
 
     float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (c < n) {
-        const float4 wv = *(const float4 *) (w + c);
         o = make_float4(h.x*scale*wv.x, h.y*scale*wv.y, h.z*scale*wv.z, h.w*scale*wv.w);
         *(float4 *) (dst + c) = o;
     }
@@ -382,6 +380,21 @@ static __device__ __forceinline__ void hc_pre_rms_norm_mul_row_vec4(
         if (c % QK8_1 == 0) {
             b.ds = make_half2(d, sum);
         }
+    }
+}
+
+// loads of the row inputs of hc_pre_rms_norm_mul_row_vec4_regs
+static __device__ __forceinline__ void hc_pre_rms_norm_mul_row_vec4_load(
+        const float * x, const float * w, const int n, const int hc, const int64_t sx1, float4 * xv, float4 & wv) {
+    const int c = 4*threadIdx.x;
+    if (c < n) {
+#pragma unroll
+        for (int s = 0; s < HC_MAX; ++s) {
+            if (s < hc) {
+                xv[s] = *(const float4 *) (x + s*sx1 + c);
+            }
+        }
+        wv = *(const float4 *) (w + c);
     }
 }
 
@@ -449,6 +462,7 @@ struct hc_chain_pre_norm_params {
     int64_t sp0;
     block_q8_1 * q8;        // q8_1 copy of dst or nullptr
     int     n_padded;
+    int     pre_off;        // pre[s*sp0] is sig[pre_off + s*sp0], or -1 when pre is not inside sig
 };
 
 // vec4: blockDim.x threads as hc_pre_rms_norm_mul_row_vec4 needs them, else HC_CHAIN_BLOCK
@@ -505,6 +519,14 @@ static __global__ void rms_norm_mat_vec_pre_norm_f32(
         *counter = 0;
     }
 
+    // vec4: the row inputs do not depend on this kernel, their loads overlap the reduction below
+    float4 xv[HC_MAX];
+    float4 wv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if constexpr (vec4) {
+        hc_pre_rms_norm_mul_row_vec4_load(pn.x, pn.w, pn.n, pn.hc, pn.sx1, xv, wv);
+    }
+    GGML_UNUSED(xv);
+
     float ss = 0.0f;
     for (int i = 0; i < nsplit; ++i) {
         ss += __ldcg(part + i*(nrows_w + 1) + nrows_w);
@@ -518,14 +540,26 @@ static __global__ void rms_norm_mat_vec_pre_norm_f32(
         const float y = v*scale + bias[r];
         mix[r] = y;
         if (r < n_sig) {
-            sig[r] = hc_sigmoid(y);
+            const float g = hc_sigmoid(y);
+            sig[r] = g;
+            // vec4: the pre weights go to the row from here instead of being read back from sig
+            const int q = r - pn.pre_off;
+            if (vec4 && pn.pre_off >= 0 && q >= 0 && q % (int) pn.sp0 == 0 && q / (int) pn.sp0 < pn.hc) {
+                s_pre[q / (int) pn.sp0] = g;
+            }
         }
     }
     __syncthreads();
 
     if constexpr (vec4) {
-        hc_pre_rms_norm_mul_row_vec4(pn.x, pn.pre, pn.w, pn.dst, pn.n, pn.hc, pn.scale_pre, pn.eps, pn.sx1, pn.sp0,
-                s_pre, s_sum, pn.q8, pn.n_padded);
+        if (pn.pre_off < 0) {
+            if ((int) threadIdx.x < pn.hc) {
+                s_pre[threadIdx.x] = __ldcg(pn.pre + threadIdx.x*pn.sp0);
+            }
+            __syncthreads();
+        }
+        hc_pre_rms_norm_mul_row_vec4_regs(xv, wv, s_pre, pn.dst, pn.n, pn.hc, pn.scale_pre, pn.eps, s_sum, pn.q8,
+                pn.n_padded);
     } else {
         hc_pre_rms_norm_mul_row<HC_CHAIN_BLOCK, true>(pn.x, pn.pre, pn.w, pn.dst, pn.n, pn.hc, pn.scale_pre, pn.eps,
                 pn.sx1, 0, pn.sp0, 0, 0, 0, s_pre, s_sum, pn.q8, pn.n_padded);
@@ -599,6 +633,15 @@ void ggml_cuda_op_rms_norm_mat_vec_pre_norm(ggml_backend_cuda_context & ctx, con
     pn.sp0       = pre->nb[0]/sizeof(float);
     pn.q8        = (block_q8_1 *) dst_q8_1;
     pn.n_padded  = (int) ncols_padded;
+    pn.pre_off   = -1;
+    {
+        // pre is a view of sig with a positive element stride: its weights come from the reducing threads
+        const int64_t off = (const float *) pre->data - (const float *) sig->data;
+        if (pre->data >= sig->data && (const char *) pre->data - (const char *) sig->data == off*(int64_t) sizeof(float) &&
+                pn.sp0 > 0 && off + (pn.hc - 1)*pn.sp0 < sig->ne[0]) {
+            pn.pre_off = (int) off;
+        }
+    }
 
     const float eps = ggml_get_op_params_f32(rms_norm, 0);
     // the pre-norm row with one float4 per thread: blockDim.x covers n (and the q8_1 padding), in whole warps
