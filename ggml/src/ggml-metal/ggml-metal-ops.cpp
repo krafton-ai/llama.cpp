@@ -4375,8 +4375,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             const int64_t ntg  = ((ne01 + nqptg - 1)/nqptg)*ne02*ne03;
             const int64_t nblk = (ne11 + ncpsg - 1)/ncpsg;
             if (ne01 <= (ne02 == 1 ? 256 : 32)) {
-                // double the workgroups while there are enough KV blocks per workgroup and the GPU is not yet filled
-                while (nwg < 32 && ntg*nwg*2 <= 128 && nblk >= 4*nwg*2) {
+                // double the workgroups while each keeps at least one KV block and the GPU is not yet filled (a short cache,
+                // e.g. a 1K-token MLA decode, has few blocks: one per workgroup still pays off there)
+                while (nwg < 32 && ntg*nwg*2 <= 256 && nblk >= nwg*2) {
                     nwg *= 2;
                 }
             } else if (ne02 != 1 && ne01 <= 512) {
