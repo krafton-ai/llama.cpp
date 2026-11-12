@@ -1473,6 +1473,18 @@ struct ggml_backend_cuda_context {
     // zero between launches: the kernel that uses it sets it back to zero
     unsigned int * block_counters[GGML_CUDA_MAX_STREAMS] = {};
 
+    // q8_1 copies of one-row F32 tensors written by fused producers, kept for the later quantized mat-vecs of the same
+    // graph evaluation that read the tensor. They live in a fixed device arena (outside the pool, whose blocks must be
+    // freed in reverse order), filled from the start in every evaluation, so a captured graph sees the same addresses
+    struct q8_1_copy {
+        const ggml_tensor * src = nullptr;
+        const void *        ptr = nullptr;
+    };
+    std::vector<q8_1_copy> q8_1_copies;
+    char * q8_1_arena      = nullptr;
+    size_t q8_1_arena_size = 0;
+    size_t q8_1_arena_used = 0;
+
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH

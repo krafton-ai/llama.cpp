@@ -746,6 +746,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (q8_1_arena != nullptr) {
+        CUDA_CHECK(cudaFree(q8_1_arena));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4632,6 +4635,38 @@ static bool ggml_cuda_nodes_on_one_stream(ggml_backend_cuda_context * cuda_ctx, 
     return true;
 }
 
+// a computed MUL_MAT that the graph runs as mul_mat_vec_q on one row
+static bool ggml_cuda_mm_is_one_row_mmvq(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * mm) {
+    if ((mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const ggml_tensor * src0 = mm->src[0];
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    return ggml_is_quantized(src0->type) && ggml_cuda_should_use_mmvq(src0->type, cc, 1) && !bad_padding_clear &&
+        !ggml_cuda_op_mul_mat_use_fwht(mm) && mm->type == GGML_TYPE_F32 && src0->nb[0] == ggml_type_size(src0->type) &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_nrows(mm) == 1;
+}
+
+// the products at nodes j .. j + n_mm - 1 belong to the fusions that start at a product: bias or scale (ADD, ADD_ID,
+// MUL) and the GLU of two products
+static bool ggml_cuda_mm_leave_to_fusion(const ggml_cgraph * cgraph, int j, int n_mm) {
+    const int next = j + n_mm;
+    if (next >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * node = cgraph->nodes[next];
+    int n_read = 0;
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        for (int k = j; k < next; ++k) {
+            n_read += node->src[s] != nullptr && node->src[s] == cgraph->nodes[k];
+        }
+    }
+    return (n_read > 0 && (node->op == GGML_OP_ADD || node->op == GGML_OP_ADD_ID || node->op == GGML_OP_MUL)) ||
+        (n_read > 1 && node->op == GGML_OP_GLU);
+}
+
 // MUL_MAT(quantized, src1) at nodes j, j + 1, ... (consecutive, at most 8) for one row src1, which the graph computes
 // as mul_mat_vec_q: the fused producer of src1 (nodes i .. j - 1) can also write src1 quantized to q8_1, and these
 // products skip their own quantization of src1. Returns their number, 0 if none
@@ -4641,44 +4676,17 @@ static int ggml_cuda_match_mat_vec_q_after(ggml_backend_cuda_context * cuda_ctx,
         return 0;
     }
 
-    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
     constexpr int max_mm = 8;
     int n_mm = 0;
     for (int k = j; k < cgraph->n_nodes && n_mm < max_mm; ++k) {
         const ggml_tensor * mm = cgraph->nodes[k];
-        if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != src1 || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            break;
-        }
-        // the choice of ggml_cuda_mul_mat for this node is mul_mat_vec_q
-        const ggml_tensor * src0 = mm->src[0];
-        const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-            ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-        if (!ggml_is_quantized(src0->type) || !ggml_cuda_should_use_mmvq(src0->type, cc, 1) || bad_padding_clear ||
-                ggml_cuda_op_mul_mat_use_fwht(mm) || mm->type != GGML_TYPE_F32 || src0->nb[0] != ggml_type_size(src0->type) ||
-                src0->ne[2] != 1 || src0->ne[3] != 1 || ggml_nrows(mm) != 1) {
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != src1 || !ggml_cuda_mm_is_one_row_mmvq(cuda_ctx, mm)) {
             break;
         }
         n_mm++;
     }
-    if (n_mm == 0) {
+    if (n_mm == 0 || ggml_cuda_mm_leave_to_fusion(cgraph, j, n_mm)) {
         return 0;
-    }
-
-    // leave the products to the fusions that start at a product: bias or scale (ADD, ADD_ID, MUL) and the GLU of two
-    // products
-    const int next = j + n_mm;
-    if (next < cgraph->n_nodes) {
-        const ggml_tensor * node = cgraph->nodes[next];
-        int n_read = 0;
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            for (int k = j; k < next; ++k) {
-                n_read += node->src[s] != nullptr && node->src[s] == cgraph->nodes[k];
-            }
-        }
-        if ((n_read > 0 && (node->op == GGML_OP_ADD || node->op == GGML_OP_ADD_ID || node->op == GGML_OP_MUL)) ||
-                (n_read > 1 && node->op == GGML_OP_GLU)) {
-            return 0;
-        }
     }
 
     // the products run after the producer, in graph order: only their own sources need to be checked
@@ -4708,11 +4716,75 @@ struct ggml_cuda_q8_1_row {
 
 // runs the products matched by ggml_cuda_match_mat_vec_q_after with src1 from its q8_1 copy
 static void ggml_cuda_mul_mat_vec_q_after(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int j, int n_mm,
-        const ggml_cuda_q8_1_row & q8_1) {
+        const void * q8_1) {
     for (int k = j; k < j + n_mm; ++k) {
         ggml_tensor * mm = cgraph->nodes[k];
-        ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, nullptr, q8_1.buf.ptr);
+        ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, nullptr, q8_1);
     }
+}
+
+static void ggml_cuda_mul_mat_vec_q_after(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int j, int n_mm,
+        const ggml_cuda_q8_1_row & q8_1) {
+    ggml_cuda_mul_mat_vec_q_after(cuda_ctx, cgraph, j, n_mm, (const void *) q8_1.buf.ptr);
+}
+
+// mat-vec weight types whose q8_1 dot product reads only the scale of a q8_1 block, not its sum: for them a q8_1 copy
+// is the same whatever order its producer summed the block in
+static bool ggml_cuda_q8_1_sum_unused(const ggml_type type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0;
+}
+
+// the q8_1 copy of src1 (one row) for the products right behind a fused producer: when a later quantized mat-vec of
+// this graph also reads src1 (as the MLA kv and gate projections of the mHC pre-norm output), the copy goes to the
+// arena and is kept for it; otherwise (and when the arena is full) it comes from the pool. Returns the copy
+static void * ggml_cuda_q8_1_row_or_kept(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int j,
+        const ggml_tensor * src1, ggml_cuda_q8_1_row & q8_1) {
+    if (q8_1.buf.ptr == nullptr || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return q8_1.buf.ptr;
+    }
+    bool later = false;
+    for (int k = j; k < cgraph->n_nodes && !later; ++k) {
+        const ggml_tensor * mm = cgraph->nodes[k];
+        later = mm->op == GGML_OP_MUL_MAT && mm->src[1] == src1 && ggml_cuda_q8_1_sum_unused(mm->src[0]->type) &&
+            ggml_cuda_mm_is_one_row_mmvq(cuda_ctx, mm);
+    }
+    if (!later) {
+        return q8_1.buf.ptr;
+    }
+    const size_t size = GGML_PAD(q8_1.ncols_padded/QK8_1*sizeof(block_q8_1), 256);
+    if (cuda_ctx->q8_1_arena == nullptr) {
+        // created outside of stream capture only: the first evaluations of a graph run eagerly
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx->stream(), &capture));
+        if (capture != cudaStreamCaptureStatusNone) {
+            return q8_1.buf.ptr;
+        }
+        cuda_ctx->q8_1_arena_size = 1024*1024;
+        CUDA_CHECK(cudaMalloc(&cuda_ctx->q8_1_arena, cuda_ctx->q8_1_arena_size));
+    }
+    if (cuda_ctx->q8_1_arena_used + size > cuda_ctx->q8_1_arena_size) {
+        return q8_1.buf.ptr;
+    }
+    void * ptr = cuda_ctx->q8_1_arena + cuda_ctx->q8_1_arena_used;
+    cuda_ctx->q8_1_arena_used += size;
+    cuda_ctx->q8_1_copies.push_back({ src1, ptr });
+    return ptr;
+}
+
+// a quantized one-row mat-vec whose src1 has a kept q8_1 copy: runs from the copy. Returns whether it ran
+static bool ggml_cuda_mul_mat_vec_q_kept(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * mm = cgraph->nodes[i];
+    for (const auto & c : cuda_ctx->q8_1_copies) {
+        if (c.src == mm->src[1]) {
+            if (!ggml_cuda_q8_1_sum_unused(mm->src[0]->type) || !ggml_cuda_mm_is_one_row_mmvq(cuda_ctx, mm) ||
+                    ggml_cuda_mm_leave_to_fusion(cgraph, i, 1)) {
+                return false;
+            }
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, nullptr, c.ptr);
+            return true;
+        }
+    }
+    return false;
 }
 
 // RMS_NORM -> MUL(w) -> MUL_MAT(quantized, ·) x n_mm for one row: the norm writes its output also quantized to q8_1.
@@ -4729,8 +4801,11 @@ static int ggml_cuda_match_rms_norm_mul_mat_vec_q(ggml_backend_cuda_context * cu
             !ggml_is_contiguous(mul) || ggml_nelements(mul) != x->ne[0]) {
         return 0;
     }
+    // the kernel reads x[c] before it writes the output at c from the same thread, so x may be the output itself
+    // (an in-place allocation of the norm and the product)
     const int outputs[] = { i + 1 };
-    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 1)) {
+    if (!(mul->data == x->data && mul->buffer == x->buffer && w->data != mul->data) &&
+            !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 1)) {
         return 0;
     }
     return ggml_cuda_match_mat_vec_q_after(cuda_ctx, cgraph, i, i + 2, mul);
@@ -4745,6 +4820,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT && !cuda_ctx->q8_1_copies.empty() && ggml_cuda_mul_mat_vec_q_kept(cuda_ctx, cgraph, i)) {
+        return -1;
+    }
 
     // hyper-connection (mHC) subgraphs
     {
@@ -4763,9 +4842,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_hc_io_ok({ add, sig }, { mul })) {
                 // one token: the following one-row quantized MUL_MATs read the q8_1 copy of the normed input
                 const int n_mm = ggml_cuda_match_mat_vec_q_after(cuda_ctx, cgraph, i, i + m.n_nodes, mul);
-                const ggml_cuda_q8_1_row q8_1(cuda_ctx, n_mm, mul->ne[0]);
-                ggml_cuda_op_rms_norm_mat_vec_pre_norm(*cuda_ctx, node, mm, add, sig, pre, rn, mul, q8_1.buf.ptr, q8_1.ncols_padded);
-                ggml_cuda_mul_mat_vec_q_after(cuda_ctx, cgraph, i + m.n_nodes, n_mm, q8_1);
+                ggml_cuda_q8_1_row q8_1(cuda_ctx, n_mm, mul->ne[0]);
+                void * q8 = ggml_cuda_q8_1_row_or_kept(cuda_ctx, cgraph, i + m.n_nodes + n_mm, mul, q8_1);
+                ggml_cuda_op_rms_norm_mat_vec_pre_norm(*cuda_ctx, node, mm, add, sig, pre, rn, mul, q8, q8_1.ncols_padded);
+                ggml_cuda_mul_mat_vec_q_after(cuda_ctx, cgraph, i + m.n_nodes, n_mm, q8);
                 return m.n_nodes - 1 + n_mm;
             }
         }
@@ -5694,7 +5774,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        // one F32 row read by quantized mat-vecs (the MLA output gate): the product is also written quantized to q8_1
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        const int n_mm = mul->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 ?
+            ggml_cuda_match_mat_vec_q_after(cuda_ctx, cgraph, i, i + 2, mul) : 0;
+        if (n_mm > 0) {
+            const ggml_cuda_q8_1_row q8_1(cuda_ctx, n_mm, mul->ne[0]);
+            ggml_cuda_op_unary_mul(*cuda_ctx, node, mul, q8_1.buf.ptr, q8_1.ncols_padded);
+            ggml_cuda_mul_mat_vec_q_after(cuda_ctx, cgraph, i + 2, n_mm, q8_1);
+            return n_mm + 1;
+        }
+        ggml_cuda_op_unary_mul(*cuda_ctx, node, mul);
         return 1;
     }
 
@@ -5718,6 +5808,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+
+    // kept q8_1 copies live for one evaluation of this graph
+    struct q8_1_copies_scope {
+        ggml_backend_cuda_context * ctx;
+        explicit q8_1_copies_scope(ggml_backend_cuda_context * ctx) : ctx(ctx) { ctx->q8_1_copies.clear(); ctx->q8_1_arena_used = 0; }
+        ~q8_1_copies_scope() { ctx->q8_1_copies.clear(); ctx->q8_1_arena_used = 0; }
+    } q8_1_scope(cuda_ctx);
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
