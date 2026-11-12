@@ -13020,6 +13020,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 259840, 1, 1536, { 1, 1 }, { 1, 1 }));
     }
 
+    // Single-column Q5_K GEMV with row counts around multiples of the rows per subgroup and per workgroup.
+    for (int64_t m : {31, 32, 33, 63, 64, 65, 67}) {
+        for (int64_t k : {256, 512, 1536}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, m, 1, k, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
