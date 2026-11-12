@@ -14110,6 +14110,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 16, {1, 1},  4100, 1024, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128,  4, {1, 1},  1024,  256, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128,  2, {1, 1}, 16500,  257, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+    // the last ubatch of a long prompt in the absorbed MLA form: one latent head for 32 query heads, more rows than a decode
+    for (int nb : { 9, 255 }) {
+        for (int kv : { 4100, 16500 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {32, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+        }
+    }
 
     // Sparse mask hint: supported decode/prefill layouts and dense fallbacks.
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));

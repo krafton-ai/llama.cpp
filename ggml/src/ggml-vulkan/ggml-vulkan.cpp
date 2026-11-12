@@ -225,6 +225,14 @@ uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const ggml_tensor * v = node->src[2];
         return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
     }
+    if (node->op == GGML_OP_MLA_EXPAND_KV) {
+        // per head of the group: K = W_UK latent and V = W_UV^T latent over all cells
+        const ggml_tensor * kv  = node->src[0];
+        const ggml_tensor * k_b = node->src[1];
+        const ggml_tensor * v_b = node->src[2];
+        const uint64_t g = (uint64_t) ggml_get_op_params_i32(node, 1);
+        return 2ull * kv->ne[1] * g * (k_b->ne[0] + v_b->ne[1]) * k_b->ne[1];
+    }
     return 0;
 }
 void ggml_vk_print_node_list(const ggml_cgraph * cgraph, int start, int end) {
@@ -8541,9 +8549,12 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
     const uint32_t DK = (uint32_t) q->ne[0];
     const uint32_t DV = (uint32_t) v->ne[0];
 
-    if (N < 256 || sinks || max_bias != 0.0f || logit_softcap != 0.0f || n_kv_max != 0 ||
+    // one K/V head shared by all query heads (MLA in the absorbed form): the multiplies broadcast it over the heads, and
+    // above the MLA decode kernel's 8 rows this is much faster than the scalar flash attention
+    const bool shared = H > 1 && k->ne[2] == 1 && v->ne[2] == 1;
+    if (N < (shared ? 9u : 256u) || sinks || max_bias != 0.0f || logit_softcap != 0.0f || n_kv_max != 0 ||
         q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
-        DK > 576 || DV > 512 || KV == 0 || k->ne[2] != H || v->ne[2] != H || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+        DK > 576 || DV > 512 || KV == 0 || (!shared && (k->ne[2] != H || v->ne[2] != H)) || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
         dst->ne[0] != DV || dst->ne[1] != H || dst->ne[2] != N ||
         (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < KV || mask->ne[1] < N || mask->ne[2] != 1 || mask->ne[3] != 1))) {
         return false;
@@ -8569,7 +8580,7 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
         }
         return s;
     };
-    const uint32_t h_step = std::max({ step(k->nb[2]), step(q->nb[2]), step(dst->nb[1]) });
+    const uint32_t h_step = std::max({ shared ? 1u : step(k->nb[2]), step(q->nb[2]), step(dst->nb[1]) });
     const uint32_t r_step = std::max({ step(q->nb[1]), step(dst->nb[2]), mask ? step(mask->nb[1]) : 1u });
 
     // the f32 scores of one chunk and the transposed V of its heads stay within this bound
@@ -8581,7 +8592,7 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
     }
     uint32_t hc = H;
     uint32_t rc = N;
-    if (s_head * H > bound || vt_head * H > bound) {
+    if (s_head * H > bound || vt_head * (shared ? 1 : H) > bound) {
         hc = (uint32_t) std::min<uint64_t>(bound / s_head, bound / vt_head);
         if (hc == 0) {
             hc = 1;
@@ -8612,7 +8623,7 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
     const uint32_t n_hchunks = CEIL_DIV(H, hc);
     const uint32_t n_rchunks = CEIL_DIV(N, rc);
     const uint64_t s_size  = (uint64_t) hc * rc * KV * sizeof(float);
-    const uint64_t vt_size = (uint64_t) hc * KV * DV * sizeof(ggml_fp16_t);
+    const uint64_t vt_size = (uint64_t) (shared ? 1 : hc) * KV * DV * sizeof(ggml_fp16_t);
 
     // softmax rows above 16384 columns of only a few rows: the three pass softmax with its partial max/sum in prealloc_y
     // (one workgroup per row keeps the device busy once there are many rows)
@@ -8685,22 +8696,23 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
     for (uint32_t h0 = 0; h0 < H; h0 += hc) {
         const uint32_t nh = std::min(hc, H - h0);
 
-        // V^T of these heads: [KV, DV, nh] f16, contiguous
-        {
-            const uint64_t off  = v_off + (uint64_t) h0 * v->nb[2];
+        // V^T of these heads: [KV, DV, nh] f16, contiguous (a shared V head once)
+        if (!shared || h0 == 0) {
+            const uint32_t nvh  = shared ? 1 : nh;
+            const uint64_t off  = v_off + (shared ? 0 : (uint64_t) h0 * v->nb[2]);
             const uint64_t desc = ggml_vk_descriptor_offset(off, min_align, sizeof(ggml_fp16_t));
             vk_op_unary_push_constants pc{};
-            pc.ne   = KV * DV * nh;
-            pc.ne00 = KV; pc.ne01 = DV; pc.ne02 = nh; pc.ne03 = 1;
+            pc.ne   = KV * DV * nvh;
+            pc.ne00 = KV; pc.ne01 = DV; pc.ne02 = nvh; pc.ne03 = 1;
             pc.nb00 = (uint32_t) (v->nb[1] / sizeof(ggml_fp16_t)); pc.nb01 = 1; pc.nb02 = (uint32_t) (v->nb[2] / sizeof(ggml_fp16_t)); pc.nb03 = 0;
-            pc.ne10 = KV; pc.ne11 = DV; pc.ne12 = nh; pc.ne13 = 1;
-            pc.nb10 = 1; pc.nb11 = KV; pc.nb12 = KV * DV; pc.nb13 = KV * DV * nh;
+            pc.ne10 = KV; pc.ne11 = DV; pc.ne12 = nvh; pc.ne13 = 1;
+            pc.nb10 = 1; pc.nb11 = KV; pc.nb12 = KV * DV; pc.nb13 = KV * DV * nvh;
             pc.misalign_offsets = (uint32_t) ((off - desc) / sizeof(ggml_fp16_t)) << 16;
             init_pushconst_fastdiv(pc);
             const std::array<uint32_t, 3> elements = {
                 std::min(CEIL_DIV(KV, 32u), device->properties.limits.maxComputeWorkGroupCount[0]),
                 std::min(CEIL_DIV(DV, 32u), device->properties.limits.maxComputeWorkGroupCount[1]),
-                std::min(nh, device->properties.limits.maxComputeWorkGroupCount[2]),
+                std::min(nvh, device->properties.limits.maxComputeWorkGroupCount[2]),
             };
             ggml_vk_dispatch_pipeline(ctx, subctx, device->pipeline_cpy_transpose_16, { ggml_vk_subbuffer(ctx, v_sb.buffer, desc), vt_buf }, pc, elements);
         }
@@ -8713,13 +8725,13 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
             ggml_vk_sync_buffers(ctx, subctx);
             vk_pipeline p_qk = pick_matmul(KV, nr, DK, qk_strides_ok);
             ggml_vk_matmul(ctx, subctx, p_qk,
-                ggml_vk_subbuffer(ctx, k_sb.buffer, k_sb.offset + (uint64_t) h0 * k->nb[2]),
+                ggml_vk_subbuffer(ctx, k_sb.buffer, k_sb.offset + (shared ? 0 : (uint64_t) h0 * k->nb[2])),
                 ggml_vk_subbuffer(ctx, q_sb.buffer, q_sb.offset + (uint64_t) h0 * q->nb[2] + (uint64_t) r0 * q->nb[1]),
                 vk_subbuffer{ s_buf }, vk_subbuffer{ nullptr, 0, 0 },
                 KV, nr, DK,
                 (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)), (uint32_t) (q->nb[1] / sizeof(float)), KV,
-                (uint32_t) (k->nb[2] / sizeof(ggml_fp16_t)), (uint32_t) (q->nb[2] / sizeof(float)), KV * nr,
-                1, nh, nh, nh, 1, 1, nr,
+                shared ? 0u : (uint32_t) (k->nb[2] / sizeof(ggml_fp16_t)), (uint32_t) (q->nb[2] / sizeof(float)), KV * nr,
+                1, nh, shared ? 1 : nh, nh, shared ? nh : 1, 1, nr,
                 (uint64_t) q->nb[1], (uint64_t) KV * sizeof(float));
 
             // S = softmax(S*scale + mask), in place; the mask rows are shared by all heads
@@ -8772,8 +8784,8 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
                     vk_subbuffer{ ctx->prealloc_y, pv_off, pv_part },
                     DV, nr, KV,
                     KV, KV, DV,
-                    KV * DV, KV * nr, DV * nr,
-                    pv_split, nh, nh, nh, 1, 1, nr,
+                    shared ? 0u : KV * DV, KV * nr, DV * nr,
+                    pv_split, nh, shared ? 1 : nh, nh, shared ? nh : 1, 1, nr,
                     (uint64_t) KV * sizeof(float), (uint64_t) DV * sizeof(float));
                 ggml_vk_sync_buffers(ctx, subctx);
 
@@ -8805,8 +8817,8 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
                 vk_subbuffer{ nullptr, 0, 0 },
                 DV, nr, KV,
                 KV, KV, (uint32_t) (dst->nb[2] / sizeof(float)),
-                KV * DV, KV * nr, (uint32_t) (dst->nb[1] / sizeof(float)),
-                1, nh, nh, nh, 1, 1, nr,
+                shared ? 0u : KV * DV, KV * nr, (uint32_t) (dst->nb[1] / sizeof(float)),
+                1, nh, shared ? 1 : nh, nh, shared ? nh : 1, 1, nr,
                 (uint64_t) KV * sizeof(float), (uint64_t) dst->nb[2]);
         }
     }
