@@ -865,6 +865,20 @@ kernel void kernel_v_gate_f32(
     }
 }
 
+// GGML_METAL_FUSION_ADD_SIGMOID_SCALE: dst = scale*sigmoid(x + b) + bias, b one row broadcast over the rows or of the shape of x
+kernel void kernel_add_sigmoid_scale_f32(
+        constant ggml_metal_kargs_add_sigmoid_scale & args,
+        device const float * x,
+        device const float * b,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    if ((int) tpig >= args.n) {
+        return;
+    }
+    const float v = x[tpig] + b[args.b_rows ? (int) tpig % args.ne0 : (int) tpig];
+    dst[tpig] = args.scale/(1.0f + exp(-v)) + args.bias;
+}
+
 // GGML_METAL_FUSION_HC_SELECT, step 1: one threadgroup per projection row and token: mixes[m] = fn[m] (x / rms(x)) + base[m]
 // over the flat streams, and its sigmoid for the first 2*hc rows
 template<typename T>

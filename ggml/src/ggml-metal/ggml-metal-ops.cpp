@@ -4673,6 +4673,36 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// GGML_METAL_FUSION_ADD_SIGMOID_SCALE: scale*sigmoid(x + b) + bias in one elementwise kernel; only the SCALE is written
+static int ggml_metal_op_add_sigmoid_scale(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    const ggml_tensor * add = ctx->node(idx);
+    const ggml_tensor * sc  = ctx->node(idx + 2);
+    const ggml_tensor * x   = add->src[0];
+    const ggml_tensor * b   = add->src[1];
+
+    ggml_metal_kargs_add_sigmoid_scale args = {
+        /*.n      =*/ (int32_t) ggml_nelements(x),
+        /*.ne0    =*/ (int32_t) x->ne[0],
+        /*.b_rows =*/ ggml_nrows(b) == 1 ? 1 : 0,
+        /*.scale  =*/ ggml_get_op_params_f32(sc, 0),
+        /*.bias   =*/ ggml_get_op_params_f32(sc, 1),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_by_name(ctx->lib, "kernel_add_sigmoid_scale_f32");
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(b),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sc), 3);
+
+    const int nth = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return n_fuse;
+}
+
 int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     int n_fuse = 1;
     const ggml_metal_fusion * fusion = nullptr;
@@ -4688,6 +4718,11 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SNAKE) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_snake_fused(ctx, idx);
+        }
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_ADD_SIGMOID_SCALE) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_add_sigmoid_scale(ctx, idx, n_fuse);
         }
 
         // MoE output reduction: experts * weights -> weighted sum

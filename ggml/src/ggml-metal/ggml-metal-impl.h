@@ -1424,6 +1424,15 @@ typedef struct {
     uint64_t nb_s1;  // sigmoid(b) token stride
 } ggml_metal_kargs_v_gate;
 
+// GGML_METAL_FUSION_ADD_SIGMOID_SCALE
+typedef struct {
+    int32_t n;      // elements of x
+    int32_t ne0;    // row length (the bias period when b is one row)
+    int32_t b_rows; // 1: b is one row broadcast over the rows of x; 0: b has the shape of x
+    float   scale;
+    float   bias;
+} ggml_metal_kargs_add_sigmoid_scale;
+
 // GGML_METAL_FUSION_HC_COMB_POST (hc = 4)
 typedef struct {
     int32_t  n_embd;

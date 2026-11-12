@@ -896,6 +896,38 @@ static bool ggml_metal_fusion_check_gated_norm(
 }
 
 // v*sigmoid(a)/sigmoid(b) with one a, b per head (the write/erase ratio of a delta rule), sigmoid(b) also written
+// GGML_METAL_FUSION_ADD_SIGMOID_SCALE: y = s*sigmoid(x + b) + c with b one row broadcast over the rows of x, or of the shape of x
+static bool ggml_metal_fusion_check_add_sigmoid_scale(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * add = nodes[0];
+    const ggml_tensor * sg  = nodes[1];
+    const ggml_tensor * sc  = nodes[2];
+    const ggml_tensor * x   = add->src[0];
+    const ggml_tensor * b   = add->src[1];
+
+    if (ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID || sg->src[0] != add || sc->src[0] != sg) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(b) || !ggml_is_contiguous(sc)) {
+        return false;
+    }
+    return b->ne[0] == x->ne[0] && (ggml_nrows(b) == 1 || ggml_are_same_shape(b, x));
+}
+
 static bool ggml_metal_fusion_check_v_gate(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -1196,6 +1228,7 @@ static const std::vector<ggml_op> ops_gdn_state = { GGML_OP_GET_ROWS, GGML_OP_GA
 static const std::vector<ggml_op> ops_gdn_state_x = { GGML_OP_GET_ROWS, GGML_OP_CPY, GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_gated_norm = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_v_gate = { GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_DIV, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_add_sigmoid_scale = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_hc_comb_post = {
     GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_ADD, GGML_OP_DSV4_HC_POST
 };
@@ -1236,6 +1269,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_CONV_STATE,     ops_conv_state,             {1, 3}, true,  ggml_metal_fusion_check_conv_state },
     { GGML_METAL_FUSION_GDN_STATE,      ops_gdn_state,              {},     true,  ggml_metal_fusion_check_gdn_state },
     { GGML_METAL_FUSION_GDN_STATE,      ops_gdn_state_x,            {},     true,  ggml_metal_fusion_check_gdn_state },
+    { GGML_METAL_FUSION_ADD_SIGMOID_SCALE, ops_add_sigmoid_scale,   {},     false, ggml_metal_fusion_check_add_sigmoid_scale },
 };
 
 // ---- alloc deps -----------------------------------------------------------
