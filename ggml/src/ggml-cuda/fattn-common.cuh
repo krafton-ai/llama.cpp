@@ -666,6 +666,35 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
+// per-query key limits: the KV_max of flash_attn_mask_to_KV_max for the mask "row k seen iff k <= limit": the upper edge
+// of the last FATTN_KQ_STRIDE tile with a seen row of any query row of the tile
+template <int ncols1>
+static __global__ void flash_attn_limits_to_KV_max(
+        const int32_t * limits_ptr, int * KV_max_ptr, const int ne30, const int ne01, const int64_t s31, const int64_t s33) {
+    const int sequence = blockIdx.y;
+    const int jt       = blockIdx.x;
+    const int32_t * limits = limits_ptr + sequence*s33;
+
+    ggml_cuda_pdl_sync();
+
+    // rows past ne01 are not written by the kernel: they need no KV rows
+    int lim = -1;
+    for (int j = threadIdx.x; j < ncols1; j += blockDim.x) {
+        const int row = jt*ncols1 + j;
+        if (row < ne01) {
+            lim = max(lim, limits[row*s31]);
+        }
+    }
+#pragma unroll
+    for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+        lim = max(lim, __shfl_xor_sync(0xffffffff, lim, offset, WARP_SIZE));
+    }
+    if (threadIdx.x == 0) {
+        const int last = min(lim, ne30*FATTN_KQ_STRIDE - 1);
+        KV_max_ptr[sequence*gridDim.x + jt] = last < 0 ? 0 : (last/FATTN_KQ_STRIDE + 1)*FATTN_KQ_STRIDE;
+    }
+}
+
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
@@ -1003,7 +1032,7 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1115,7 +1144,19 @@ void launch_fattn(
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
     const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
-    if (scan_mask) {
+    if (scan_mask && mask->type == GGML_TYPE_I32) {
+        // the same tile bounds as the mask scan, from the per-query key limits
+        const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
+        const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
+        const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
+
+        KV_max.alloc(ne_KV_max);
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, dim3(WARP_SIZE, 1, 1), 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_limits_to_KV_max<ncols1>, launch_params,
+            (const int32_t *) mask->data, KV_max.ptr, iter_k, (int) Q->ne[1], (int64_t) (mask->nb[1]/sizeof(int32_t)),
+            (int64_t) (mask->nb[3]/sizeof(int32_t)));
+        CUDA_CHECK(cudaGetLastError());
+    } else if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1260,7 +1301,8 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        // ne31 < 0: the mask holds per-query key limits (I32)
+        mask ? (mask->type == GGML_TYPE_I32 ? -1 : mask->ne[1]) : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());

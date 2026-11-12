@@ -145,7 +145,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
-        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+        mask != nullptr && mask->type == GGML_TYPE_F16 && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -565,6 +565,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    // per-query key limits (an I32 mask): the MMA kernel with one query head per K/V head of D 192/128 (the MLA prefill
+    // on K/V expanded per head), which builds its mask tiles from the limits
+    if (mask && mask->type == GGML_TYPE_I32) {
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        const int cc_l = ggml_cuda_info().devices[device].cc;
+        const bool ok = GGML_CUDA_CC_IS_NVIDIA(cc_l) && turing_mma_available(cc_l) && Q->ne[2] == K->ne[2] &&
+            K->ne[0] == 192 && V->ne[0] == 128 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            max_bias == 0.0f && logit_softcap == 0.0f && dst->src[4] == nullptr && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+            mask->ne[1] >= Q->ne[1] && Q->ne[3] == 1 && ggml_get_op_params_i32(KQV, 4) == 0;
+        return ok ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+    }
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
