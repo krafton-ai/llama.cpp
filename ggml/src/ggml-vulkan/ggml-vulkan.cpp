@@ -18045,6 +18045,56 @@ static void ggml_vk_graph_optimize_impl(ggml_backend_t backend, struct ggml_cgra
             break;
         }
     }
+
+    // A one-row mat-vec of weights that reads the same input as an earlier one moves right before it, so that the two
+    // run together and the readers of the later one can start a barrier earlier (the delta net f_a projection with the
+    // qkv projection of the same norm output). Not when the next node reads its output (a fused epilogue)
+    auto reads = [](const ggml_tensor * n, const ggml_tensor * t) {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] && (n->src[s] == t || n->src[s]->view_src == t)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::unordered_map<const ggml_tensor *, int> mv_pos;
+    std::unordered_map<const ggml_tensor *, int> mv_first;
+    auto mv_index = [&]() {
+        mv_pos.clear();
+        mv_first.clear();
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            mv_pos[graph->nodes[i]] = i;
+        }
+    };
+    mv_index();
+    for (int j = 0; j < graph->n_nodes; ++j) {
+        ggml_tensor * mm = graph->nodes[j];
+        if (mm->op != GGML_OP_MUL_MAT || ggml_nrows(mm->src[1]) != 1) {
+            continue;
+        }
+        auto it = mv_first.find(mm->src[1]);
+        if (it == mv_first.end()) {
+            mv_first[mm->src[1]] = j;
+            continue;
+        }
+        const int i = it->second;
+        const ggml_tensor * w = mm->src[0]->view_src ? mm->src[0]->view_src : mm->src[0];
+        if (mv_pos.count(mm->src[0]) || mv_pos.count(w) || (j + 1 < graph->n_nodes && reads(graph->nodes[j + 1], mm))) {
+            continue;
+        }
+        for (int k = j; k > i; --k) {
+            graph->nodes[k] = graph->nodes[k - 1];
+        }
+        graph->nodes[i] = mm;
+        // the nodes up to j moved by one; the first mat-vec of each input is found again on the way
+        mv_index();
+        for (int k = 0; k <= j; ++k) {
+            const ggml_tensor * n = graph->nodes[k];
+            if (n->op == GGML_OP_MUL_MAT && ggml_nrows(n->src[1]) == 1 && !mv_first.count(n->src[1])) {
+                mv_first[n->src[1]] = k;
+            }
+        }
+    }
 }
 
 static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
