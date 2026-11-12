@@ -1683,6 +1683,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--ubatch-auto"}, "MIB",
+        "choose the physical batch size: the largest one up to the logical batch size (-b), halving down to -ub, whose "
+        "compute buffer on every GPU stays within MIB MiB (default: 0 = off, use -ub)",
+        [](common_params & params, int value) {
+            params.n_ubatch_auto_mib = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_AUTO"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

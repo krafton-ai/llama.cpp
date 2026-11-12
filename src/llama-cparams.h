@@ -53,6 +53,7 @@ struct llama_cparams {
     bool auto_fhc;
     bool mla_expand;         // MLA prefill may expand the latent cache to per-head K/V (ggml_mla_expand_kv)
     bool auto_mla_expand;
+    uint32_t n_ubatch_auto_mib; // > 0: choose n_ubatch from the compute buffer it needs (llama_context_params)
     bool kq_limits;          // the expanded MLA prefill may give flash attention per-query key limits instead of the KQ mask
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]

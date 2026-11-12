@@ -344,6 +344,7 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    cparams.n_ubatch_auto_mib = params.n_ubatch_auto_mib;
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -806,9 +807,10 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+          uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    // with an automatic physical batch size the graph may hold up to n_batch tokens
+    const size_t max_nodes = this->graph_max_nodes(cparams.n_ubatch_auto_mib > 0 ? std::min(cparams.n_ctx, cparams.n_batch) : n_tokens);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -835,6 +837,45 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs);
+
+    // automatic physical batch size (n_ubatch_auto_mib): from n_batch, halving down to the requested n_ubatch, the first
+    // size whose worst-case prompt graph needs at most that many MiB of compute buffer on every non-CPU device. Sized
+    // without allocating; done once
+    if (cparams.n_ubatch_auto_mib > 0 && !ubatch_auto_done && !cparams.training) {
+        ubatch_auto_done = true;
+        const uint32_t ub_min = cparams.n_ubatch;
+        const size_t   cap    = (size_t) cparams.n_ubatch_auto_mib*1024*1024;
+        std::vector<size_t> sizes(ggml_backend_sched_get_n_backends(sched.get()));
+        bool found = false;
+        for (uint32_t ub = cparams.n_batch; ub > ub_min; ub /= 2) {
+            cparams.n_ubatch = ub;
+            const uint32_t nt = std::min(cparams.n_ctx, ub);
+            std::fill(sizes.begin(), sizes.end(), 0);
+            if (!graph_reserve(nt, n_seqs, std::min(nt, cparams.n_outputs_max), mctx.get(), true, sizes.data())) {
+                continue;
+            }
+            size_t max_dev = 0;
+            for (size_t b = 0; b < sizes.size(); ++b) {
+                ggml_backend_t backend = ggml_backend_sched_get_backend(sched.get(), (int) b);
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    max_dev = std::max(max_dev, sizes[b]);
+                }
+            }
+            LLAMA_LOG_INFO("%s: n_ubatch %u needs %.2f MiB of compute buffer (limit %u MiB)\n", __func__, ub,
+                    max_dev/1024.0/1024.0, cparams.n_ubatch_auto_mib);
+            if (max_dev <= cap) {
+                found = true;
+                break;
+            }
+        }
+        // none within the limit: the requested size
+        if (!found) {
+            cparams.n_ubatch = ub_min;
+        }
+        LLAMA_LOG_INFO("%s: automatic n_ubatch = %u\n", __func__, cparams.n_ubatch);
+        n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    }
 
     // reserve worst-case graph
     int n_splits_pp        = -1;
@@ -4065,6 +4106,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
+        /*.n_ubatch_auto_mib           =*/ 0,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,

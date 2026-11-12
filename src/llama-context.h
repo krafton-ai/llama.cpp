@@ -367,6 +367,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool ubatch_auto_done   = false; // the automatic physical batch size was chosen (n_ubatch_auto_mib)
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
