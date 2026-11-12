@@ -1262,8 +1262,19 @@ struct vk_gdn_gates {
     float lower = 0.0f;
 };
 
+// the result of ggml_vk_graph_optimize for a graph of a given structure: the node order (indices into the nodes as given)
+// and the allocation dependencies it added (tensor: node index, or a leaf when < 0 with the tensor itself; until: node index)
+struct vk_graph_optimize_entry {
+    std::vector<uint64_t> key;
+    std::vector<int> order;
+    std::vector<std::pair<std::pair<int, ggml_tensor *>, int>> deps;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
+
+    // graph_optimize results of the last few graphs of a few tokens (decode, speculative verify), most recent first
+    std::vector<vk_graph_optimize_entry> graph_optimize_cache;
 
     vk_device device;
 

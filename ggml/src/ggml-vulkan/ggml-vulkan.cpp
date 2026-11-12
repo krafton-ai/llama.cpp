@@ -16768,7 +16768,141 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     UNUSED(backend);
 }
 
+static void ggml_vk_graph_optimize_impl(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params);
+
+// Everything ggml_vk_graph_optimize looks at: per node the op, type, shape, strides, view offset, flags, op params and where
+// its sources and view source are (a node index, or the address and shape of a tensor outside the nodes)
+static std::vector<uint64_t> ggml_vk_graph_optimize_key(const struct ggml_cgraph * graph) {
+    std::unordered_map<const ggml_tensor *, int> idx;
+    idx.reserve(graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        idx[graph->nodes[i]] = i;
+    }
+    std::vector<uint64_t> key;
+    key.reserve((size_t) graph->n_nodes * 40);
+    key.push_back((uint64_t) graph->n_nodes);
+    auto ref = [&](const ggml_tensor * t) {
+        if (t == nullptr) {
+            key.push_back(~0ull);
+            return;
+        }
+        auto it = idx.find(t);
+        if (it != idx.end()) {
+            key.push_back((uint64_t) it->second);
+            return;
+        }
+        key.push_back((uint64_t) (uintptr_t) t);
+        key.push_back(((uint64_t) t->op << 32) | (uint64_t) t->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            key.push_back((uint64_t) t->ne[d]);
+        }
+    };
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * t = graph->nodes[i];
+        key.push_back(((uint64_t) t->op << 32) | ((uint64_t) t->type << 8) | (uint64_t) t->flags);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            key.push_back((uint64_t) t->ne[d]);
+            key.push_back((uint64_t) t->nb[d]);
+        }
+        key.push_back((uint64_t) t->view_offs);
+        for (size_t p = 0; p < GGML_MAX_OP_PARAMS / sizeof(int32_t); p += 2) {
+            key.push_back(((uint64_t) (uint32_t) t->op_params[p] << 32) | (uint32_t) t->op_params[p + 1]);
+        }
+        ref(t->view_src);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            ref(t->src[s]);
+        }
+    }
+    return key;
+}
+
+struct vk_graph_optimize_recorder {
+    struct ggml_backend_graph_optimize_params * params;
+    const std::unordered_map<const ggml_tensor *, int> * idx;
+    std::vector<std::pair<std::pair<int, ggml_tensor *>, int>> deps;
+    bool ok = true;
+};
+
+static void ggml_vk_graph_optimize_record_dep(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until) {
+    auto * r = (vk_graph_optimize_recorder *) user_data;
+    r->params->add_alloc_dep(r->params->user_data, tensor, until);
+    auto t = r->idx->find(tensor);
+    auto u = r->idx->find(until);
+    if (u == r->idx->end()) {
+        r->ok = false;
+        return;
+    }
+    r->deps.push_back({ { t != r->idx->end() ? t->second : -1, tensor }, u->second });
+}
+
+// The graph of a few tokens (decode, speculative verify) is built again for every request with the same structure: its
+// reordering is taken from the cache instead of being worked out again. The ubatch graphs of a prompt are not cached: there
+// are many (their cache length grows), and the reordering is small next to their compute
 void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
+{
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->device->disable_graph_optimize) {
+        return;
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * t = graph->nodes[i];
+        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && t->src[1]->ne[1] > 8) {
+            ggml_vk_graph_optimize_impl(backend, graph, params);
+            return;
+        }
+    }
+    std::vector<uint64_t> key = ggml_vk_graph_optimize_key(graph);
+    auto & cache = ctx->graph_optimize_cache;
+    for (size_t c = 0; c < cache.size(); ++c) {
+        if (cache[c].key != key) {
+            continue;
+        }
+        const vk_graph_optimize_entry & e = cache[c];
+        std::vector<ggml_tensor *> nodes(graph->nodes, graph->nodes + graph->n_nodes);
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            graph->nodes[i] = nodes[e.order[i]];
+        }
+        for (const auto & d : e.deps) {
+            params->add_alloc_dep(params->user_data, d.first.first >= 0 ? nodes[d.first.first] : d.first.second, nodes[d.second]);
+        }
+        if (c != 0) {
+            std::rotate(cache.begin(), cache.begin() + c, cache.begin() + c + 1);
+        }
+        return;
+    }
+
+    std::unordered_map<const ggml_tensor *, int> idx;
+    idx.reserve(graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        idx[graph->nodes[i]] = i;
+    }
+    vk_graph_optimize_recorder rec { params, &idx, {} };
+    struct ggml_backend_graph_optimize_params rparams = { ggml_vk_graph_optimize_record_dep, &rec };
+    const int n_nodes = graph->n_nodes;
+    ggml_vk_graph_optimize_impl(backend, graph, &rparams);
+
+    vk_graph_optimize_entry e;
+    e.key = std::move(key);
+    e.order.resize(graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes && rec.ok; ++i) {
+        auto it = idx.find(graph->nodes[i]);
+        if (it == idx.end()) {
+            rec.ok = false;
+            break;
+        }
+        e.order[i] = it->second;
+    }
+    if (!rec.ok || graph->n_nodes != n_nodes) {
+        return;
+    }
+    e.deps = std::move(rec.deps);
+    cache.insert(cache.begin(), std::move(e));
+    if (cache.size() > 8) {
+        cache.pop_back();
+    }
+}
+
+static void ggml_vk_graph_optimize_impl(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
 {
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
