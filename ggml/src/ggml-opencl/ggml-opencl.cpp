@@ -1296,6 +1296,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_1_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemm_noshuffle_q4_1_f32;
     cl_kernel kernel_gemm_noshuffle_q8_0_f32, kernel_gemm_noshuffle_q8_0_f32_bin;
+    cl_kernel kernel_gemm_noshuffle_q8_0_f32_acc32;  // F32 accumulator (GGML_PREC_F32)
     cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a = nullptr;  // dp4a (int8) dense q8_0 prefill GEMM (opt-in)
     cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg = nullptr;  // q8_0 dense dp4a, weights via texture (opt-in)
     cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_ila_a8_bin = nullptr;
@@ -4632,6 +4633,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q8_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q8_0_f32_acc32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_f32_acc32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -23481,8 +23483,12 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clReleaseMemObject(b_img));
         CL_CHECK(clReleaseMemObject(b_sub_buf));
     } else {
+        // GGML_PREC_F32: the half-accumulator GEMM can overflow with large activations;
+        // use the F32-accumulator kernel and skip the precompiled and dp4a variants
+        const bool use_acc32 = ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
+
         static const char * q8_bin_dp4a_env = getenv("GGML_OPENCL_Q8_0_BIN_DP4A");
-        const bool q8_bin_dp4a_on = backend_ctx->has_integer_dot &&
+        const bool q8_bin_dp4a_on = !use_acc32 && backend_ctx->has_integer_dot &&
             (q8_bin_dp4a_env ? (atoi(q8_bin_dp4a_env) != 0) : true);
 
         if (q8_bin_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_ila_a8_bin
@@ -23571,7 +23577,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             ? (atoi(q8_dense_dp4a_env) != 0)
             : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && !q8_bin_loaded);
         // dot prod has to be available
-        q8_dense_dp4a_on = backend_ctx->has_integer_dot && q8_dense_dp4a_on;
+        q8_dense_dp4a_on = !use_acc32 && backend_ctx->has_integer_dot && q8_dense_dp4a_on;
 
         if (q8_dense_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a
                 && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
@@ -23642,7 +23648,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         }
 
         // use bin kernel if available
-        if (backend_ctx->kernel_gemm_noshuffle_q8_0_f32_bin) {
+        if (!use_acc32 && backend_ctx->kernel_gemm_noshuffle_q8_0_f32_bin) {
             int K_pad = K;
 
             cl_mem b_sub_buf = nullptr;
@@ -23793,7 +23799,8 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
         // gemm
-        kernel = backend_ctx->kernel_gemm_noshuffle_q8_0_f32;
+        kernel = use_acc32 ? backend_ctx->kernel_gemm_noshuffle_q8_0_f32_acc32
+                           : backend_ctx->kernel_gemm_noshuffle_q8_0_f32;
         int padded_N = N + padding;
 
         CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q8_0->q));
@@ -26821,7 +26828,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             }
             case GGML_TYPE_F16: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-                if (ggml_cl_can_use_adreno_xmem_gemm_f16_f32(backend_ctx, src0, src1, dst)) {
+                // the xmem GEMM accumulates in half; with GGML_PREC_F32 use the F32-accumulator l4_lm kernel below
+                if (ggml_get_op_params_i32(dst, 0) != GGML_PREC_F32 &&
+                    ggml_cl_can_use_adreno_xmem_gemm_f16_f32(backend_ctx, src0, src1, dst)) {
                     ggml_cl_mul_mat_f16_f32_adreno_xmem(backend, src0, src1, dst);
                     return;
                 }
