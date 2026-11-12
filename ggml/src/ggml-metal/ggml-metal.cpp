@@ -642,7 +642,8 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    // two encoding threads: with one, the GPU finishes the first command buffer of a decode graph before the rest is encoded
+    ggml_backend_metal_set_n_cb(backend, 2);
 
     return backend;
 }
@@ -737,7 +738,8 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    // two encoding threads: with one, the GPU finishes the first command buffer of a decode graph before the rest is encoded
+    ggml_backend_metal_set_n_cb(backend, 2);
 
     return backend;
 
