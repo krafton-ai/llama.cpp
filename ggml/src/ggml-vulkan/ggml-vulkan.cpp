@@ -8621,6 +8621,15 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
     const uint64_t sm_off = ggml_vk_align_size(sm_tmp, A);
     const uint32_t max_wg1 = device->properties.limits.maxComputeWorkGroupCount[1];
 
+    // O = V S has a small output (DV x rows of a few heads) and a long k: split k as a matmul does, the partials and
+    // the reduced O (contiguous) in prealloc_y after the softmax partials, then O is copied into dst
+    vk_pipeline p_pv0 = pick_matmul(DV, rc, KV, true);
+    const uint32_t pv_split = ggml_vk_guess_split_k(ctx, DV, rc, KV, false, p_pv0);
+    const uint64_t pv_off   = sm_large ? ggml_vk_align_size(sm_off + sm_tmp, A) : 0;
+    const uint64_t o_size   = (uint64_t) DV * rc * hc * sizeof(float);
+    const uint64_t pv_part  = ggml_vk_align_size((uint64_t) pv_split * o_size, A);
+    const uint64_t y_size   = pv_split > 1 ? pv_off + pv_part + o_size : (sm_large ? sm_off + sm_tmp : 0);
+
     bool grow = false;
     if (ctx->prealloc_size_split_k < s_size) {
         ctx->prealloc_size_split_k = s_size;
@@ -8630,8 +8639,8 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
         ctx->prealloc_size_x = vt_size;
         grow = true;
     }
-    if (sm_large && ctx->prealloc_size_y < sm_off + sm_tmp) {
-        ctx->prealloc_size_y = sm_off + sm_tmp;
+    if (ctx->prealloc_size_y < y_size) {
+        ctx->prealloc_size_y = y_size;
         grow = true;
     }
     if (grow) {
@@ -8645,6 +8654,10 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
     vk_pipeline sm_pipeline3 = mask ? device->pipeline_soft_max_large3_f32_f16 : device->pipeline_soft_max_large3_f32;
 
     ggml_pipeline_request_descriptor_sets(ctx, device->pipeline_cpy_transpose_16, n_hchunks);
+    if (pv_split > 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, device->pipeline_matmul_split_k_reduce, n_hchunks * n_rchunks);
+        ggml_pipeline_request_descriptor_sets(ctx, device->pipeline_cpy_32, n_hchunks * n_rchunks);
+    }
     if (sm_large) {
         const uint32_t n_sm = n_hchunks * n_rchunks * CEIL_DIV(hc * rc, max_wg1);
         ggml_pipeline_request_descriptor_sets(ctx, sm_pipeline1, n_sm);
@@ -8751,6 +8764,40 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
             // O = V S: [DV, nr] per head, written at dst[:, h, r]
             ggml_vk_sync_buffers(ctx, subctx);
             vk_pipeline p_pv = pick_matmul(DV, nr, KV, true);
+            if (pv_split > 1) {
+                const vk_subbuffer o_buf = { ctx->prealloc_y, pv_off + pv_part, (uint64_t) DV * nr * nh * sizeof(float) };
+                ggml_vk_matmul(ctx, subctx, p_pv,
+                    vk_subbuffer{ vt_buf }, vk_subbuffer{ s_buf }, vk_subbuffer{ o_buf },
+                    vk_subbuffer{ ctx->prealloc_y, pv_off, pv_part },
+                    DV, nr, KV,
+                    KV, KV, DV,
+                    KV * DV, KV * nr, DV * nr,
+                    pv_split, nh, nh, nh, 1, 1, nr,
+                    (uint64_t) KV * sizeof(float), (uint64_t) DV * sizeof(float));
+                ggml_vk_sync_buffers(ctx, subctx);
+
+                // O [DV, nr, nh] -> dst[:, h0 + h, r0 + r]
+                const uint32_t ne = DV * nr * nh;
+                vk_op_unary_push_constants pc_o{};
+                pc_o.ne   = ne;
+                pc_o.ne00 = DV; pc_o.ne01 = nr; pc_o.ne02 = nh; pc_o.ne03 = 1;
+                pc_o.nb00 = 1;  pc_o.nb01 = DV; pc_o.nb02 = DV * nr; pc_o.nb03 = ne;
+                pc_o.ne10 = DV; pc_o.ne11 = nr; pc_o.ne12 = nh; pc_o.ne13 = 1;
+                pc_o.nb10 = 1;  pc_o.nb11 = (uint32_t) (dst->nb[2] / sizeof(float)); pc_o.nb12 = (uint32_t) (dst->nb[1] / sizeof(float));
+                pc_o.nb13 = pc_o.nb12 * nh;
+                init_pushconst_fastdiv(pc_o);
+                std::array<uint32_t, 3> elements;
+                if (ne > 262144) {
+                    elements = { 512, 512, CEIL_DIV(ne, 262144) };
+                } else if (ne > 512) {
+                    elements = { 512, CEIL_DIV(ne, 512), 1 };
+                } else {
+                    elements = { ne, 1, 1 };
+                }
+                ggml_vk_dispatch_pipeline(ctx, subctx, device->pipeline_cpy_32, { o_buf,
+                    ggml_vk_subbuffer(ctx, d_sb.buffer, d_sb.offset + (uint64_t) h0 * dst->nb[1] + (uint64_t) r0 * dst->nb[2]) }, pc_o, elements);
+                continue;
+            }
             ggml_vk_matmul(ctx, subctx, p_pv,
                 vk_subbuffer{ vt_buf }, vk_subbuffer{ s_buf },
                 ggml_vk_subbuffer(ctx, d_sb.buffer, d_sb.offset + (uint64_t) h0 * dst->nb[1] + (uint64_t) r0 * dst->nb[2]),
@@ -8765,7 +8812,7 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
 
     ctx->prealloc_x_need_sync = true;
     ctx->prealloc_split_k_need_sync = true;
-    if (sm_large) {
+    if (sm_large || pv_split > 1) {
         ctx->prealloc_y_need_sync = true;
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
