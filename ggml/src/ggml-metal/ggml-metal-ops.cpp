@@ -3076,6 +3076,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_IQ4_NL ||
            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
+         // one-row q8_0 mat-vecs over short rows in many batches (e.g. the MLA k_b of a decode token, 32 heads of 128 x 512):
+         // the regular mat-vec kernel spreads a short row over a whole simdgroup
+         (op->src[0]->type == GGML_TYPE_Q8_0 && ne11 == 1 && ne00 <= 256 && ne12 > 1) ||
          (
           (
            op->src[0]->type == GGML_TYPE_Q4_K ||
@@ -3113,6 +3116,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         // note: not sure how optimal are those across all different hardware. there might be something cleverer
         switch (ne11) {
+            case 1:
+                r1ptg = 1; break;
             case 2:
                 r1ptg = 2; break;
             case 3:
