@@ -3864,9 +3864,12 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     // note: always reserve the temp buffer to avoid graph reallocations
     //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
     if (true) {
-        const int64_t nwg = 32;
-        // single-head ops (MLA heads as query rows) may split up to 256 rows: a short MTP verify batch is 32*n_tokens rows
-        const int64_t ne01_max = std::min(ne01, ne02 == 1 ? 256 : 32);
+        // single-head ops (MLA heads as query rows) may split up to 256 rows: a short MTP verify batch is 32*n_tokens rows;
+        // a prefill of up to 512 rows over few heads may split up to 8 ways
+        // (only where the encoder can split: at most 256 threadgroups with the largest query block, 16 rows)
+        const bool    rows   = ne02 != 1 && ne01 > 32 && ne01 <= 512 && ((ne01 + 15)/16)*ne02*ne03 <= 256;
+        const int64_t nwg = rows ? 8 : 32;
+        const int64_t ne01_max = rows ? std::min<int64_t>(ne01, 512) : std::min(ne01, ne02 == 1 ? 256 : 32);
 
         // temp buffer for writing the results from each workgroup
         // - ne20: the size of the Value head
@@ -4366,7 +4369,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         // few query blocks over a long cache (e.g. MLA decode with the heads as query rows): split the cache over
         // nwg workgroups so that more GPU cores take part, then combine them as the vector kernel does. The temp
-        // buffer holds up to 32 query rows per head (ggml_metal_op_flash_attn_ext_extra_tmp)
+        // buffer holds up to 32 query rows per head, or 512 for the prefill case (ggml_metal_op_flash_attn_ext_extra_tmp)
         int32_t nwg = 1;
         {
             const int64_t ntg  = ((ne01 + nqptg - 1)/nqptg)*ne02*ne03;
@@ -4374,6 +4377,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             if (ne01 <= (ne02 == 1 ? 256 : 32)) {
                 // double the workgroups while there are enough KV blocks per workgroup and the GPU is not yet filled
                 while (nwg < 32 && ntg*nwg*2 <= 128 && nblk >= 4*nwg*2) {
+                    nwg *= 2;
+                }
+            } else if (ne02 != 1 && ne01 <= 512) {
+                // a prefill over a long cache with few heads per op (the expanded MLA prefill, a group of heads at a time) gives
+                // few threadgroups: split the cache up to 8 ways while that fills up to 512 threadgroups and leaves each
+                // workgroup at least 16 KV blocks
+                while (nwg < 8 && ntg*nwg*2 <= 512 && nblk >= 16*nwg*2) {
                     nwg *= 2;
                 }
             }
