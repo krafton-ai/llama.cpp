@@ -335,8 +335,9 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
 
-    cparams.mla_expand      = true;
-    cparams.auto_mla_expand = true;
+    // the expansion reads a latent MLA cache; other models do not reserve its probe graph
+    cparams.mla_expand      = model.hparams.is_mla();
+    cparams.auto_mla_expand = model.hparams.is_mla();
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
