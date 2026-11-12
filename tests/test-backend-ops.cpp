@@ -10113,6 +10113,48 @@ struct test_mul_mat_prec_f32 : public test_case {
     }
 };
 
+// MLA decode attention output without flash attention: 32 query heads' probabilities against the latent V, which the
+// graph takes as the first 512 values of each 576-value cache row, transposes and copies (the OpenCL backend runs the
+// copy and the MUL_MAT as one split kernel on the cache view)
+struct test_mla_kqv_decode : public test_case {
+    const int64_t n_kv;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MLA_KQV_DECODE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR1(n_kv);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    // the copy and the MUL_MAT must be in one graph for the backend to fuse them
+    bool run_whole_graph() override { return true; }
+
+    test_mla_kqv_decode(int64_t n_kv = 1280) : n_kv(n_kv) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 576, n_kv);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * v = ggml_view_2d(ctx, cache, 512, n_kv, cache->nb[1], 0);
+        ggml_tensor * vt = ggml_cont(ctx, ggml_transpose(ctx, v));
+        ggml_tensor * p = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, 1, 32);
+        ggml_set_name(p, "p");
+        ggml_tensor * out = ggml_mul_mat(ctx, vt, p);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_tensor_uniform(ggml_get_tensor(ctx, "cache"), -1.0f, 1.0f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "p"), 0.0f, 1.0f);
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with the first n_masked kv cells of every row masked, e.g. unused cells at the start of the cache.
 // The OpenCL Adreno xmem path (GGML_OPENCL_XMEM_SDPA=1) gave NaN for these rows.
 struct test_flash_attn_ext_masked_head : public test_flash_attn_ext {
@@ -13018,6 +13060,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (ggml_type type_a : { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 259840, 1, 1536, { 1, 1 }, { 1, 1 }));
+    }
+
+    // MLA decode KQV at the cache lengths that select each split variant, and one that is not a multiple of 64
+    for (int64_t n_kv : {1000, 1280, 2304, 4224, 8448}) {
+        test_cases.emplace_back(new test_mla_kqv_decode(n_kv));
     }
 
     // Single-column Q5_K GEMV with row counts around multiples of the rows per subgroup and per workgroup.

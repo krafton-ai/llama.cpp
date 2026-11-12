@@ -25997,12 +25997,13 @@ static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor
                          view->ne[1] == 512 && view->nb[0] == 1152 && p_rows_ok && nbd1 == 2048 && transposed &&
                          ggml_cl_ncol_split_ranges_ok(backend_ctx, view, p, mm);
 
-    // two exact shorter cache lengths have their own split size (JC = 128 and 64)
+    // shorter caches split into full 128-row (from 4096) or 64-row (from 1024) blocks; these variants read whole
+    // splits, so the cache length must be a multiple of the split size
     const bool short_shape = !long_kv && D == 512 && view->nb[0] == 1152 && nbp1 == (cl_ulong) J * sizeof(float) &&
                              nbd1 == 2048 && offv % 4 == 0 && offp % 16 == 0 && offd % 4 == 0 && transposed;
-    const bool short_4352  = short_shape && J == 4352 && variants[NCOL_SPLIT_D2_C8_VP_J128] &&
+    const bool short_4352  = short_shape && J >= 4096 && J % 128 == 0 && variants[NCOL_SPLIT_D2_C8_VP_J128] &&
                              ggml_cl_ncol_split_ranges_ok(backend_ctx, view, p, mm);
-    const bool short_2304  = short_shape && J == 2304 && variants[NCOL_SPLIT_D2_C8_VP_J64] &&
+    const bool short_2304  = short_shape && J >= 1024 && J < 4096 && J % 64 == 0 && variants[NCOL_SPLIT_D2_C8_VP_J64] &&
                              ggml_cl_ncol_split_ranges_ok(backend_ctx, view, p, mm);
     const bool short_kv    = short_4352 || short_2304;
 
