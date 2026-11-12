@@ -1433,6 +1433,18 @@ typedef struct {
     float   bias;
 } ggml_metal_kargs_add_sigmoid_scale;
 
+// GGML_METAL_FUSION_NORM_MUL_ADD_HC
+typedef struct {
+    int32_t  n;
+    int32_t  hc;
+    float    eps;
+    uint64_t nb_x1;
+    uint64_t nb_r1;
+    uint64_t nb_r2;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+} ggml_metal_kargs_norm_mul_add_hc;
+
 // GGML_METAL_FUSION_HC_COMB_POST (hc = 4)
 typedef struct {
     int32_t  n_embd;

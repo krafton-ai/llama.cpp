@@ -51,6 +51,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_CONV_STATE,   // CONCAT + CPY (conv state) + SSM_CONV + SILU + L2_NORM (q | k), one token
     GGML_METAL_FUSION_GDN_STATE,    // GET_ROWS (initial states) + GATED_DELTA_NET + CPY: states read from the cache rows by id
     GGML_METAL_FUSION_ADD_SIGMOID_SCALE, // ADD (row bias) + SIGMOID + SCALE: scale*sigmoid(x + b) + bias
+    GGML_METAL_FUSION_NORM_MUL_ADD_HC,   // RMS_NORM + MUL + ADD into hc streams: res[:, s] + norm(x)*w for every stream s
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

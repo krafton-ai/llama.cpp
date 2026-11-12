@@ -865,6 +865,50 @@ kernel void kernel_v_gate_f32(
     }
 }
 
+// GGML_METAL_FUSION_NORM_MUL_ADD_HC: one threadgroup per token t: v = x[:, t]/rms(x[:, t])*w, dst[:, s, t] = res[:, s, t] + v
+kernel void kernel_rms_norm_mul_add_hc_f32(
+        constant ggml_metal_kargs_norm_mul_add_hc & args,
+        device const char * x,
+        device const char * w,
+        device const char * res,
+        device       char * dst,
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    const int t   = tgpig;
+    const int nsg = ntg/32;
+
+    device const float * xt = (device const float *) (x + (uint64_t) t*args.nb_x1);
+    device const float * wr = (device const float *) w;
+
+    float ss = 0.0f;
+    for (int i = tpitg; i < args.n; i += ntg) {
+        ss += xt[i]*xt[i];
+    }
+    ss = simd_sum(ss);
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int s = 0; s < nsg; ++s) {
+        tot += shmem[s];
+    }
+    const float inv = 1.0f/sqrt(tot/args.n + args.eps);
+
+    for (int i = tpitg; i < args.n; i += ntg) {
+        const float v = xt[i]*inv*wr[i];
+        for (int s = 0; s < args.hc; ++s) {
+            const uint64_t ro = (uint64_t) s*args.nb_r1 + (uint64_t) t*args.nb_r2;
+            const uint64_t d0 = (uint64_t) s*args.nb_d1 + (uint64_t) t*args.nb_d2;
+            *((device float *) (dst + d0) + i) = *((device const float *) (res + ro) + i) + v;
+        }
+    }
+}
+
 // GGML_METAL_FUSION_ADD_SIGMOID_SCALE: dst = scale*sigmoid(x + b) + bias, b one row broadcast over the rows or of the shape of x
 kernel void kernel_add_sigmoid_scale_f32(
         constant ggml_metal_kargs_add_sigmoid_scale & args,

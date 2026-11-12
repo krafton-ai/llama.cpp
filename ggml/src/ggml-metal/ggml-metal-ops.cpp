@@ -4996,6 +4996,42 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// GGML_METAL_FUSION_NORM_MUL_ADD_HC: one threadgroup per token: the RMS norm of x times w, added to every stream of the residual
+static int ggml_metal_op_norm_mul_add_hc(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    const ggml_tensor * rn  = ctx->node(idx);
+    const ggml_tensor * mul = ctx->node(idx + 1);
+    const ggml_tensor * add = ctx->node(idx + 2);
+    const ggml_tensor * x   = rn->src[0];
+    const ggml_tensor * res = add->src[0];
+
+    ggml_metal_kargs_norm_mul_add_hc args = {
+        /*.n     =*/ (int32_t) x->ne[0],
+        /*.hc    =*/ (int32_t) res->ne[1],
+        /*.eps   =*/ ggml_get_op_params_f32(rn, 0),
+        /*.nb_x1 =*/ x->nb[1],
+        /*.nb_r1 =*/ res->nb[1],
+        /*.nb_r2 =*/ res->nb[2],
+        /*.nb_d1 =*/ add->nb[1],
+        /*.nb_d2 =*/ add->nb[2],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_by_name(ctx->lib, "kernel_rms_norm_mul_add_hc_f32");
+
+    const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), x->ne[1] <= 8 ? 1024 : 256);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),           1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res),         3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(add),         4);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD((nth/32)*sizeof(float), 16), 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, x->ne[1], 1, 1, nth, 1, 1);
+
+    return n_fuse;
+}
+
 int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -5007,6 +5043,10 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         const int m = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_GATED_NORM);
         if (m > 1) {
             return ggml_metal_op_gated_norm(ctx, idx, m);
+        }
+        const int k = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_NORM_MUL_ADD_HC);
+        if (k > 1) {
+            return ggml_metal_op_norm_mul_add_hc(ctx, idx, k);
         }
     }
 

@@ -896,6 +896,61 @@ static bool ggml_metal_fusion_check_gated_norm(
 }
 
 // v*sigmoid(a)/sigmoid(b) with one a, b per head (the write/erase ratio of a delta rule), sigmoid(b) also written
+// GGML_METAL_FUSION_NORM_MUL_ADD_HC: out[:, s, t] = res[:, s, t] + RMS_NORM(x[:, t])*w for the hc streams s; the MUL reaches the
+// ADD through a reshape [n, t] -> [n, 1, t] and is not written
+static bool ggml_metal_fusion_check_norm_mul_add_hc(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * rn  = nodes[0];
+    const ggml_tensor * mul = nodes[1];
+    const ggml_tensor * add = nodes[2];
+    const ggml_tensor * x   = rn->src[0];
+    const ggml_tensor * w   = mul->src[1];
+    const ggml_tensor * res = add->src[0];
+    const ggml_tensor * rs  = add->src[1];
+
+    if (rn->op != GGML_OP_RMS_NORM || mul->src[0] != rn || rs->op != GGML_OP_RESHAPE || rs->view_src != mul) {
+        return false;
+    }
+    const int64_t n = x->ne[0];
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // x [n, nt] rows contiguous; w one contiguous row; res [n, hc, nt] with unit element stride; out contiguous
+    if (x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) || !ggml_is_contiguous(rn) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    if (w->ne[0] != n || ggml_nrows(w) != 1 || !ggml_is_contiguous(w)) {
+        return false;
+    }
+    if (res->ne[0] != n || res->ne[1] < 2 || res->ne[1] > 8 || res->ne[2] != x->ne[1] || res->ne[3] != 1 || res->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (rs->ne[0] != n || rs->ne[1] != 1 || rs->ne[2] != x->ne[1] || !ggml_is_contiguous(add)) {
+        return false;
+    }
+
+    // the MUL is counted as an output for the structural check; it must have the reshape as its only reader, and the
+    // reshape the ADD
+    const int outs[2] = { node_idxs[idx + 2], node_idxs[idx + 1] };
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, (int) fusion->ops.size(), fusion->ops.data(), outs, 2) ||
+            ggml_node_get_use_count(gf, node_idxs[idx + 1]) != 1) {
+        return false;
+    }
+    for (int i = node_idxs[idx + 1] + 1; i < node_idxs[idx + 2]; ++i) {
+        if (gf->nodes[i] == rs) {
+            return ggml_node_get_use_count(gf, i) == 1;
+        }
+    }
+    return false;
+}
+
 // GGML_METAL_FUSION_ADD_SIGMOID_SCALE: y = s*sigmoid(x + b) + c with b one row broadcast over the rows of x, or of the shape of x
 static bool ggml_metal_fusion_check_add_sigmoid_scale(
         const ggml_metal_fusion       * fusion,
@@ -1229,6 +1284,7 @@ static const std::vector<ggml_op> ops_gdn_state_x = { GGML_OP_GET_ROWS, GGML_OP_
 static const std::vector<ggml_op> ops_gated_norm = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_v_gate = { GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_DIV, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_add_sigmoid_scale = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_norm_mul_add_hc = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_hc_comb_post = {
     GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_ADD, GGML_OP_DSV4_HC_POST
 };
@@ -1270,6 +1326,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_GDN_STATE,      ops_gdn_state,              {},     true,  ggml_metal_fusion_check_gdn_state },
     { GGML_METAL_FUSION_GDN_STATE,      ops_gdn_state_x,            {},     true,  ggml_metal_fusion_check_gdn_state },
     { GGML_METAL_FUSION_ADD_SIGMOID_SCALE, ops_add_sigmoid_scale,   {},     false, ggml_metal_fusion_check_add_sigmoid_scale },
+    { GGML_METAL_FUSION_NORM_MUL_ADD_HC,   ops_norm_mul_add_hc,     {},     true,  ggml_metal_fusion_check_norm_mul_add_hc },
 };
 
 // ---- alloc deps -----------------------------------------------------------
