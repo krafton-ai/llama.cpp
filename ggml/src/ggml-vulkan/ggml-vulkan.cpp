@@ -8614,8 +8614,9 @@ static bool ggml_vk_fa_prefill_matmul(ggml_backend_vk_context * ctx, vk_context&
     const uint64_t s_size  = (uint64_t) hc * rc * KV * sizeof(float);
     const uint64_t vt_size = (uint64_t) hc * KV * DV * sizeof(ggml_fp16_t);
 
-    // softmax rows above 16384 columns: the three pass softmax with its partial max/sum in prealloc_y
-    const bool sm_large = KV > 16384;
+    // softmax rows above 16384 columns of only a few rows: the three pass softmax with its partial max/sum in prealloc_y
+    // (one workgroup per row keeps the device busy once there are many rows)
+    const bool sm_large = KV > 16384 && (uint64_t) hc * rc < 512;
     const uint32_t sm_wgs = CEIL_DIV(KV, 128 * 4);
     const uint64_t sm_tmp = (uint64_t) sm_wgs * hc * rc * sizeof(float);
     const uint64_t sm_off = ggml_vk_align_size(sm_tmp, A);
