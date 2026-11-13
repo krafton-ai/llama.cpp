@@ -649,6 +649,7 @@ enum ggml_cl_ncol_split_variant {
     NCOL_SPLIT_D2_C8_VP,
     NCOL_SPLIT_D2_C8_VP_J128,
     NCOL_SPLIT_D2_C8_VP_J64,
+    NCOL_SPLIT_D8_C8,
     NCOL_SPLIT_COUNT,
 };
 
@@ -1864,6 +1865,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     "kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp",
                     "kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_j128",
                     "kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_j64",
+                    "kernel_mul_mat_f16t_f32_ncol_split_d8_c8",
                 };
                 for (int i = 0; i < NCOL_SPLIT_COUNT; ++i) {
                     backend_ctx->kernel_mul_mat_f16t_f32_ncol_split_var[i] =
@@ -26025,6 +26027,8 @@ static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor
 
     const int JC      = long_kv ? 256 : J >= 4096 ? 128 : J >= 1024 ? 64 : 32;
     const int n_split = CEIL_DIV(J, JC);
+    // 8 d per lane over the same full splits (same partial layout and summation order); not the normalizing variant
+    const bool d8      = !norm && (long_kv || short_kv) && D == 512 && variants[NCOL_SPLIT_D8_C8];
 
     backend_ctx->prealloc_ncol_part.allocate(backend_ctx->context, (size_t) n_split * 32 * D * sizeof(float));
 
@@ -26033,6 +26037,8 @@ static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor
         if (norm) {
             GGML_ASSERT(long_kv && long_idx == NCOL_SPLIT_D2_C8_VP);
             kernel = backend_ctx->kernel_mul_mat_f16t_f32_ncol_split_norm;
+        } else if (d8) {
+            kernel = variants[NCOL_SPLIT_D8_C8];
         } else if (short_kv) {
             kernel = variants[short_2304 ? NCOL_SPLIT_D2_C8_VP_J64 : NCOL_SPLIT_D2_C8_VP_J128];
         } else if (long_kv) {
@@ -26049,7 +26055,7 @@ static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &backend_ctx->prealloc_ncol_part.buffer));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &J));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &D));
-        if (!long_kv && !short_kv) {
+        if ((!long_kv && !short_kv) || d8) {
             CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &JC));
         }
         if (norm) {
@@ -26057,7 +26063,7 @@ static void ggml_cl_mul_mat_ncol_split(ggml_backend_t backend, const ggml_tensor
         }
 
         // the variants take two d per lane; c8 / c16 split the 32 heads over 4 / 2 groups
-        const int gws0   = short_kv ? 2 * D : !long_kv ? CEIL_DIV(D, 64) * 64 : c8_u4 ? 2 * D : c16 ? D : D / 2;
+        const int gws0   = d8 ? 4 * 64 : short_kv ? 2 * D : !long_kv ? CEIL_DIV(D, 64) * 64 : c8_u4 ? 2 * D : c16 ? D : D / 2;
         size_t    lws[2] = { 64, 1 };
         size_t    gws[2] = { (size_t) gws0, (size_t) n_split };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, mm);

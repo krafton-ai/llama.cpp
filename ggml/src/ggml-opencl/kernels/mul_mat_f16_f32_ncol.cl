@@ -602,6 +602,65 @@ kernel void kernel_mul_mat_f16t_f32_ncol_split_d2_c8_vp_j64(
         out += 8 * D;
     }
 }
+
+//------------------------------------------------------------------------------
+// 64 lanes, 8 adjacent d per lane (one half8 load of a cache row per lane and key), 8 heads per group (P of the
+// 8 heads for one key read as a float8 from local memory): 64 FMA per load pair. Splits of JC keys; the selector
+// only admits full splits (J % JC == 0). Same summation order as the d2 variants.
+//------------------------------------------------------------------------------
+kernel void kernel_mul_mat_f16t_f32_ncol_split_d8_c8(
+        global const char * v,
+        ulong offv,
+        ulong nbvj,
+        global const char * p,
+        ulong offp,
+        ulong nbp1,
+        global float * part,
+        int J,
+        int D,
+        int JC) {
+    local float8 Pl[64];
+    const int lane = get_local_id(0);
+    const int head0 = get_group_id(0) * 8;
+    const int d = lane * 8;
+    const int split = get_group_id(1);
+    const int j0 = JC * split;
+    float8 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f, acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    for (int strip = 0; strip < JC; strip += 64) {
+        float w[8];
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            w[h] = ((global const float *) (p + offp + (ulong) (head0 + h) * nbp1))[j0 + strip + lane];
+        }
+        Pl[lane] = (float8) (w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const global char * base = v + offv + (ulong) (j0 + strip) * nbvj + (ulong) d * sizeof(half);
+#pragma unroll 4
+        for (int u = 0; u < 64; ++u) {
+            const float8 x = convert_float8(vload8(0, (const global half *) (base + (ulong) u * nbvj)));
+            const float8 pw = Pl[u];
+            acc0 = mad((float8) x.s0, pw, acc0);
+            acc1 = mad((float8) x.s1, pw, acc1);
+            acc2 = mad((float8) x.s2, pw, acc2);
+            acc3 = mad((float8) x.s3, pw, acc3);
+            acc4 = mad((float8) x.s4, pw, acc4);
+            acc5 = mad((float8) x.s5, pw, acc5);
+            acc6 = mad((float8) x.s6, pw, acc6);
+            acc7 = mad((float8) x.s7, pw, acc7);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    global float * out = part + ((ulong) split * 32 + head0) * D + d;
+    global float * o0 = out + 0; NCOL_STORE8(acc0, o0, D)
+    global float * o1 = out + 1; NCOL_STORE8(acc1, o1, D)
+    global float * o2 = out + 2; NCOL_STORE8(acc2, o2, D)
+    global float * o3 = out + 3; NCOL_STORE8(acc3, o3, D)
+    global float * o4 = out + 4; NCOL_STORE8(acc4, o4, D)
+    global float * o5 = out + 5; NCOL_STORE8(acc5, o5, D)
+    global float * o6 = out + 6; NCOL_STORE8(acc6, o6, D)
+    global float * o7 = out + 7; NCOL_STORE8(acc7, o7, D)
+}
+
 #endif  // NCOL_SPLIT_VARIANTS
 
 #ifdef NCOL_SPLIT_NORM
