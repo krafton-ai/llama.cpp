@@ -778,7 +778,7 @@ bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_t
     if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_I32) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
         const char * name = reg ? ggml_backend_reg_name(reg) : "";
-        if (strcmp(name, "CPU") != 0) {
+        if (strcmp(name, "CPU") != 0 && strcmp(name, "CUDA") != 0) {
             return false;
         }
     }
