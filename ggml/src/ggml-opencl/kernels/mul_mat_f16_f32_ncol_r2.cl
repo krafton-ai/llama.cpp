@@ -461,4 +461,57 @@ kernel void kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2(
         STORE8(y0, o, stride)
     }
 }
+
+// img2 with q viewed as 128-bit texels (CL_RGBA / CL_UNSIGNED_INT32): one fetch gives the 8 heads of one k
+kernel void kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4(
+        global const char * a,
+        ulong oa,
+        ulong sa,
+        read_only image1d_buffer_t qimage,
+        ulong ob,
+        ulong sb,
+        global char * d,
+        ulong od,
+        ulong sd,
+        int K,
+        int M) {
+    const int lid = get_local_id(0), rl = lid / 8, kl = lid % 8;
+    const int head0 = (get_group_id(0) % 4) * 8;
+    const int m0 = (get_group_id(0) / 4) * 64 + rl, m1 = m0 + 32;
+    const global half * a0 = (global const half *) (a + oa + (ulong) min(m0, M - 1) * sa);
+    const global half * a1 = (global const half *) (a + oa + (ulong) min(m1, M - 1) * sa);
+    float8 x0 = 0.0f, y0 = 0.0f;
+    for (int c = kl * 4; c < 576; c += 64) {
+        float4 av0 = convert_float4(vload4(0, a0 + c));
+        float4 av1 = convert_float4(vload4(0, a1 + c));
+        float4 bv0 = convert_float4(vload4(0, a0 + c + 32));
+        float4 bv1 = convert_float4(vload4(0, a1 + c + 32));
+#define BOTH(a, b, k)                                                                    \
+    {                                                                                    \
+        float8 q0 = convert_float8(as_half8(read_imageui(qimage, (k) * 4 + head0 / 8))); \
+        x0 = mad((float8) (a), q0, x0);                                                  \
+        y0 = mad((float8) (b), q0, y0);                                                  \
+    }
+        BOTH(av0.s0, av1.s0, c + 0)
+        BOTH(av0.s1, av1.s1, c + 1)
+        BOTH(av0.s2, av1.s2, c + 2) BOTH(av0.s3, av1.s3, c + 3) BOTH(bv0.s0, bv1.s0, c + 32)
+                BOTH(bv0.s1, bv1.s1, c + 33) BOTH(bv0.s2, bv1.s2, c + 34) BOTH(bv0.s3, bv1.s3, c + 35)
+#undef BOTH
+    }
+    RED8(x0, 1u)
+    RED8(y0, 1u)
+    RED8(x0, 2u)
+    RED8(y0, 2u)
+    RED8(x0, 4u)
+    RED8(y0, 4u)
+    const int stride = (int) (sd / sizeof(float));
+    if (kl == 0 && m0 < M) {
+        global float * o = (global float *) (d + od + (ulong) head0 * sd + (ulong) m0 * sizeof(float));
+        STORE8(x0, o, stride)
+    }
+    if (kl == 0 && m1 < M) {
+        global float * o = (global float *) (d + od + (ulong) head0 * sd + (ulong) m1 * sizeof(float));
+        STORE8(y0, o, stride)
+    }
+}
 #endif  // NCOL_R2_PACKED

@@ -884,11 +884,13 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8      = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img  = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2 = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4 = nullptr;
     ggml_cl_buffer prealloc_ncol_part;      // the split partial sums of kernel_mul_mat_f16t_f32_ncol_split
     ggml_cl_buffer prealloc_soft_max_sums;  // the softmax row sums for kernel_mul_mat_f16t_f32_ncol_split_norm
     std::mutex     soft_max_sums_mutex;
     ggml_cl_buffer ncol_q_packed;           // q as half [576][32] for the _pq variants
     cl_mem         ncol_q_packed_image       = nullptr;
+    cl_mem         ncol_q_packed_image4      = nullptr;  // the same scratch as 128-bit texels (8 halfs)
     bool           ncol_q_packed_image_tried = false;
     std::mutex     ncol_q_mutex;
     ggml_cl_buffer prealloc_gdn_gexp;       // exp(g) of a KDA gated delta net in prompt processing
@@ -1367,6 +1369,7 @@ struct ggml_backend_opencl_context {
             &kernel_mul_mat_f16t_f32_ncol_split_norm,
             &kernel_mul_mat_ncol_pack_q,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2,
+            &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c16,
@@ -1389,6 +1392,10 @@ struct ggml_backend_opencl_context {
         if (ncol_q_packed_image) {
             CL_CHECK(clReleaseMemObject(ncol_q_packed_image));
             ncol_q_packed_image = nullptr;
+        }
+        if (ncol_q_packed_image4) {
+            CL_CHECK(clReleaseMemObject(ncol_q_packed_image4));
+            ncol_q_packed_image4 = nullptr;
         }
         ncol_q_packed_image_tried = false;
     }
@@ -1916,6 +1923,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                         ggml_cl_create_optional_kernel(backend_ctx, packed, "kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img", 256);
                     backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2 =
                         ggml_cl_create_optional_kernel(backend_ctx, packed, "kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2", 256);
+                    backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4 = ggml_cl_create_optional_kernel(
+                        backend_ctx, packed, "kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4", 256);
                 } else if (dot) {
                     CL_CHECK(clReleaseKernel(dot));
                 }
@@ -26215,12 +26224,26 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             } else if (image) {
                 CL_CHECK(clReleaseMemObject(image));
             }
+            if (backend_ctx->ncol_q_packed_image && backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4) {
+                cl_image_format format4 = { CL_RGBA, CL_UNSIGNED_INT32 };
+                desc.image_width        = 32 * 576 / 8;
+                err_image               = CL_SUCCESS;
+                cl_mem image4 = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &format4, &desc, nullptr, &err_image);
+                if (image4 && err_image == CL_SUCCESS) {
+                    backend_ctx->ncol_q_packed_image4 = image4;
+                } else if (image4) {
+                    CL_CHECK(clReleaseMemObject(image4));
+                }
+            }
         }
         const bool image  = want_image && backend_ctx->ncol_q_packed_image;
         const bool image2 = image && backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2;
+        const bool image4 = image2 && backend_ctx->ncol_q_packed_image4;
 
         cl_kernel kernel = backend_ctx->kernel_mul_mat_f16_f32_ncol;
-        if (image2) {
+        if (image4) {
+            kernel = backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4;
+        } else if (image2) {
             kernel = backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2;
         } else if (image) {
             kernel = backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img;
@@ -26247,7 +26270,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         ggml_opencl_arg_tensor(kernel, idx, src0);
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nba1));
         if (packed) {
-            cl_mem q = image ? backend_ctx->ncol_q_packed_image : backend_ctx->ncol_q_packed.buffer;
+            cl_mem q = image4 ? backend_ctx->ncol_q_packed_image4 :
+                       image  ? backend_ctx->ncol_q_packed_image : backend_ctx->ncol_q_packed.buffer;
             CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &q));
             CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &zero));
         } else {
