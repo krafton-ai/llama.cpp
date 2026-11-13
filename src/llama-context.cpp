@@ -860,7 +860,14 @@ void llama_context::sched_reserve() {
     // automatic physical batch size (n_ubatch_auto_mib): from n_batch, halving down to the requested n_ubatch, the first
     // size whose worst-case prompt graph needs at most that many MiB of compute buffer on every non-CPU device. Sized
     // without allocating; done once
-    if (cparams.n_ubatch_auto_mib > 0 && !ubatch_auto_done && !cparams.training) {
+    // only with a GPU: without one there is no device buffer to bound, and the requested size is kept
+    bool ubatch_auto_dev = false;
+    for (int b = 0; b < ggml_backend_sched_get_n_backends(sched.get()); ++b) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), b));
+        const enum ggml_backend_dev_type type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        ubatch_auto_dev = ubatch_auto_dev || type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+    }
+    if (cparams.n_ubatch_auto_mib > 0 && !ubatch_auto_done && !cparams.training && ubatch_auto_dev) {
         ubatch_auto_done = true;
         const uint32_t ub_min = cparams.n_ubatch;
         const size_t   cap    = (size_t) cparams.n_ubatch_auto_mib*1024*1024;
