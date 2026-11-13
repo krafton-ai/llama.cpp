@@ -514,4 +514,51 @@ kernel void kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4(
         STORE8(y0, o, stride)
     }
 }
+// img4 with each of 4 k-lanes per row reading 8 contiguous k (one half8 load) at stride 32; 64 row slots x 2 rows = 128 rows per group
+kernel void kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4c(
+        global const char * a,
+        ulong oa,
+        ulong sa,
+        read_only image1d_buffer_t qimage,
+        ulong ob,
+        ulong sb,
+        global char * d,
+        ulong od,
+        ulong sd,
+        int K,
+        int M) {
+    const int lid = get_local_id(0), rl = lid / 4, kl = lid % 4;
+    const int head0 = (get_group_id(0) % 4) * 8;
+    const int m0 = (get_group_id(0) / 4) * 128 + rl, m1 = m0 + 64;
+    const global half * a0 = (global const half *) (a + oa + (ulong) min(m0, M - 1) * sa);
+    const global half * a1 = (global const half *) (a + oa + (ulong) min(m1, M - 1) * sa);
+    float8 x0 = 0.0f, y0 = 0.0f;
+    for (int c = kl * 8; c < 576; c += 32) {
+        float8 av = convert_float8(vload8(0, a0 + c));
+        float8 bv = convert_float8(vload8(0, a1 + c));
+#define BOTH(a, b, k)                                                                        {                                                                                            float8 q0 = convert_float8(as_half8(read_imageui(qimage, (k) * 4 + head0 / 8)));         x0 = mad((float8) (a), q0, x0);                                                          y0 = mad((float8) (b), q0, y0);                                                      }
+        BOTH(av.s0, bv.s0, c + 0)
+        BOTH(av.s1, bv.s1, c + 1)
+        BOTH(av.s2, bv.s2, c + 2)
+        BOTH(av.s3, bv.s3, c + 3)
+        BOTH(av.s4, bv.s4, c + 4)
+        BOTH(av.s5, bv.s5, c + 5)
+        BOTH(av.s6, bv.s6, c + 6)
+        BOTH(av.s7, bv.s7, c + 7)
+#undef BOTH
+    }
+    RED8(x0, 1u)
+    RED8(y0, 1u)
+    RED8(x0, 2u)
+    RED8(y0, 2u)
+    const int stride = (int) (sd / sizeof(float));
+    if (kl == 0 && m0 < M) {
+        global float * o = (global float *) (d + od + (ulong) head0 * sd + (ulong) m0 * sizeof(float));
+        STORE8(x0, o, stride)
+    }
+    if (kl == 0 && m1 < M) {
+        global float * o = (global float *) (d + od + (ulong) head0 * sd + (ulong) m1 * sizeof(float));
+        STORE8(y0, o, stride)
+    }
+}
 #endif  // NCOL_R2_PACKED

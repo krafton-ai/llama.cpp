@@ -885,6 +885,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img  = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4 = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4c = nullptr;
     ggml_cl_buffer prealloc_ncol_part;      // the split partial sums of kernel_mul_mat_f16t_f32_ncol_split
     ggml_cl_buffer prealloc_soft_max_sums;  // the softmax row sums for kernel_mul_mat_f16t_f32_ncol_split_norm
     std::mutex     soft_max_sums_mutex;
@@ -1370,6 +1371,7 @@ struct ggml_backend_opencl_context {
             &kernel_mul_mat_ncol_pack_q,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4,
+            &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4c,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8,
             &kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c16,
@@ -1925,6 +1927,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                         ggml_cl_create_optional_kernel(backend_ctx, packed, "kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2", 256);
                     backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4 = ggml_cl_create_optional_kernel(
                         backend_ctx, packed, "kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4", 256);
+                    backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4c = ggml_cl_create_optional_kernel(
+                        backend_ctx, packed, "kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4c", 256);
                 } else if (dot) {
                     CL_CHECK(clReleaseKernel(dot));
                 }
@@ -26239,9 +26243,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         const bool image  = want_image && backend_ctx->ncol_q_packed_image;
         const bool image2 = image && backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2;
         const bool image4 = image2 && backend_ctx->ncol_q_packed_image4;
+        const bool image4c = image4 && backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4c;
 
         cl_kernel kernel = backend_ctx->kernel_mul_mat_f16_f32_ncol;
-        if (image4) {
+        if (image4c) {
+            kernel = backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4c;
+        } else if (image4) {
             kernel = backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img4;
         } else if (image2) {
             kernel = backend_ctx->kernel_mul_mat_f16_f32_ncol_r2_k576_pq_c8_img2;
@@ -26285,7 +26292,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         // NCOL_ROWS_WG rows per group; c8 / c16 split the 32 heads over 4 / 2 groups
         size_t lws[1] = { 256 };
-        size_t gws[1] = { (size_t) CEIL_DIV(M, 64) * 256 * (c8 ? 4 : c16 ? 2 : 1) };
+        // img4c covers 128 rows per group
+        size_t gws[1] = { (size_t) CEIL_DIV(M, image4c ? 128 : 64) * 256 * (c8 ? 4 : c16 ? 2 : 1) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, dst);
         if (packed) {
             backend_ctx->ncol_q_mutex.unlock();
