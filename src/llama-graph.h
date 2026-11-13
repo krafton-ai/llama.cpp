@@ -402,10 +402,17 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // per-query key limits for FLASH_ATTN_EXT in place of get_kq_mask() (I32 [1, n_batch padded]), or nullptr when
+    // they cannot express the mask of this ubatch or are off (cparams.kq_limits). Created on the first call
+    ggml_tensor * get_kq_limits(ggml_context * ctx0, const llama_ubatch & ubatch);
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    ggml_tensor * self_kq_limits   = nullptr; // I32 [1, n_batch padded] when the graph uses the limits
+    bool          kq_limits_asked  = false;   // the graph asked for the limits (their use then depends on the cells)
 
     const llama_hparams hparams;
     const llama_cparams cparams;

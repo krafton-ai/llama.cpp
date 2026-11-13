@@ -1802,6 +1802,59 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+// A query of the ubatch sees cell j of the first n_kv cells iff vis(j) <= its position, with vis(j) the position of the
+// cell when it holds the sequence of the ubatch and INT32_MAX otherwise (the KQ mask of set_input_kq_mask_impl for one
+// sequence, causal, without SWA, ALiBi or 2-D positions). When vis is non-decreasing over [0, n_kv) the seen rows are
+// [0, limit] for every query, and a per-query limit replaces the mask
+static void kq_limits_vis(const llama_kv_cells & cells, llama_seq_id seq_id, uint32_t n_kv, std::vector<llama_pos> & vis) {
+    vis.resize(n_kv);
+    for (uint32_t j = 0; j < n_kv; ++j) {
+        vis[j] = !cells.is_empty(j) && cells.seq_has(j, seq_id) ? cells.pos_get(j) : INT32_MAX;
+    }
+}
+
+bool llama_kv_cache::can_use_kq_limits(const llama_ubatch & ubatch, uint32_t n_kv, bool causal_attn) const {
+    if (!causal_attn || swa_type != LLAMA_SWA_TYPE_NONE || hparams.use_alibi || hparams.n_pos_per_embd() != 1 ||
+            ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1) {
+        return false;
+    }
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq_id) {
+            return false;
+        }
+    }
+    const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+    if (n_kv > cells.size()) {
+        return false;
+    }
+    std::vector<llama_pos> vis;
+    kq_limits_vis(cells, seq_id, n_kv, vis);
+    return std::is_sorted(vis.begin(), vis.end());
+}
+
+void llama_kv_cache::set_input_kq_limits(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[0] == 1 && dst->ne[1] >= ubatch->n_tokens);
+
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+
+    std::vector<llama_pos> vis;
+    kq_limits_vis(cells, seq_id, n_kv, vis);
+    GGML_ASSERT(std::is_sorted(vis.begin(), vis.end()));
+
+    int32_t * data = (int32_t *) dst->data;
+    for (int64_t i = 0; i < dst->ne[1]; ++i) {
+        if (i < ubatch->n_tokens) {
+            // the last row with vis <= pos (-1: none)
+            data[i] = (int32_t) (std::upper_bound(vis.begin(), vis.end(), ubatch->pos[i]) - vis.begin()) - 1;
+        } else {
+            data[i] = -1;
+        }
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2943,6 +2996,14 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::can_use_kq_limits(const llama_ubatch & ubatch, bool causal_attn) const {
+    return kv->can_use_kq_limits(ubatch, n_kv, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_limits(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_kq_limits(dst, ubatch, n_kv);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

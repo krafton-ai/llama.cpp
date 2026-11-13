@@ -236,6 +236,11 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // per-query key limits instead of the KQ mask (FLASH_ATTN_EXT with an I32 mask): possible when the rows of the first
+    // n_kv cells a query sees always form a prefix [0, limit] (see the implementation)
+    bool can_use_kq_limits   (const llama_ubatch & ubatch, uint32_t n_kv, bool causal_attn) const;
+    void set_input_kq_limits (ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -431,6 +436,9 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    bool can_use_kq_limits   (const llama_ubatch & ubatch, bool causal_attn) const;
+    void set_input_kq_limits (ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

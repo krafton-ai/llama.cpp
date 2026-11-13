@@ -352,6 +352,10 @@ ggml_tensor * llama_model_raon1_nano::graph::build_mla_layer(
             ggml_build_forward_expand(gf, mctx_k->cpy_k(ctx0, k_cur, inp_attn_k->get_k_idxs(), il));
             const int64_t n_kv = kc->ne[2];
             ggml_tensor * kc2 = ggml_view_2d(ctx0, kc, rank + nr, n_kv, kc->nb[2], 0);
+            // per-query key limits instead of the [n_kv, n_tokens] mask when they express it (one sequence, cells in
+            // position order): the attention then needs no mask in the compute buffer
+            ggml_tensor * kq_limits = inp_attn_k->get_kq_limits(ctx0, ubatch);
+            ggml_tensor * kq_mask   = kq_limits ? kq_limits : inp_attn_k->get_kq_mask();
             ggml_tensor * out = nullptr;
             for (int64_t h0 = 0; h0 < n_head; h0 += g) {
                 ggml_tensor * kvg = ggml_mla_expand_kv(ctx0, kc2, layer.wk_b, layer.wv_b, (int32_t) h0, (int32_t) g);
@@ -360,7 +364,7 @@ ggml_tensor * llama_model_raon1_nano::graph::build_mla_layer(
                 ggml_tensor * kg = ggml_view_3d(ctx0, kvg, nk, g, n_kv, nk*e16, nk*g*e16, 0);
                 ggml_tensor * vg = ggml_view_3d(ctx0, kvg, nv, g, n_kv, nv*e16, nv*g*e16, nk*g*n_kv*e16);
                 ggml_tensor * qg = ggml_view_3d(ctx0, q, nk, g, n_tokens, nk*q->nb[0], q->nb[1], h0*nk*q->nb[0]);
-                ggml_tensor * og = build_attn_mha(qg, kg, vg, nullptr, inp_attn_k->get_kq_mask(), nullptr, nullptr, 0, 1.0f/sqrtf(nk), il);
+                ggml_tensor * og = build_attn_mha(qg, kg, vg, nullptr, kq_mask, nullptr, nullptr, 0, 1.0f/sqrtf(nk), il);
                 out = out ? ggml_concat(ctx0, out, og, 0) : og;
             }
             cb(out, "mla_expanded", il);

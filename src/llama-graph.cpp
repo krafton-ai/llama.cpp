@@ -578,7 +578,25 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    // a graph that uses the key limits may not use the mask, which is then not allocated
+    if (self_kq_mask->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
+    if (self_kq_limits && self_kq_limits->buffer) {
+        mctx->set_input_kq_limits(self_kq_limits, ubatch);
+    }
+}
+
+ggml_tensor * llm_graph_input_attn_k::get_kq_limits(ggml_context * ctx0, const llama_ubatch & ubatch) {
+    if (!kq_limits_asked) {
+        kq_limits_asked = true;
+        if (cparams.kq_limits && mctx->can_use_kq_limits(ubatch, cparams.causal_attn)) {
+            self_kq_limits = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, 1, ubatch.n_tokens, 1, 1);
+            ggml_set_input(self_kq_limits);
+            ggml_set_name(self_kq_limits, "kq_limits");
+        }
+    }
+    return self_kq_limits;
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
@@ -593,6 +611,12 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // the graph is built for the key limits or the mask: the cells must allow the same choice
+    if (kq_limits_asked) {
+        res &= (self_kq_limits != nullptr) == (params.cparams.kq_limits && mctx->can_use_kq_limits(params.ubatch, params.cparams.causal_attn));
+        res &= self_kq_limits == nullptr || self_kq_limits->ne[1] == params.ubatch.n_tokens;
+    }
 
     return res;
 }
@@ -1215,7 +1239,13 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // a graph that uses the key limits may not use the mask, which is then not allocated
+    if (inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
+    if (inp_attn->self_kq_limits && inp_attn->self_kq_limits->buffer) {
+        mctx->get_attn()->set_input_kq_limits(inp_attn->self_kq_limits, ubatch);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1240,6 +1270,13 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    // the graph is built for the key limits or the mask: the cells must allow the same choice
+    if (inp_attn->kq_limits_asked) {
+        res &= (inp_attn->self_kq_limits != nullptr) ==
+            (params.cparams.kq_limits && mctx->get_attn()->can_use_kq_limits(params.ubatch, params.cparams.causal_attn));
+        res &= inp_attn->self_kq_limits == nullptr || inp_attn->self_kq_limits->ne[1] == params.ubatch.n_tokens;
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 

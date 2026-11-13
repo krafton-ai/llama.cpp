@@ -338,6 +338,7 @@ llama_context::llama_context(
     // the expansion reads a latent MLA cache; other models do not reserve its probe graph
     cparams.mla_expand      = model.hparams.is_mla();
     cparams.auto_mla_expand = model.hparams.is_mla();
+    cparams.kq_limits       = model.hparams.is_mla();
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -722,6 +723,24 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             }
 
             cparams.mla_expand = found && supported;
+
+            // the flash attention of the expanded prefill with per-query key limits (an I32 mask), as reserved
+            if (cparams.mla_expand && cparams.kq_limits) {
+                for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+                    if (node.op != LLM_FUSED_OP_FLASH_ATTN || node.tensor->src[3] == nullptr ||
+                            node.tensor->src[3]->type != GGML_TYPE_I32) {
+                        continue;
+                    }
+                    ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+                    if (device_layer && !ggml_backend_dev_supports_op(device_layer, node.tensor)) {
+                        cparams.kq_limits = false;
+                        LLAMA_LOG_INFO("%s: flash attention with per-query key limits not supported, using the KQ mask\n", func);
+                        break;
+                    }
+                }
+            } else {
+                cparams.kq_limits = false;
+            }
             if (!found) {
                 LLAMA_LOG_DEBUG("%s: %s not used by this graph, set to disabled\n", func, probe.name);
             } else if (!supported) {
