@@ -4843,6 +4843,7 @@ struct test_hc_site_ple : public test_case {
     const int64_t   nt;
     const ggml_type type_fn;
     const bool      ple;
+    const ggml_type type_gate;
 
     std::vector<ggml_tensor *> checked;
 
@@ -4852,7 +4853,11 @@ struct test_hc_site_ple : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_embd, hc, nt, type_fn, ple);
+        std::string v = VARS_TO_STR5(n_embd, hc, nt, type_fn, ple);
+        if (type_gate != GGML_TYPE_F32) {
+            v += "," + VAR_TO_STR(type_gate);
+        }
+        return v;
     }
 
     bool run_whole_graph() override { return true; }
@@ -4860,11 +4865,14 @@ struct test_hc_site_ple : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
 
     double max_nmse_err() override {
-        return type_fn == GGML_TYPE_F16 ? 5e-4 : 1e-5;
+        // a quantized gate: the backends quantize the stream sum differently (q8_1, q8_0, ...)
+        return type_fn == GGML_TYPE_F16 || type_gate != GGML_TYPE_F32 ? 5e-4 : 1e-5;
     }
 
-    test_hc_site_ple(int64_t n_embd = 1536, int64_t hc = 4, int64_t nt = 1, ggml_type type_fn = GGML_TYPE_F16, bool ple = true)
-        : n_embd(n_embd), hc(hc), nt(nt), type_fn(type_fn), ple(ple) {}
+    // type_gate: the gate projection of the stream sum (a quantized one lets a backend quantize the sum in the hc_post)
+    test_hc_site_ple(int64_t n_embd = 1536, int64_t hc = 4, int64_t nt = 1, ggml_type type_fn = GGML_TYPE_F16, bool ple = true,
+            ggml_type type_gate = GGML_TYPE_F32)
+        : n_embd(n_embd), hc(hc), nt(nt), type_fn(type_fn), ple(ple), type_gate(type_gate) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         return build_graph(ctx, ctx);
@@ -4917,7 +4925,7 @@ struct test_hc_site_ple : public test_case {
         checked = { mixes, sg, cur, out };
 
         if (ple) {
-            ggml_tensor * gate      = weight("gate", GGML_TYPE_F32, n_embd, n_ple);
+            ggml_tensor * gate      = weight("gate", type_gate, n_embd, n_ple);
             ggml_tensor * proj      = weight("proj", GGML_TYPE_F32, n_ple, n_embd);
             ggml_tensor * post_norm = weight("post_norm", GGML_TYPE_F32, n_embd);
             ggml_tensor * inp_ple   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ple, nt, 2);
@@ -11980,6 +11988,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_site_ple(64, 2, 1, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_hc_site_ple(4096, 6, 1, GGML_TYPE_F16, false));
     test_cases.emplace_back(new test_hc_site_ple(75, 3, 1, GGML_TYPE_F32, true));
+    // a quantized gate of the stream sum: one token may take the q8_1 copy of the sum from the hc_post
+    for (ggml_type type_gate : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+        for (int64_t nt : { 1, 2 }) {
+            test_cases.emplace_back(new test_hc_site_ple(1536, 4, nt, GGML_TYPE_F16, true, type_gate));
+        }
+    }
+    test_cases.emplace_back(new test_hc_site_ple(96, 3, 1, GGML_TYPE_F32, true, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_dsv4_hc_post_stream_sum(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post_stream_sum(1536, 1));
     test_cases.emplace_back(new test_dsv4_hc_post_stream_sum(31, 17));

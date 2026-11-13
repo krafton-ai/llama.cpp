@@ -4803,8 +4803,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             sel.scale = ggml_get_op_params_f32(sc, 0);
             sel.bias  = ggml_get_op_params_f32(sc, 1);
             if (ggml_cuda_hc_io_ok({ post->src[0], post->src[1], post->src[2], sel.K, sel.mixes, sel.r, sel.c0 }, { post, sum })) {
-                ggml_cuda_op_hc_post_fused(*cuda_ctx, post, sel, sum);
-                return pm.n_nodes - 1;
+                // one token: the following one-row quantized MUL_MATs of the stream sum read its q8_1 copy
+                const int n_mm = sum ? ggml_cuda_match_mat_vec_q_after(cuda_ctx, cgraph, i, i + pm.n_nodes, sum) : 0;
+                const ggml_cuda_q8_1_row q8_1(cuda_ctx, n_mm, sum ? sum->ne[0] : 0);
+                ggml_cuda_op_hc_post_fused(*cuda_ctx, post, sel, sum, q8_1.buf.ptr, q8_1.ncols_padded);
+                ggml_cuda_mul_mat_vec_q_after(cuda_ctx, cgraph, i + pm.n_nodes, n_mm, q8_1);
+                return pm.n_nodes - 1 + n_mm;
             }
         }
         if (node->op == GGML_OP_RMS_NORM && ggml_cuda_match_rms_norm_mul_add_streams(cgraph, i, m)) {

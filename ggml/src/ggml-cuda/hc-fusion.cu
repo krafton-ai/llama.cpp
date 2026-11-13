@@ -580,7 +580,8 @@ static __global__ void hc_select_post_f32(
         const hc_select_kparams sel, const int n, const int hc,
         const int64_t sx0, const int64_t sx1, const int64_t sr0, const int64_t sr1, const int64_t sr2,
         const int64_t sp0, const int64_t sp1,
-        const int64_t sd0, const int64_t sd1, const int64_t sd2, const int64_t ss0, const int64_t ss1) {
+        const int64_t sd0, const int64_t sd1, const int64_t sd2, const int64_t ss0, const int64_t ss1,
+        block_q8_1 * q8, const int n_padded) {
     const int i       = blockIdx.x*blockDim.x + threadIdx.x;
     const int t       = blockIdx.y;
     const int lane    = threadIdx.x % WARP_SIZE;
@@ -636,29 +637,31 @@ static __global__ void hc_select_post_f32(
     }
     __syncthreads();
 
-    if (i >= n) {
-        return;
-    }
-
     float tot = 0.0f;
-    for (int d = 0; d < hc; ++d) {
-        float v = xv*s_post[d];
+    if (i < n) {
+        for (int d = 0; d < hc; ++d) {
+            float v = xv*s_post[d];
 #pragma unroll
-        for (int s = 0; s < HC_MAX; ++s) {
-            if (s < hc) {
-                v += r[s]*s_comb[d + hc*s];
+            for (int s = 0; s < HC_MAX; ++s) {
+                if (s < hc) {
+                    v += r[s]*s_comb[d + hc*s];
+                }
             }
+            dst[i*sd0 + d*sd1 + t*sd2] = v;
+            tot = d == 0 ? v : tot + v;
         }
-        dst[i*sd0 + d*sd1 + t*sd2] = v;
-        tot = d == 0 ? v : tot + v;
+        if constexpr (with_sum) {
+            sum[i*ss0 + t*ss1] = tot;
+        }
     }
-    if constexpr (with_sum) {
-        sum[i*ss0 + t*ss1] = tot;
+    // n_padded is a multiple of WARP_SIZE: the condition is the same for all lanes of a warp
+    if (with_sum && q8 != nullptr && i < n_padded) {
+        quantize_q8_1_store(tot, q8, i);
     }
 }
 
 void ggml_cuda_op_hc_post_fused(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post,
-        const ggml_cuda_hc_select_args & sel, ggml_tensor * sum) {
+        const ggml_cuda_hc_select_args & sel, ggml_tensor * sum, void * sum_q8_1, const int64_t ncols_padded) {
     const ggml_tensor * x    = hc_post->src[0];
     const ggml_tensor * res  = hc_post->src[1];
     const ggml_tensor * post = hc_post->src[2];
@@ -689,8 +692,13 @@ void ggml_cuda_op_hc_post_fused(ggml_backend_cuda_context & ctx, ggml_tensor * h
     kp.scale = sel.scale;
     kp.bias  = sel.bias;
 
+    GGML_ASSERT(sum_q8_1 == nullptr || (sum != nullptr && nt == 1 && ncols_padded >= n && ncols_padded % QK8_1 == 0 &&
+                ncols_padded <= INT_MAX));
+    // with the q8_1 copy of the sum the threads cover its zero padding too
+    const int n_threads = sum_q8_1 ? (int) ncols_padded : n;
+
     const int block_size = 256;
-    const ggml_cuda_kernel_launch_params lp(dim3((n + block_size - 1)/block_size, nt), dim3(block_size), 0, ctx.stream());
+    const ggml_cuda_kernel_launch_params lp(dim3((n_threads + block_size - 1)/block_size, nt), dim3(block_size), 0, ctx.stream());
     ggml_cuda_kernel_launch(sum ? hc_select_post_f32<true> : hc_select_post_f32<false>, lp,
             (const float *) x->data, (const float *) res->data, (const float *) post->data,
             (float *) hc_post->data, sum ? (float *) sum->data : nullptr, kp, n, hc,
@@ -698,7 +706,8 @@ void ggml_cuda_op_hc_post_fused(ggml_backend_cuda_context & ctx, ggml_tensor * h
             (int64_t) (res->nb[0]/f), (int64_t) (res->nb[1]/f), (int64_t) (res->nb[2]/f),
             (int64_t) (post->nb[0]/f), (int64_t) (post->nb[1]/f),
             (int64_t) (hc_post->nb[0]/f), (int64_t) (hc_post->nb[1]/f), (int64_t) (hc_post->nb[2]/f),
-            sum ? (int64_t) (sum->nb[0]/f) : (int64_t) 0, sum ? (int64_t) (sum->nb[1]/f) : (int64_t) 0);
+            sum ? (int64_t) (sum->nb[0]/f) : (int64_t) 0, sum ? (int64_t) (sum->nb[1]/f) : (int64_t) 0,
+            (block_q8_1 *) sum_q8_1, (int) ncols_padded);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

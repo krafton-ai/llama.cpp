@@ -34,9 +34,10 @@ struct ggml_cuda_hc_select_args {
 };
 
 // DSV4_HC_POST with its comb input computed in the kernel, and optionally the sum of its hc output streams
-// (sum != nullptr: the VIEW x hc -> ADD x (hc - 1) chain)
+// (sum != nullptr: the VIEW x hc -> ADD x (hc - 1) chain).
+// sum_q8_1 (one token): also writes the sum quantized to q8_1 for mul_mat_vec_q, zero padded to ncols_padded
 void ggml_cuda_op_hc_post_fused(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post,
-        const ggml_cuda_hc_select_args & sel, ggml_tensor * sum);
+        const ggml_cuda_hc_select_args & sel, ggml_tensor * sum, void * sum_q8_1 = nullptr, int64_t ncols_padded = 0);
 
 // RMS_NORM(g) -> MUL(w) -> RESHAPE(n, 1, rows) -> ADD(streams [n, hc, rows], .): the normed row added to every stream
 void ggml_cuda_op_rms_norm_mul_add_streams(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
