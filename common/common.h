@@ -297,6 +297,7 @@ struct common_params_sampling {
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
+    bool greedy_argmax    = false; // the caller reads only the sampled tokens, not the candidates: a greedy chain may take the argmax directly
 
     // print the parameters into a string
     std::string print() const;

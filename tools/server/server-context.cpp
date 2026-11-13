@@ -1923,6 +1923,8 @@ private:
         // initialize samplers
         if (task.need_sampling()) {
             try {
+                // the slot reads only the sampled tokens unless probabilities are requested (n_probs, checked by the sampler)
+                task.params.sampling.greedy_argmax = true;
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
