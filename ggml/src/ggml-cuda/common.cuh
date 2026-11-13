@@ -1485,6 +1485,10 @@ struct ggml_backend_cuda_context {
     size_t q8_1_arena_size = 0;
     size_t q8_1_arena_used = 0;
 
+    // the f_a product of the fused one-token RDA gates (ggml_cuda_op_rda_pre)
+    void * rda_pre_scratch      = nullptr;
+    size_t rda_pre_scratch_size = 0;
+
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH

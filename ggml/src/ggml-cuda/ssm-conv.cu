@@ -386,3 +386,154 @@ void ggml_cuda_op_conv_state(ggml_backend_cuda_context & ctx, const ggml_cuda_co
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// one token of a gated delta net layer with a write/erase ratio: the conv state update of
+// ggml_cuda_op_conv_state (with the L2 norm of the q and k heads) and the two gates in one launch.
+// Blocks below conv_blocks: conv_state_f32<nc, true> for one head of l2_n channels; the v heads also scale their outputs
+// by sigmoid(a)/sigmoid(b) of their head (as sigmoid_ratio_mul_f32) and write sigmoid(b).
+// The other blocks: two rows of the f_b product per block, 64 threads per row, the sum of each row as mul_mat_vec_f
+// with a block of 64 threads sums it (one float2 per thread, warp sums, then the sum of the two warp sums), then the
+// decay gate scale*sigmoid(row + bias) + offset (as add_sigmoid_scale_f32)
+
+static __device__ __forceinline__ float rda_pre_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x)); // op_sigmoid of unary.cu
+}
+
+template <int nc>
+static __global__ void rda_pre_f32(const ggml_cuda_conv_state_args a, const ggml_cuda_rda_gates_args g) {
+    if ((int) blockIdx.x < g.conv_blocks) {
+        const int64_t c     = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+        const bool    valid = c < a.n_ch;
+
+        const float * state = a.state;
+        if (a.state_row != nullptr) {
+            state += (int64_t) a.state_row[0]*a.state_row_stride;
+        }
+
+        float st[nc - 1];
+        float w[nc];
+#pragma unroll
+        for (int j = 0; j < nc - 1; ++j) {
+            st[j] = valid ? state[c*a.state_stride_c + j] : 0.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < nc; ++j) {
+            w[j] = valid ? a.w[c*a.w_stride_c + j] : 0.0f;
+        }
+
+        float win[nc];
+#pragma unroll
+        for (int j = 0; j < nc - 1; ++j) {
+            win[j] = st[j];
+        }
+        win[nc - 1] = valid ? a.x[c*a.x_stride_c] : 0.0f;
+
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < nc; ++j) {
+            sumf += win[j]*w[j];
+        }
+        const float out = ggml_cuda_op_silu_single(sumf);
+        if (valid) {
+            a.y[c] = out;
+        }
+
+        __shared__ float s_sum[32];
+        if ((int64_t) blockIdx.x*blockDim.x < a.l2_nc) { // the same for the whole block
+            float sum = warp_reduce_sum(valid ? out*out : 0.0f);
+            if (threadIdx.x % WARP_SIZE == 0) {
+                s_sum[threadIdx.x / WARP_SIZE] = sum;
+            }
+            __syncthreads();
+            const int lane = threadIdx.x % WARP_SIZE;
+            sum = lane < (int) (blockDim.x / WARP_SIZE) ? s_sum[lane] : 0.0f;
+            sum = warp_reduce_sum(sum);
+            __syncthreads();
+            if (valid) {
+                a.y_l2[c] = out*rsqrtf(fmaxf(sum, a.l2_eps*a.l2_eps));
+            }
+        }
+
+        // the v heads: v*(sigmoid(a)/sigmoid(b)) of the head, and sigmoid(b)
+        const int64_t cv = c - g.v_off;
+        if (valid && cv >= 0 && cv < (int64_t) g.head*g.n_head) {
+            const int r  = (int) (cv / g.head);
+            const int i0 = (int) (cv - (int64_t) r*g.head);
+            const float sa = rda_pre_sigmoid(g.a[r]);
+            const float sb = rda_pre_sigmoid(g.b[r]);
+            g.v_dst[cv] = out*(sa/sb);
+            if (i0 == 0) {
+                g.sig_b[r] = sb;
+            }
+        }
+
+        if (!valid) {
+            return;
+        }
+        for (int k = 0; k < a.n_copies; ++k) {
+#pragma unroll
+            for (int j = 0; j < nc - 1; ++j) {
+                const int p = a.copy_start[k] + j;
+                a.copy_dst[k][c*(nc - 1) + j] = p < nc - 1 ? st[p] : a.x[(p - (nc - 1))*a.x_stride_t + c*a.x_stride_c];
+            }
+        }
+        return;
+    }
+
+    // f_b rows and the decay gate
+    __shared__ float s_w[4];
+    const int hb   = threadIdx.x / 64; // which of the two rows of the block
+    const int tid  = threadIdx.x % 64;
+    const int row  = 2*((int) blockIdx.x - g.conv_blocks) + hb;
+    float sum = 0.0f;
+    if (row < g.d_inner && tid < g.rank/2) {
+        const float2 y2 = ((const float2 *) g.fa)[tid];
+        if (g.fb_type == 0) {
+            const float2 x2 = ((const float2 *) ((const float *) g.fb_w + (int64_t) row*g.fb_stride_row))[tid];
+            ggml_cuda_mad(sum, x2.x, y2.x);
+            ggml_cuda_mad(sum, x2.y, y2.y);
+        } else if (g.fb_type == 1) {
+            const float2 x2 = __half22float2(((const half2 *) ((const half *) g.fb_w + (int64_t) row*g.fb_stride_row))[tid]);
+            ggml_cuda_mad(sum, x2.x, y2.x);
+            ggml_cuda_mad(sum, x2.y, y2.y);
+        } else {
+#ifdef FP16_AVAILABLE
+            const half2 x2 = ((const half2 *) ((const half *) g.fb_w + (int64_t) row*g.fb_stride_row))[tid];
+            half2 sumh2 = make_half2(0.0f, 0.0f);
+            sumh2 += x2 * make_half2(y2.x, y2.y);
+            sum = __low2float(sumh2) + __high2float(sumh2);
+#else
+            NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+        }
+    }
+    sum = warp_reduce_sum(sum);
+    if (threadIdx.x % WARP_SIZE == 0) {
+        s_w[threadIdx.x / WARP_SIZE] = sum;
+    }
+    __syncthreads();
+    if (tid == 0 && row < g.d_inner) {
+        const float y = s_w[2*hb] + s_w[2*hb + 1];
+        if (g.fb_out) {
+            g.fb_out[row] = y;
+        }
+        const float v = y + g.dt_b[row % g.bias_n];
+        g.g_out[row] = g.scale*rda_pre_sigmoid(v) + g.offset;
+    }
+}
+
+void ggml_cuda_op_rda_pre(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state_args & args,
+        ggml_cuda_rda_gates_args gates) {
+    GGML_ASSERT(args.n_t == 1 && args.y_l2 != nullptr && args.l2_n == 128 && gates.rank <= 128 && gates.rank % 2 == 0);
+    gates.conv_blocks = (int) ((args.n_ch + args.l2_n - 1) / args.l2_n);
+    const dim3 blocks(gates.conv_blocks + (gates.d_inner + 1)/2, 1, 1);
+    cudaStream_t stream = ctx.stream();
+    switch (args.nc) {
+        case 3: rda_pre_f32<3><<<blocks, 128, 0, stream>>>(args, gates); break;
+        case 4: rda_pre_f32<4><<<blocks, 128, 0, stream>>>(args, gates); break;
+        case 5: rda_pre_f32<5><<<blocks, 128, 0, stream>>>(args, gates); break;
+        default: GGML_ABORT("unsupported conv width %d", args.nc);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

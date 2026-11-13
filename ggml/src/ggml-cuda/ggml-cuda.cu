@@ -749,6 +749,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (q8_1_arena != nullptr) {
         CUDA_CHECK(cudaFree(q8_1_arena));
     }
+    if (rda_pre_scratch != nullptr) {
+        CUDA_CHECK(cudaFree(rda_pre_scratch));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -3579,6 +3582,228 @@ static int ggml_cuda_match_rda_gates(ggml_backend_cuda_context * cuda_ctx, const
     return j_mm + 3;
 }
 
+// true if every use of the node at t_idx, directly or through views that are nodes of this graph, is by a node at an
+// index of at most last, and the node is not a graph output
+static bool ggml_cuda_uses_end_by(const ggml_cgraph * cgraph, int t_idx, int last) {
+    const ggml_tensor * t = cgraph->nodes[t_idx];
+    if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    constexpr int max_views = 16;
+    const ggml_tensor * views[max_views] = { t };
+    int32_t             left[max_views]  = { ggml_cuda_tensor_use_count(cgraph, t) };
+    int                 n_views          = 1;
+    int32_t             n_left           = left[0];
+    for (int j = t_idx + 1; j <= last && j < cgraph->n_nodes && n_left > 0; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s == nullptr || ggml_cuda_view_root(s) != t) {
+                continue;
+            }
+            int v = 0;
+            while (v < n_views && views[v] != s) {
+                ++v;
+            }
+            if (v == n_views || left[v] == 0) {
+                return false;
+            }
+            left[v]--;
+            n_left--;
+        }
+        if (n->view_src == t) {
+            if (n_views == max_views || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return false;
+            }
+            views[n_views] = n;
+            left[n_views]  = ggml_cuda_tensor_use_count(cgraph, n);
+            n_left        += left[n_views++];
+        }
+    }
+    return n_left == 0;
+}
+
+// the scratch buffer of the f_a product of ggml_cuda_op_rda_pre: outside the graph allocation, so no node of the fused
+// range can share its memory. Created outside of stream capture (the first evaluations of a graph run eagerly); nullptr
+// when it is missing during a capture or too small
+static float * ggml_cuda_rda_pre_scratch(ggml_backend_cuda_context * cuda_ctx, size_t size) {
+    if (cuda_ctx->rda_pre_scratch == nullptr) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx->stream(), &capture));
+        if (capture != cudaStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        cuda_ctx->rda_pre_scratch_size = 64*1024;
+        CUDA_CHECK(cudaMalloc(&cuda_ctx->rda_pre_scratch, cuda_ctx->rda_pre_scratch_size));
+    }
+    return size <= cuda_ctx->rda_pre_scratch_size ? (float *) cuda_ctx->rda_pre_scratch : nullptr;
+}
+
+// one token of a gated delta net layer with a write/erase ratio: the conv state update matched at m, the f_a product
+// (MUL_MAT of the layer input, run first) and the two gates (ggml_cuda_match_rda_gates) in one launch. Every computed node
+// from the conv up to the decay gate must be one of these; the f_a product, run before the conv, may not overlap any
+// tensor the conv reads or writes. Returns the index of the gate SCALE (the last node), or -1
+static int ggml_cuda_match_rda_pre(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
+        const ggml_cuda_conv_state_match & m, int & j_fa, ggml_cuda_rda_gates_args & ga) {
+    const ggml_cuda_conv_state_args & ca = m.args;
+    if (ca.n_t != 1 || ca.y_l2 == nullptr || ca.l2_n != 128 || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return -1;
+    }
+    // the first SIGMOID after the conv starts the gates
+    int j0 = -1;
+    for (int j = m.last + 1; j < cgraph->n_nodes && j0 < 0; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_UNARY && ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID) {
+            j0 = j;
+        }
+    }
+    if (j0 < 0) {
+        return -1;
+    }
+    int j_b, j_ratio, j_mm;
+    const int j_mul = ggml_cuda_match_sigmoid_ratio_mul(cgraph, j0, j_b, j_ratio);
+    if (j_mul < 0) {
+        return -1;
+    }
+    const int j_scale = ggml_cuda_match_rda_gates(cuda_ctx, cgraph, j0, j_b, j_ratio, j_mul, j_mm);
+    if (j_scale < 0) {
+        return -1;
+    }
+    const ggml_tensor * sa    = cgraph->nodes[j0];
+    const ggml_tensor * sb    = cgraph->nodes[j_b];
+    const ggml_tensor * mul   = cgraph->nodes[j_mul];
+    const ggml_tensor * ratio = cgraph->nodes[j_ratio];
+    const ggml_tensor * div   = ratio->view_src;
+    const ggml_tensor * v     = mul->src[0] == ratio ? mul->src[1] : mul->src[0];
+    const ggml_tensor * mm    = cgraph->nodes[j_mm];
+    const ggml_tensor * add   = cgraph->nodes[j_mm + 1];
+    const ggml_tensor * scale = cgraph->nodes[j_scale];
+    const ggml_tensor * bias  = add->src[1];
+
+    // f_a: the product whose output holds a and b (and the f_b input)
+    const ggml_tensor * fab = ggml_cuda_view_root(sa->src[0]);
+    j_fa = -1;
+    for (int j = m.last + 1; j < j0; ++j) {
+        if (cgraph->nodes[j] == fab) {
+            j_fa = j;
+        }
+    }
+    if (j_fa < 0 || fab->op != GGML_OP_MUL_MAT || ggml_cuda_view_root(sb->src[0]) != fab ||
+            ggml_cuda_view_root(mm->src[1]) != fab || fab->type != GGML_TYPE_F32 || ggml_nrows(fab) != 1) {
+        return -1;
+    }
+    // f_a is written to the scratch buffer only: nothing after the decay gate may read it
+    if (!ggml_cuda_uses_end_by(cgraph, j_fa, j_scale)) {
+        return -1;
+    }
+    // nothing else is computed between the conv and the decay gate
+    for (int j = m.last + 1; j <= j_scale; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (j != j_fa && j != j0 && j != j_b && n != div && j != j_mul && j != j_mm && j != j_mm + 1 && j != j_mm + 2 &&
+                j != j_scale) {
+            return -1;
+        }
+    }
+    // f_a goes to a scratch buffer outside the graph (ggml_cuda_rda_pre_scratch), read by all blocks of the launch.
+    // The outputs of the gates are written by blocks that run with the conv blocks, which read x and the state: in the
+    // graph order they are written later, so the allocator may have placed them on x or the state. They may not overlap
+    // what any block reads, nor the conv outputs
+    const ggml_tensor * conv = cgraph->nodes[m.conv];
+    const ggml_tensor * cat  = conv->src[0];
+    {
+        // the f_b product (mm) is consumed by the decay gate only: the fused kernel does not write it. A state taken
+        // from a cache row is read from the cache, not from its gathered copy (cat->src[0])
+        const ggml_tensor * gate_out[] = { sb, mul, scale };
+        const ggml_tensor * read_or_conv_out[] = { ca.state_row ? nullptr : cat->src[0], cat->src[1], cgraph->nodes[m.last], cgraph->nodes[m.conv + 1] };
+        for (const ggml_tensor * o : gate_out) {
+            for (const ggml_tensor * t : read_or_conv_out) {
+                // the ratio product may be the v view of the conv output itself (same element, same thread)
+                if (t == nullptr || (o == mul && mul->data == v->data)) {
+                    continue;
+                }
+                if (ggml_cuda_tensors_overlap(o, t)) {
+                    GGML_LOG_DEBUG("%s: %s overlaps %s\n", __func__, o->name, t->name);
+                    return -1;
+                }
+            }
+        }
+        for (const ggml_tensor * o : gate_out) {
+            for (const ggml_tensor * o2 : gate_out) {
+                if (o != o2 && ggml_cuda_tensors_overlap(o, o2)) {
+                    GGML_LOG_DEBUG("%s: %s overlaps %s\n", __func__, o->name, o2->name);
+                    return -1;
+                }
+            }
+        }
+    }
+    for (int k = 0; k < ca.n_copies; ++k) {
+        const int64_t f0 = (int64_t) fab->data, f1 = f0 + (int64_t) ggml_nbytes(fab);
+        const int64_t c0 = (int64_t) ca.copy_dst[k], c1 = c0 + (int64_t) (ca.nc - 1)*ca.n_ch*(int64_t) sizeof(float);
+        if (f0 < c1 && c0 < f1) {
+            return -1;
+        }
+    }
+    // a state read from a cache row: the cache is not a compute buffer, f_a cannot overlap it
+    // one token: a and b one value per head, v a view of the conv output with heads of l2_n channels
+    const ggml_tensor * silu = cgraph->nodes[m.conv + 1];
+    const ggml_tensor * a    = sa->src[0];
+    const ggml_tensor * b    = sb->src[0];
+    const int n_head = (int) a->ne[0];
+    if (ggml_nrows(a) != 1 || v->view_src != silu || v->ne[0] != ca.l2_n || v->ne[1] != n_head || v->ne[2] != 1 ||
+            v->ne[3] != 1 || v->nb[1] != (size_t) ca.l2_n*sizeof(float) || v->view_offs % (ca.l2_n*sizeof(float)) != 0 ||
+            (int64_t) (v->view_offs/sizeof(float)) < ca.l2_nc ||
+            (int64_t) (v->view_offs/sizeof(float)) + (int64_t) ca.l2_n*n_head > ca.n_ch || mul->ne[0] != ca.l2_n ||
+            !ggml_is_contiguous(mul) || ggml_nelements(mul) != (int64_t) ca.l2_n*n_head || ggml_nelements(sb) != n_head) {
+        return -1;
+    }
+    // f_b: F32 or F16 weights of rank columns, one row per output; the product summed as mul_mat_vec_f sums it
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+    const int rank    = (int) w->ne[0];
+    const int d_inner = (int) w->ne[1];
+    const int cc      = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    if ((w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) || w->nb[0] != ggml_type_size(w->type) ||
+            w->nb[1] % (2*ggml_type_size(w->type)) != 0 || w->ne[2] != 1 ||
+            w->ne[3] != 1 || rank % 2 != 0 || rank > 128 || !ggml_cuda_should_use_mmvf(w->type, cc, WARP_SIZE, w->ne, w->nb, 1) ||
+            x->ne[0] != rank || ggml_nrows(x) != 1 || x->nb[0] != sizeof(float) || (uintptr_t) x->data % 8 != 0 ||
+            (uintptr_t) w->data % 8 != 0 || mm->ne[0] != d_inner || ggml_nrows(mm) != 1 || !ggml_is_contiguous(mm) ||
+            ggml_nelements(scale) != d_inner || !ggml_is_contiguous(scale) || !ggml_is_contiguous(bias) ||
+            bias->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    // mul_mat_vec_f sums a row of 128 values with a block of 64 threads (one float2 each); rank 66..128 only
+    if (rank <= 2*WARP_SIZE) {
+        return -1;
+    }
+
+    ga = {};
+    ga.a             = (const float *) a->data;
+    ga.b             = (const float *) b->data;
+    ga.sig_b         = (float *) sb->data;
+    ga.v_dst         = (float *) mul->data;
+    ga.v_off         = (int64_t) (v->view_offs/sizeof(float));
+    ga.head          = ca.l2_n;
+    ga.n_head        = n_head;
+    ga.fb_w          = w->data;
+    ga.fb_stride_row = (int64_t) (w->nb[1]/ggml_type_size(w->type));
+    // mul_mat_vec_f sums F16 rows in half2 when fast FP16 is available and the node keeps the default precision
+    ga.fb_type       = w->type == GGML_TYPE_F32 ? 0 :
+        (fast_fp16_available(cc) && ggml_prec(mm->op_params[0]) == GGML_PREC_DEFAULT ? 2 : 1);
+    ga.fa            = (const float *) x->data;
+    ga.rank          = rank;
+    ga.fb_out        = nullptr; // consumed by the decay gate only
+    ga.dt_b          = (const float *) bias->data;
+    ga.bias_n        = ggml_nelements(bias);
+    ga.g_out         = (float *) scale->data;
+    ga.scale         = ggml_get_op_params_f32(scale, 0);
+    ga.offset        = ggml_get_op_params_f32(scale, 1);
+    ga.d_inner       = d_inner;
+    return j_scale;
+}
+
 // expert group selection from build_moe_ffn (n_expert_groups > 1)
 // src0/src1 index into this table, -1 is the (biased) probs, -2 is not checked
 static const struct {
@@ -4956,6 +5181,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 GGML_LOG_INFO("%s: fused conv state %s: %d copies, %d tokens, l2_norm %d, state from cache row %d\n", __func__,
                               node->name, m.args.n_copies, m.args.n_t, m.args.y_l2 != nullptr, m.args.state_row != nullptr);
 #endif
+                // one token: with the f_a product and the two gates of the layer in one launch
+                int j_fa;
+                ggml_cuda_rda_gates_args ga;
+                const int j_scale = ggml_cuda_match_rda_pre(cuda_ctx, cgraph, m, j_fa, ga);
+                float * scratch = j_scale > 0 ? ggml_cuda_rda_pre_scratch(cuda_ctx, ggml_nbytes(cgraph->nodes[j_fa])) : nullptr;
+                if (scratch != nullptr) {
+                    // f_a into the scratch buffer; a, b and the f_b input are views of it
+                    const ggml_tensor * fab = cgraph->nodes[j_fa];
+                    ggml_tensor fab_tmp = *fab;
+                    fab_tmp.data = scratch;
+                    const bool ok = ggml_cuda_compute_forward(*cuda_ctx, &fab_tmp);
+                    GGML_ASSERT(ok);
+                    auto remap = [&](const float * p) {
+                        const char * c = (const char *) p;
+                        const char * f = (const char *) fab->data;
+                        GGML_ASSERT(c >= f && c < f + ggml_nbytes(fab));
+                        return (const float *) ((char *) scratch + (c - f));
+                    };
+                    ga.a  = remap(ga.a);
+                    ga.b  = remap(ga.b);
+                    ga.fa = remap(ga.fa);
+                    ggml_cuda_op_rda_pre(*cuda_ctx, m.args, ga);
+                    return j_scale - i;
+                }
                 ggml_cuda_op_conv_state(*cuda_ctx, m.args);
                 return m.last - i;
             }

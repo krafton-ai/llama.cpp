@@ -34,3 +34,31 @@ struct ggml_cuda_conv_state_args {
 };
 
 void ggml_cuda_op_conv_state(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state_args & args);
+
+// one token of a gated delta net layer with a write/erase ratio: ggml_cuda_op_conv_state (with the L2 norm, l2_n == 128)
+// and the two gates (sigmoid_ratio_mul of the v heads, the f_b product and the decay gate) in one launch
+struct ggml_cuda_rda_gates_args {
+    const float * a;        // a[r], b[r]: the logits of the two ratio sigmoids of head r
+    const float * b;
+    float       * sig_b;    // sigmoid(b), [n_head]
+    float       * v_dst;    // v*(sigmoid(a)/sigmoid(b)), [head, n_head]
+    int64_t       v_off;    // channel of v[0] in the conv output
+    int           head;     // v channels per head (== l2_n)
+    int           n_head;
+    const void  * fb_w;     // f_b weights (F32 or F16), row r at element r*fb_stride_row, rank values
+    int64_t       fb_stride_row;
+    int           fb_type;  // 0: F32, 1: F16 summed in F32, 2: F16 summed in half2 (as mul_mat_vec_f picks for the node)
+    const float * fa;       // f_a, rank values
+    int           rank;
+    float       * fb_out;   // f_b product, [d_inner]
+    const float * dt_b;     // bias, element r % bias_n
+    int64_t       bias_n;
+    float       * g_out;    // scale*sigmoid(fb_out + dt_b) + offset
+    float         scale;
+    float         offset;
+    int           d_inner;
+    int           conv_blocks;
+};
+
+void ggml_cuda_op_rda_pre(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state_args & args,
+        ggml_cuda_rda_gates_args gates);
