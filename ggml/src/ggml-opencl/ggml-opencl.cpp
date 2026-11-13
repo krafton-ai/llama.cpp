@@ -890,6 +890,7 @@ struct ggml_backend_opencl_context {
     cl_mem         ncol_q_packed_image       = nullptr;
     bool           ncol_q_packed_image_tried = false;
     std::mutex     ncol_q_mutex;
+    ggml_cl_buffer prealloc_gdn_gexp;       // exp(g) of a KDA gated delta net in prompt processing
     // fused op chains (kernels/fused_ops.cl)
     cl_kernel kernel_rms_norm_mul_mat_add_part_f16 = nullptr;
     cl_kernel kernel_rms_norm_mul_mat_add_part_f32 = nullptr;
@@ -32503,7 +32504,29 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst, c
     const cl_ulong off_q     = extra_q->offset     + src_q->view_offs;
     const cl_ulong off_k     = extra_k->offset     + src_k->view_offs;
     const cl_ulong off_v     = extra_v->offset     + src_v->view_offs;
-    const cl_ulong off_g     = extra_g->offset     + src_g->view_offs;
+          cl_ulong off_g     = extra_g->offset     + src_g->view_offs;
+    // KDA prompt processing: exp(g) once for all tokens and dims, instead of in every lane of every token step
+    // (each value is needed by 8 lane groups and 4 work-groups)
+    cl_mem  g_buf    = extra_g->data_device;
+    cl_uint g_is_exp = 0;
+    if (kda && n_tokens > 1 && ggml_is_contiguous(src_g) && src_g->type == GGML_TYPE_F32 &&
+        ggml_nelements(src_g) % 4 == 0 && backend_ctx->kernel_exp_f32_4) {
+        const int n4 = (int) (ggml_nelements(src_g) / 4);
+        backend_ctx->prealloc_gdn_gexp.allocate(backend_ctx->context, ggml_nbytes(src_g));
+        cl_kernel      ek   = backend_ctx->kernel_exp_f32_4;
+        const cl_ulong zero = 0;
+        CL_CHECK(clSetKernelArg(ek, 0, sizeof(cl_mem), &extra_g->data_device));
+        CL_CHECK(clSetKernelArg(ek, 1, sizeof(cl_ulong), &off_g));
+        CL_CHECK(clSetKernelArg(ek, 2, sizeof(cl_mem), &backend_ctx->prealloc_gdn_gexp.buffer));
+        CL_CHECK(clSetKernelArg(ek, 3, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(ek, 4, sizeof(int), &n4));
+        size_t lws = 64;
+        size_t gws = (size_t) CEIL_DIV(n4, 64) * 64;
+        backend_ctx->enqueue_ndrange_kernel(ek, 1, &gws, &lws, dst);
+        g_buf    = backend_ctx->prealloc_gdn_gexp.buffer;
+        off_g    = 0;
+        g_is_exp = 1;
+    }
     const cl_ulong off_beta  = extra_beta->offset  + src_beta->view_offs;
     const cl_ulong off_state = extra_state->offset + src_state->view_offs;
     const cl_ulong off_dst   = extra_dst->offset   + dst->view_offs;
@@ -32515,7 +32538,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst, c
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_k));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_v->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_v));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_g->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &g_buf));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_g));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_beta->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_beta));
@@ -32546,6 +32569,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst, c
         state_dst ? extra_sdst->offset + state_dst->view_offs : off_dst + (cl_ulong) s_off * sizeof(float);
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem), &extra_sdst->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_sdst));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint), &g_is_exp));
 
     // Subgroup size is 64 for Adreno and 32 for Intel
     const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;

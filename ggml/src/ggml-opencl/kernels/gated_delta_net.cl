@@ -98,7 +98,8 @@ kernel void kernel_gated_delta_net(
         uint  rq3,
         float scale,
         uint K,
-        global char * sdst_buf, ulong off_sdst) {
+        global char * sdst_buf, ulong off_sdst,
+        uint g_is_exp) {  // KDA: g already holds exp(g) (computed for all tokens at once by the host)
 
     global const float * data_q     = (global const float *)(q_buf     + off_q);
     global const float * data_k     = (global const float *)(k_buf     + off_k);
@@ -167,7 +168,7 @@ kernel void kernel_gated_delta_net(
             const uint i = r * LANES_PER_COLUMN + lane;
             k_reg[r] = data_k[k_off + i];
             q_reg[r] = data_q[q_off + i];
-            g_exp[r] = exp(data_g[gb_off * S_V + i]);
+            g_exp[r] = g_is_exp ? data_g[gb_off * S_V + i] : exp(data_g[gb_off * S_V + i]);
         }
 #else
         const float g_val = exp(data_g[gb_off]);
