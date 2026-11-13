@@ -1233,7 +1233,8 @@ struct ggml_backend_opencl_context {
         return workgroup_size;
     }
 
-    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor,
+                                const size_t * global_work_offset = nullptr) {
         // From the spec on clEnqueueNDRangeKernel:
         // If the device associated with command_queue is an OpenCL 2.1 or newer device,
         // and global_work_size is NULL or the value in any passed dimension is zero,
@@ -1248,7 +1249,7 @@ struct ggml_backend_opencl_context {
         }
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, global_work_offset, global_work_size, local_work_size, 0, NULL, &evt));
 
         profiling_info.emplace_back();
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
@@ -1257,7 +1258,7 @@ struct ggml_backend_opencl_context {
         }
 #else
         GGML_UNUSED(tensor);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, global_work_offset, global_work_size, local_work_size, 0, NULL, NULL));
 #endif
     }
 
@@ -24957,7 +24958,19 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         size_t local_work_size[3]  = {64, 4, 1};
         size_t global_work_size[3] = {gws_x, 4, 1};
 
-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        // A very tall o4_global GEMV (the tied lm_head) runs faster and steadier as a few row
+        // chunks than as one dispatch that spans the whole weight.
+        if (use_o4_global && ne01 >= 131072) {
+            const size_t lm_chunks = 8;
+            const size_t chunk     = CEIL_DIV(gws_x / 64, lm_chunks) * 64;
+            for (size_t o = 0; o < gws_x; o += chunk) {
+                size_t off[3] = { o, 0, 0 };
+                size_t g[3]   = { std::min(chunk, gws_x - o), 4, 1 };
+                backend_ctx->enqueue_ndrange_kernel(kernel, 3, g, local_work_size, dst, off);
+            }
+        } else {
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        }
 
         if (ql_img) CL_CHECK(clReleaseMemObject(ql_img));
         if (qh_img) CL_CHECK(clReleaseMemObject(qh_img));
