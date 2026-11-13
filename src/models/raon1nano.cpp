@@ -334,7 +334,7 @@ ggml_tensor * llama_model_raon1_nano::graph::build_mla_layer(
     latent = ggml_mul(ctx0, ggml_rms_norm(ctx0, latent, eps), layer.attn_kv_a_norm);
     // NoPE: the "rope" dims of q and k are concatenated as they are, without rotation
     ggml_tensor * extra = ggml_view_3d(ctx0, kv, nr, 1, n_tokens, kv->nb[1], kv->nb[1], rank*kv->nb[0]);
-    if (n_tokens > LLAMA_MLA_EXPAND_MIN_TOKENS && ubatch.n_seqs == 1 && cparams.flash_attn && cparams.mla_expand) {
+    if (n_tokens > (int64_t) cparams.mla_expand_min_tokens && ubatch.n_seqs == 1 && cparams.flash_attn && cparams.mla_expand) {
         // long prefill: attend over per-head K/V expanded from the latent cache, a group of g heads at a time.
         // g is fixed from the context size (same graph for every ubatch): the most heads, a power of two, whose
         // F16 K/V of a full cache stay within 96 MiB

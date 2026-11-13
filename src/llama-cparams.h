@@ -5,7 +5,8 @@
 #include <cstdint>
 #include <vector>
 
-// MLA ubatches with more tokens than this attend over the expanded per-head K/V instead of the latent (absorbed) form
+// MLA ubatches with more tokens than this attend over the expanded per-head K/V instead of the latent (absorbed) form: the
+// default; the context picks the value for the device of the MLA layers (llama_cparams::mla_expand_min_tokens)
 #define LLAMA_MLA_EXPAND_MIN_TOKENS 256
 
 #define LLAMA_MAX_SEQ 256
@@ -55,6 +56,7 @@ struct llama_cparams {
     bool auto_mla_expand;
     uint32_t n_ubatch_auto_mib; // > 0: choose n_ubatch from the compute buffer it needs (llama_context_params)
     bool kq_limits;          // the expanded MLA prefill may give flash attention per-query key limits instead of the KQ mask
+    uint32_t mla_expand_min_tokens; // the expansion is used for ubatches of one sequence with more tokens than this
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

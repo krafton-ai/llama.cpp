@@ -169,8 +169,25 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 static const llm_fused_op_probe llm_fused_op_mla_expand_probe = {
     /*.op               =*/ LLM_FUSED_OP_MLA_EXPAND_KV,
     /*.name             =*/ "MLA K/V expansion",
-    /*.n_tokens_per_seq =*/ LLAMA_MLA_EXPAND_MIN_TOKENS + 1,
+    /*.n_tokens_per_seq =*/ LLAMA_MLA_EXPAND_MIN_TOKENS + 1, // the default; the check uses cparams.mla_expand_min_tokens + 1
 };
+
+// the ubatch size above which the expanded MLA prefill is faster than the absorbed attention, by the device of the MLA layers:
+// 128 on Metal, LLAMA_MLA_EXPAND_MIN_TOKENS (256) elsewhere
+static uint32_t llama_mla_expand_min_tokens(const llama_model & model) {
+    for (int il = 0; il < (int) model.layers.size(); ++il) {
+        if (model.layers[il].wk_b == nullptr) {
+            continue;
+        }
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg && strcmp(ggml_backend_reg_name(reg), "MTL") == 0) {
+            return 128;
+        }
+        break;
+    }
+    return LLAMA_MLA_EXPAND_MIN_TOKENS;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -339,6 +356,7 @@ llama_context::llama_context(
     cparams.mla_expand      = model.hparams.is_mla();
     cparams.auto_mla_expand = model.hparams.is_mla();
     cparams.kq_limits       = model.hparams.is_mla();
+    cparams.mla_expand_min_tokens = model.hparams.is_mla() ? llama_mla_expand_min_tokens(model) : LLAMA_MLA_EXPAND_MIN_TOKENS;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -689,18 +707,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.auto_fhc = false;
     }
 
-    // the expanded MLA prefill is built only for ubatches of one sequence with more than LLAMA_MLA_EXPAND_MIN_TOKENS
+    // the expanded MLA prefill is built only for ubatches of one sequence with more than cparams.mla_expand_min_tokens
     // tokens and flash attention; without the op on the layer's device the context keeps the absorbed form. The probe is
     // one sequence with a unified cache (one stream); with one stream per sequence it reserves all of them, like the
     // other probes. When the probe graph has no expansion node (the model does not use it, or that layout does not
     // build it) the path stays off
     if (cparams.auto_mla_expand) {
         const uint32_t n_seqs_mla = cparams.kv_unified ? 1 : n_seqs;
-        if (!cparams.flash_attn || cparams.n_ubatch < llm_fused_op_mla_expand_probe.n_tokens_per_seq*n_seqs_mla) {
+        const uint32_t n_tokens_per_seq = cparams.mla_expand_min_tokens + 1;
+        if (!cparams.flash_attn || cparams.n_ubatch < n_tokens_per_seq*n_seqs_mla) {
             cparams.mla_expand = false;
         } else {
             const auto & probe = llm_fused_op_mla_expand_probe;
-            const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs_mla;
+            const uint32_t n_tokens_probe = n_tokens_per_seq*n_seqs_mla;
 
             if (!graph_reserve(n_tokens_probe, n_seqs_mla, n_tokens_probe, mctx, true)) {
                 throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
@@ -747,7 +766,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             } else if (!supported) {
                 LLAMA_LOG_INFO("%s: %s not supported, set to disabled\n", func, probe.name);
             } else {
-                LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
+                LLAMA_LOG_INFO("%s: %s enabled (one-sequence ubatches of more than %u tokens)\n", func, probe.name, cparams.mla_expand_min_tokens);
             }
         }
         cparams.auto_mla_expand = false;
