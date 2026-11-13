@@ -9988,6 +9988,65 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// FLASH_ATTN_EXT with per-query key limits (an I32 mask [1, nb_pad, 1, 1]): KV row k is seen by query row j iff
+// k <= limit[j], as a causal prefill with kv cells in position order has it
+struct test_flash_attn_ext_limits : public test_case {
+    const int64_t hsk;
+    const int64_t hsv;
+    const int64_t nh;
+    const int64_t kv;
+    const int64_t nb;
+    const ggml_type type_KV;
+    const ggml_prec prec;
+
+    std::string vars() override {
+        return VARS_TO_STR7(hsk, hsv, nh, kv, nb, type_KV, prec);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_limits(int64_t hsk = 192, int64_t hsv = 128, int64_t nh = 4, int64_t kv = 1024, int64_t nb = 256,
+                               ggml_type type_KV = GGML_TYPE_F16, ggml_prec prec = GGML_PREC_F32)
+        : hsk(hsk), hsv(hsv), nh(nh), kv(kv), nb(nb), type_KV(type_KV), prec(prec) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hsk, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hsv, kv, nh, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, nb, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), 0.0f, 0.0f);
+        ggml_prec_set_acc(out, prec);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                // causal: query j at position kv - nb + j sees the rows up to it
+                std::vector<int32_t> lim(t->ne[1]);
+                for (int64_t j = 0; j < t->ne[1]; ++j) {
+                    lim[j] = (int32_t) (kv - nb + j);
+                }
+                // a row that sees an arbitrary prefix (every row sees at least row 0, as a query sees itself)
+                if (nb > 3) {
+                    lim[2] = (int32_t) (rng() % kv);
+                }
+                ggml_backend_tensor_set(t, lim.data(), 0, lim.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -14144,6 +14203,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 4, { 4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, true));
 
     // FLASH_ATTN_EXT: large logits
+    for (int64_t nb : { 1, 3, 32, 255, 512 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_limits(192, 128, 4, 1024, nb));
+        test_cases.emplace_back(new test_flash_attn_ext_limits(192, 128, 4, 4096, nb, GGML_TYPE_F16, GGML_PREC_DEFAULT));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_limits(128, 128, 8, 2048, 512));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits( 64,  64, 16, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128,  8, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

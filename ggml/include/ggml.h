@@ -2483,6 +2483,8 @@ extern "C" {
     // k:    [n_embd_k, n_kv,    n_head_kv, ne3 ]
     // v:    [n_embd_v, n_kv,    n_head_kv, ne3 ] !! not transposed !!
     // mask: [n_kv,     n_batch, ne32,      ne33]
+    //   or per-query key limits (I32): [1, n_batch, ne32, ne33], KV row k is seen by query row j iff k <= limit[j]
+    //   (backends without support for limits report the op as unsupported)
     // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! permuted !!
     //
     // broadcast:

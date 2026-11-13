@@ -5534,7 +5534,9 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        // F16: the mask [n_kv, n_batch_pad, ne32, ne33] added to KQ; I32: per-query key limits [1, n_batch_pad, ne32, ne33],
+        // KV row k is seen by query row j iff k <= limit[j] (the other rows are masked with -INF)
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || (mask->type == GGML_TYPE_I32 && mask->ne[0] == 1));
         GGML_ASSERT(ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 

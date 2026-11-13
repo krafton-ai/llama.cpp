@@ -773,6 +773,15 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    // FLASH_ATTN_EXT with per-query key limits (an I32 mask): only the backends that implement them (listed here as they
+    // gain a kernel); the others would read the limits as an F16 mask
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_I32) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        const char * name = reg ? ggml_backend_reg_name(reg) : "";
+        if (strcmp(name, "CPU") != 0) {
+            return false;
+        }
+    }
     return device->iface.supports_op(device, op);
 }
 
