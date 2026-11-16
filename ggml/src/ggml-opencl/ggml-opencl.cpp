@@ -968,6 +968,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
     cl_kernel kernel_gemm_xmem_f16_f32_os8;
     cl_kernel kernel_adreno_xmem_store_dst_f32;
+    cl_kernel kernel_adreno_xmem_store_dst_f32_coalesced = nullptr;
     cl_kernel kernel_mul_mm_f16_f32_kqv;
     cl_kernel kernel_mul_mm_f16_f32_kq;
     cl_kernel kernel_mla_qk_prefill = nullptr;
@@ -1408,6 +1409,9 @@ struct ggml_backend_opencl_context {
 
     ~ggml_backend_opencl_context() {
         release_ncol_kernels();
+        if (kernel_adreno_xmem_store_dst_f32_coalesced) {
+            clReleaseKernel(kernel_adreno_xmem_store_dst_f32_coalesced);
+        }
         if (kernel_adreno_xmem_pack_src_f32_k) {
             clReleaseKernel(kernel_adreno_xmem_pack_src_f32_k);
         }
@@ -2968,6 +2972,17 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             clCreateKernel(prog, "kernel_gemm_xmem_f16_f32_os8", &err), err));
         CL_CHECK((backend_ctx->kernel_adreno_xmem_store_dst_f32 =
             clCreateKernel(prog, "adreno_xmem_store_dst_f32", &err), err));
+        if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+            const std::string store_src {
+                #include "gemm_xmem_store_f32.cl.h"
+            };
+#else
+            const std::string store_src = read_file("gemm_xmem_store_f32.cl");
+#endif
+            backend_ctx->kernel_adreno_xmem_store_dst_f32_coalesced = ggml_cl_build_optional_kernel(
+                backend_ctx, store_src, compile_opts, "adreno_xmem_store_dst_f32_coalesced", 256);
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -21502,6 +21517,13 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     backend_ctx->enqueue_ndrange_kernel(gemm, 3, gemm_gws, gemm_lws, dst);
 
     cl_kernel store_dst = backend_ctx->kernel_adreno_xmem_store_dst_f32;
+    const bool use_coalesced = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E &&
+                               backend_ctx->kernel_adreno_xmem_store_dst_f32_coalesced &&
+                               N > 1;
+    if (use_coalesced) {
+        store_dst = backend_ctx->kernel_adreno_xmem_store_dst_f32_coalesced;
+    }
+
     CL_CHECK(clSetKernelArg(store_dst, 0, sizeof(cl_mem),   &dst_img));
     CL_CHECK(clSetKernelArg(store_dst, 1, sizeof(cl_mem),   &extrad->data_device));
     CL_CHECK(clSetKernelArg(store_dst, 2, sizeof(cl_ulong), &offsetd));
