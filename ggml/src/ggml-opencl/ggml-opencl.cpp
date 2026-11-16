@@ -21756,6 +21756,12 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     CL_CHECK(clReleaseMemObject(weights));
     CL_CHECK(clReleaseMemObject(dst_img));
     CL_CHECK(clReleaseMemObject(src_img));
+
+    // Queued commands can keep large temporary images alive after release.
+    const size_t image_bytes = desc_src.image_width * (desc_src.image_height + desc_dst.image_height) * sizeof(cl_half4);
+    if (image_bytes >= 64u * 1024u * 1024u) {
+        CL_CHECK(clFinish(backend_ctx->queue));
+    }
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
