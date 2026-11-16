@@ -1117,6 +1117,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
     cl_kernel kernel_mul_mm_f16_f32_smallm = nullptr;
+    cl_kernel kernel_rms_norm_mul_mm_f16_f32_smallm = nullptr;
     cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_1_f32_l4_lm;
@@ -1409,6 +1410,9 @@ struct ggml_backend_opencl_context {
 
     ~ggml_backend_opencl_context() {
         release_ncol_kernels();
+        if (kernel_rms_norm_mul_mm_f16_f32_smallm) {
+            clReleaseKernel(kernel_rms_norm_mul_mm_f16_f32_smallm);
+        }
         if (kernel_adreno_xmem_store_dst_f32_coalesced) {
             clReleaseKernel(kernel_adreno_xmem_store_dst_f32_coalesced);
         }
@@ -3075,6 +3079,31 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->kernel_mul_mm_f16_f32_smallm = ggml_cl_build_optional_kernel(
             backend_ctx, kernel_src, compile_opts, "kernel_mul_mm_f16_f32_smallm", 64);
+        GGML_LOG_CONT(".");
+    }
+
+    if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "rms_norm_mul_mm_f16_f32_smallm.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("rms_norm_mul_mm_f16_f32_smallm.cl");
+#endif
+        cl_kernel k = ggml_cl_build_optional_kernel(backend_ctx, kernel_src, compile_opts,
+            "kernel_rms_norm_mul_mm_f16_f32_smallm", 64);
+        if (k) {
+            const size_t lws[] = {64, 1, 1};
+            size_t subgroup = 0, count = 0;
+            if (clGetKernelSubGroupInfo(k, backend_ctx->device, CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
+                    sizeof(lws), lws, sizeof(subgroup), &subgroup, nullptr) != CL_SUCCESS ||
+                clGetKernelSubGroupInfo(k, backend_ctx->device, CL_KERNEL_SUB_GROUP_COUNT_FOR_NDRANGE,
+                    sizeof(lws), lws, sizeof(count), &count, nullptr) != CL_SUCCESS || subgroup != 64 || count != 1) {
+                clReleaseKernel(k);
+                k = nullptr;
+            }
+        }
+        backend_ctx->kernel_rms_norm_mul_mm_f16_f32_smallm = k;
         GGML_LOG_CONT(".");
     }
 
@@ -10142,6 +10171,60 @@ static void ggml_opencl_fused_add_sigmoid_scale(ggml_backend_t backend, const gg
     backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, sc);
 }
 
+static bool ggml_opencl_match_rms_norm_smallm(const ggml_backend_opencl_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ctx->kernel_rms_norm_mul_mm_f16_f32_smallm ||
+        !ctx->kernel_mul_mm_f16_f32_smallm || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT };
+    const int outputs[] = { i + 1 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 2, ops, outputs, 1)) {
+        return false;
+    }
+    const ggml_tensor * rms = cgraph->nodes[i];
+    const ggml_tensor * mm = cgraph->nodes[i + 1];
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mm->src[0];
+    if (mm->src[1] != rms || !ggml_opencl_f32_rows(x) || !ggml_is_contiguous(rms) ||
+        rms->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->type != GGML_TYPE_F16 ||
+        !ggml_opencl_f32_rows(mm) || !ggml_is_contiguous(mm) || x->ne[0] < 1024 || x->ne[0] > 6144 ||
+        x->ne[0] % 256 != 0 || x->ne[1] < 32 || x->ne[1] > 512 || x->ne[2] != 1 || x->ne[3] != 1 ||
+        w->ne[0] != x->ne[0] || w->ne[1] < 1 || w->ne[1] > 24 || w->ne[2] != 1 || w->ne[3] != 1 ||
+        x->nb[1] < (size_t) x->ne[0] * sizeof(float) || x->nb[1] % 16 != 0 ||
+        ggml_opencl_overlaps(mm, x) || ggml_opencl_overlaps(mm, w)) {
+        return false;
+    }
+    const auto * ex = (const ggml_tensor_extra_cl *) x->extra;
+    const auto * ew = (const ggml_tensor_extra_cl *) w->extra;
+    return (ex->offset + x->view_offs) % 16 == 0 && (ew->offset + w->view_offs) % 8 == 0;
+}
+
+static void ggml_opencl_fused_rms_norm_smallm(ggml_backend_t backend, const ggml_cgraph * cgraph, int i) {
+    auto * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    const ggml_tensor * rms = cgraph->nodes[i];
+    const ggml_tensor * mm = cgraph->nodes[i + 1];
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mm->src[0];
+    cl_kernel kernel = backend_ctx->kernel_rms_norm_mul_mm_f16_f32_smallm;
+    const cl_ulong nbw = w->nb[1], nbx = x->nb[1], nbd = mm->nb[1];
+    const int K = (int) x->ne[0], M = (int) w->ne[1], N = (int) x->ne[1];
+    const float eps = ggml_get_op_params_f32(rms, 0);
+    cl_uint idx = 0;
+    ggml_opencl_arg_tensor(kernel, idx, w);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbw));
+    ggml_opencl_arg_tensor(kernel, idx, x);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbx));
+    ggml_opencl_arg_tensor(kernel, idx, mm);
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbd));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &K));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &M));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int), &N));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float), &eps));
+    size_t lws[] = {64, 1, 1};
+    size_t gws[] = {(size_t) ((N + 1) / 2) * 64, 1, 1};
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, mm);
+}
+
 // RMS_NORM(x) -> MUL_MAT(fn [n, nmix], .) -> ADD(base) for up to 8 tokens: the long rows are split over work-groups
 // (partial dot products and partial sums of squares), then one small reduce
 static bool ggml_opencl_match_rms_norm_mul_mat_add(ggml_backend_opencl_context * ctx,
@@ -10354,6 +10437,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 i = last;
                 continue;
             }
+        }
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_RMS_NORM &&
+            ggml_opencl_match_rms_norm_smallm(backend_ctx, cgraph, i)) {
+            ggml_opencl_fused_rms_norm_smallm(backend, cgraph, i);
+            i++;
+            continue;
         }
         if (!backend_ctx->disable_fusion && node->op == GGML_OP_RMS_NORM &&
             ggml_opencl_match_rms_norm_mul_mat_add(backend_ctx, cgraph, i)) {

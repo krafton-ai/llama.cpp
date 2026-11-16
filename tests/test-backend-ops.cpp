@@ -10257,6 +10257,7 @@ struct test_rms_norm_mul_mat_add : public test_case {
     const int64_t n;
     const int64_t n_out;
     const int64_t n_tokens;
+    const int variant;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -10264,7 +10265,7 @@ struct test_rms_norm_mul_mat_add : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(type_w, n, n_out, n_tokens);
+        return VARS_TO_STR5(type_w, n, n_out, n_tokens, variant);
     }
 
     bool run_whole_graph() override { return true; }
@@ -10273,18 +10274,32 @@ struct test_rms_norm_mul_mat_add : public test_case {
         return 5e-4;
     }
 
-    test_rms_norm_mul_mat_add(ggml_type type_w, int64_t n, int64_t n_out, int64_t n_tokens)
-        : type_w(type_w), n(n), n_out(n_out), n_tokens(n_tokens) {}
+    test_rms_norm_mul_mat_add(ggml_type type_w, int64_t n, int64_t n_out, int64_t n_tokens, int variant = 0)
+        : type_w(type_w), n(n), n_out(n_out), n_tokens(n_tokens), variant(variant) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n + (variant == 1 ? 32 : 0), n_tokens);
+        if (variant == 1) {
+            x = ggml_view_2d(ctx, x, n, n_tokens, x->nb[1], 64);
+        }
         ggml_set_name(x, "x");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, n, n_out);
         ggml_set_name(w, "w");
         ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_out);
         ggml_set_name(b, "b");
 
-        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, x, 1e-6f)), b);
+        ggml_tensor * norm = ggml_rms_norm(ctx, x, 1e-6f);
+        if (variant == 2) {
+            ggml_set_output(norm);
+        }
+        ggml_tensor * mm = ggml_mul_mat(ctx, w, norm);
+        if (variant == 4) {
+            ggml_mul_mat_set_prec(mm, GGML_PREC_F32);
+        }
+        ggml_tensor * out = ggml_add(ctx, mm, b);
+        if (variant == 3) {
+            out = ggml_add(ctx, out, ggml_repeat(ctx, ggml_sum_rows(ctx, norm), out));
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -14568,6 +14583,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 32, 576, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1500, 1, 256, {1, 1}, {32, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 300, 32, 300, {1, 1}, {1, 1}));
+
+    for (int variant = 0; variant < 5; ++variant) {
+        test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 6144, 17, 256, variant));
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 6144, 17, 257, 1));
+    test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 1024, 8, 64));
+    test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 6144, 24, 256));
+    test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F32, 6144, 17, 256));
 
     for (int64_t n_tokens : {1, 4, 8, 9}) {
         test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 2048, 17, n_tokens));
