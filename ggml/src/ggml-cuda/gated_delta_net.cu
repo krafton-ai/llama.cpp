@@ -561,7 +561,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (state_rows == nullptr) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state_out = state_d;
-        if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+        if (ggml_cuda_gdn_mma_launch(ctx, args, stream)) {
             return;
         }
     }

@@ -5036,6 +5036,43 @@ static int ggml_cuda_match_rms_norm_mul_mat_vec_q(ggml_backend_cuda_context * cu
     return ggml_cuda_match_mat_vec_q_after(cuda_ctx, cgraph, i, i + 2, mul);
 }
 
+static bool ggml_cuda_match_swiglu_mmq(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    if (i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * glu = cgraph->nodes[i];
+    const ggml_tensor * mm  = cgraph->nodes[i + 1];
+    if (glu->op != GGML_OP_GLU || mm->op != GGML_OP_MUL_MAT || mm->src[1] != glu ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] || ggml_get_op_params_i32(glu, 1) ||
+        glu->type != GGML_TYPE_F32 || glu->src[0]->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        glu->ne[1] <= 256 || glu->ne[2] != 1 || glu->ne[3] != 1 || glu->ne[0] % MATRIX_ROW_PADDING ||
+        !ggml_is_contiguous(glu->src[0]) || !ggml_is_contiguous(glu) || !ggml_is_contiguous(mm) ||
+        glu->src[0]->ne[0] != 2 * glu->ne[0] || ggml_nrows(glu->src[0]) != glu->ne[1] ||
+        !(glu->flags & GGML_TENSOR_FLAG_COMPUTE) || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return false;
+    }
+    const ggml_tensor * weight = mm->src[0];
+    const int           cc     = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    if ((weight->type != GGML_TYPE_Q4_K && weight->type != GGML_TYPE_Q6_K) || !weight->buffer || weight->ne[2] != 1 ||
+        weight->ne[3] != 1 || !ggml_is_contiguous(weight) ||
+        ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        ggml_cuda_op_mul_mat_use_fwht(mm) || ggml_cuda_should_use_mmvq(weight->type, cc, glu->ne[1]) ||
+        !ggml_cuda_should_use_mmq(weight->type, cc, glu->ne[1], 0)) {
+        return false;
+    }
+    const ggml_tensor * tensors[] = { glu->src[0], glu, weight, mm };
+    for (const ggml_tensor * tensor : tensors) {
+        if (!tensor->buffer || !ggml_backend_buffer_is_cuda(tensor->buffer) ||
+            ((ggml_backend_cuda_buffer_context *) tensor->buffer->context)->device != cuda_ctx->device) {
+            return false;
+        }
+    }
+    const int outputs[] = { i + 1 };
+    return ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 }) &&
+           ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 1) &&
+           ggml_cuda_hc_io_ok({ glu->src[0], weight }, { mm }) && ggml_cuda_nodes_on_one_stream(cuda_ctx, cgraph, i, 2);
+}
+
 // try and fuse nodes and return the number of nodes to skip, or -1 if the node was computed by a fused kernel (or
 // skipped) without the nodes after it
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -5972,6 +6009,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_mul_mat_vec_q_after(cuda_ctx, cgraph, i + 2, n_mm, q8_1);
             return n_mm + 1;
         }
+    }
+
+    if (node->op == GGML_OP_GLU && ggml_cuda_match_swiglu_mmq(cuda_ctx, cgraph, i)) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], node, nullptr, mm, true);
+        return 1;
     }
 
     // GLU -> MUL_MAT(quantized, ·) x n_mm for one row: the GLU writes its output also quantized to q8_1

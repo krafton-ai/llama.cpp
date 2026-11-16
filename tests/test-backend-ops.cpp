@@ -4078,6 +4078,40 @@ struct test_mat_vec_q8_1_producer : public test_case {
     }
 };
 
+struct test_swiglu_mul_mat : public test_case {
+    const ggml_type type_w;
+    const int64_t   n_tokens;
+    const bool      extra_consumer;
+
+    test_swiglu_mul_mat(ggml_type type_w, int64_t n_tokens, bool extra_consumer) :
+        type_w(type_w),
+        n_tokens(n_tokens),
+        extra_consumer(extra_consumer) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SWIGLU_MUL_MAT";
+    }
+
+    std::string vars() override { return VARS_TO_STR3(type_w, n_tokens, extra_consumer); }
+
+    bool run_whole_graph() override { return true; }
+
+    bool use_weight_context() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, n_tokens);
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx_weights, type_w, 512, 64);
+        ggml_tensor * glu = ggml_swiglu(ctx, x);
+        ggml_tensor * out = ggml_mul_mat(ctx, w, glu);
+        return extra_consumer ? ggml_concat(ctx, out, glu, 0) : out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -5675,6 +5709,30 @@ struct test_gated_delta_net : public test_case {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else {
                 init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_gated_delta_net_prefill : public test_gated_delta_net {
+    const float gate_min;
+
+    test_gated_delta_net_prefill(int64_t n_tokens, float gate_min) :
+        test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 1, false, true),
+        gate_min(gate_min) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_PREFILL";
+    }
+
+    std::string vars() override { return test_gated_delta_net::vars() + "," + VAR_TO_STR(gate_min); }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_gated_delta_net::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, gate_min, -1e-4f);
             }
         }
     }
@@ -14353,7 +14411,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 4, { 4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, true));
 
     // FLASH_ATTN_EXT: large logits
-    for (int64_t nb : { 1, 3, 32, 255, 512 }) {
+    for (int64_t nb : { 1, 3, 32, 63, 64, 65, 255, 512 }) {
         test_cases.emplace_back(new test_flash_attn_ext_limits(192, 128, 4, 1024, nb));
         test_cases.emplace_back(new test_flash_attn_ext_limits(192, 128, 4, 4096, nb, GGML_TYPE_F16, GGML_PREC_DEFAULT));
     }
@@ -14477,6 +14535,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+
+    for (int64_t nt : { 255, 256, 257, 2048, 2049 }) {
+        for (float gate_min : { -1.0f, -20.0f }) {
+            test_cases.emplace_back(new test_gated_delta_net_prefill(nt, gate_min));
+        }
+    }
+    for (ggml_type type_w : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (int64_t nt : { 256, 257, 511 }) {
+            for (bool extra_consumer : { false, true }) {
+                test_cases.emplace_back(new test_swiglu_mul_mat(type_w, nt, extra_consumer));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

@@ -1,4 +1,6 @@
 #include "quantize.cuh"
+#include "unary.cuh"
+
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -453,12 +455,18 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
-static __global__ void quantize_mmq_q8_1(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
-        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
-
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool swiglu = false>
+static __global__ void quantize_mmq_q8_1(const float * __restrict__ x,
+                                         const int32_t * __restrict__ ids,
+                                         void * __restrict__ vy,
+                                         const int64_t ne00,
+                                         const int64_t s01,
+                                         const int64_t s02,
+                                         const int64_t s03,
+                                         const int64_t ne0,
+                                         const int     ne1,
+                                         const int     ne2,
+                                         const int     n_expert_used) {
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
@@ -488,7 +496,21 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi;
+    if constexpr (swiglu) {
+        static_assert(!scatter, "dense SwiGLU only");
+        xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (i0 < ne00) {
+            const float4 gate = x4[(2 * base_idx + i00) / 4];
+            const float4 up   = x4[(2 * base_idx + ne00 + i00) / 4];
+            // Round the product to F32 before quantization, as the separate GLU store does.
+            xi                = make_float4(
+                __fmul_rn(ggml_cuda_op_silu_single(gate.x), up.x), __fmul_rn(ggml_cuda_op_silu_single(gate.y), up.y),
+                __fmul_rn(ggml_cuda_op_silu_single(gate.z), up.z), __fmul_rn(ggml_cuda_op_silu_single(gate.w), up.w));
+        }
+    } else {
+        xi = i0 < ne00 ? x4[(base_idx + i00) / 4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -597,6 +619,32 @@ void quantize_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
+    }
+}
+
+// Contiguous [gate | up] rows; use the same quantization layout and reduction as MMQ.
+void quantize_swiglu_mmq_q8_1_cuda(const float *   x,
+                                   void *          vy,
+                                   const ggml_type type_src0,
+                                   const int64_t   ne00,
+                                   const int64_t   ne0,
+                                   const int64_t   ne1,
+                                   cudaStream_t    stream) {
+    GGML_ASSERT(ne00 % 4 == 0 && ne0 % QK8_1_MMQ == 0);
+    const int64_t block_num_y = (ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3    num_blocks(ne1, block_num_y, 1);
+    const dim3    block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    switch (mmq_get_q8_1_ds_layout(type_src0)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true><<<num_blocks, block_size, 0, stream>>>(
+                x, nullptr, vy, ne00, ne00, ne00 * ne1, ne00 * ne1, ne0, ne1, 1, 0);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true><<<num_blocks, block_size, 0, stream>>>(
+                x, nullptr, vy, ne00, ne00, ne00 * ne1, ne00 * ne1, ne0, ne1, 1, 0);
+            break;
+        default:
+            GGML_ABORT("unsupported SwiGLU MMQ weight layout");
     }
 }
 

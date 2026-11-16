@@ -143,10 +143,228 @@ template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, 
 }
 #endif // defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
 
+// P and inverse are shared by the value slices of one operator invocation.
+template <int C> struct alignas(128) gdn_prepared_matrices {
+    matrix<C, C> p, inverse;
+};
+
+template <int R, int C>
+static __device__ __forceinline__ void copy_matrix(matrix<R, C> & dst, const matrix<R, C> & src, int tid) {
+    static_assert(sizeof(matrix<R, C>) % sizeof(int4) == 0, "complete vector copies");
+    for (int i = tid; i < (int) (sizeof(matrix<R, C>) / sizeof(int4)); i += 256) {
+        reinterpret_cast<int4 *>(&dst)[i] = reinterpret_cast<const int4 *>(&src)[i];
+    }
+}
+
+// The block selects one operand layout before writing it.
+template <int C> struct alignas(128) gdn_prepare_shared {
+    static constexpr int DP = D + 1;
+
+    union {
+        struct {
+            matrix<C, D> q, k, kinv;
+        } fast;
+
+        struct {
+            float qr[C * DP], kr[C * DP];
+        } slow;
+    } operands;
+
+    matrix<C, C> p, inverse;
+    float        lower[C * C], beta[C];
+    float        gate[C * DP], gm[D];
+
+    static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
+};
+
+template <int C>
+static __global__ __launch_bounds__(256) void gdn_prepare_matrices(ggml_cuda_gdn_mma_args     a,
+                                                                   gdn_prepared_matrices<C> * prepared) {
+#if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+    constexpr int WARPS = 8;
+#    ifdef GGML_USE_HIP
+    constexpr int N = 16;
+#    else
+    constexpr int N = 8;
+#    endif
+    extern __shared__ __align__(128) unsigned char bytes[];
+    auto &                                         s    = *reinterpret_cast<gdn_prepare_shared<C> *>(bytes);
+    const int                                      lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
+    const int64_t                                  chunks  = (a.n_tokens + C - 1) / C;
+    const int64_t                                  chunk   = blockIdx.x % chunks;
+    const int                                      h       = (blockIdx.x / chunks) % a.H;
+    const int                                      seq     = blockIdx.x / (chunks * a.H);
+    const int64_t                                  qoff    = (seq / a.rq3) * a.sq3 + (h % a.H_k) * a.sq1;
+    const int64_t                                  goff    = seq * a.sb3 + h * a.sb1;
+    const int64_t                                  t0      = chunk * C;
+    const int                                      valid   = min((int64_t) C, a.n_tokens - t0);
+    bool                                           fast    = false;
+    auto                                           read_qk = [&](int64_t t, float4 & q, float4 & k) {
+        t += warp;
+        q = k = make_float4(0, 0, 0, 0);
+        if (t < a.n_tokens) {
+            const int64_t off = qoff + t * a.sq2 + 4 * lane;
+            if ((((uintptr_t) (a.q + off) | (uintptr_t) (a.k + off)) & 15) == 0) {
+                q = *reinterpret_cast<const float4 *>(a.q + off);
+                k = *reinterpret_cast<const float4 *>(a.k + off);
+            } else {
+                q = make_float4(a.q[off], a.q[off + 1], a.q[off + 2], a.q[off + 3]);
+                k = make_float4(a.k[off], a.k[off + 1], a.k[off + 2], a.k[off + 3]);
+            }
+        }
+    };
+
+    // gate prefix per key dimension (one thread per dimension), beta per token
+    constexpr int DP = gdn_prepare_shared<C>::DP;
+    bool          ok = true;
+    if (tid < D) {
+        float gv[C];
+#    pragma unroll
+        for (int t = 0; t < C; ++t) {
+            gv[t] = t < valid ? a.g[(goff + (t0 + t) * a.sb2) * D + tid] : 0.f;
+        }
+        float     acc_g = 0.f, g_m = 0.f;
+        const int m = min(C / 2 - 1, valid - 1);
+#    pragma unroll
+        for (int t = 0; t < C; ++t) {
+            acc_g += gv[t];
+            s.gate[t * DP + tid] = acc_g;
+            g_m                  = t == m ? acc_g : g_m;
+        }
+        s.gm[tid] = g_m;
+        ok        = s.gate[tid] - g_m <= 80.f && g_m - acc_g <= 80.f;
+    } else if (tid < D + C) {
+        const int t = tid - D;
+        s.beta[t]   = t < valid ? a.beta[goff + (t0 + t) * a.sb2] : 0.f;
+    }
+    fast = __syncthreads_and(ok);
+
+#    pragma unroll
+    for (int j = 0; j < C / 8; ++j) {
+        const int t = warp + 8 * j, d = 4 * lane;
+        float4    q, k;
+
+        read_qk(t0 + 8 * j, q, k);
+
+        constexpr int DP    = gdn_prepare_shared<C>::DP;
+        const float   qv[4] = { q.x * a.scale, q.y * a.scale, q.z * a.scale, q.w * a.scale };
+        const float   kv[4] = { k.x, k.y, k.z, k.w };
+        float         e[4], ei[4];
+#    pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float x = s.gate[t * DP + d + u] - (fast ? s.gm[d + u] : 0.f);
+            e[u]          = expf(x);
+            ei[u]         = fast ? expf(-x) : 0.f;
+            if (!fast) {
+                s.operands.slow.kr[t * DP + d + u] = kv[u];
+                s.operands.slow.qr[t * DP + d + u] = qv[u];
+            }
+        }
+        if (fast) {
+            s.operands.fast.q.store2(t, d, make_float2(qv[0] * e[0], qv[1] * e[1]));
+            s.operands.fast.q.store2(t, d + 2, make_float2(qv[2] * e[2], qv[3] * e[3]));
+            s.operands.fast.k.store2(t, d, make_float2(kv[0] * e[0], kv[1] * e[1]));
+            s.operands.fast.k.store2(t, d + 2, make_float2(kv[2] * e[2], kv[3] * e[3]));
+            s.operands.fast.kinv.store2(t, d, make_float2(kv[0] * ei[0], kv[1] * ei[1]));
+            s.operands.fast.kinv.store2(t, d + 2, make_float2(kv[2] * ei[2], kv[3] * ei[3]));
+        }
+    }
+
+    __syncthreads();
+
+    if (!fast) {
+        // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay), one (r, c) pair per thread in FP32
+        constexpr int DP = gdn_prepare_shared<C>::DP;
+        static_assert(C * C <= 256, "one pair per thread");
+        if (tid < C * C) {
+            const int r = tid / C, c = tid % C;
+            float     sp = 0.f, sa = 0.f;
+            if (c <= r && r < valid) {
+                const float * qr = s.operands.slow.qr + r * DP;
+                const float * kr = s.operands.slow.kr + r * DP;
+                const float * kc = s.operands.slow.kr + c * DP;
+                const float * gr = s.gate + r * DP;
+                const float * gc = s.gate + c * DP;
+#    pragma unroll 8
+                for (int d = 0; d < D; ++d) {
+                    const float e  = expf(gr[d] - gc[d]);
+                    const float ke = kc[d] * e;
+                    sp += qr[d] * ke;
+                    sa += kr[d] * ke;
+                }
+            }
+            s.p.store(r, c, sp);
+            if (c < r) {
+                s.lower[s.lower_index(r, c)] = sa * s.beta[r];
+            }
+        }
+    }
+
+    // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay)
+    for (int ti = warp; fast && ti < 2 * (C / 16) * (C / N); ti += WARPS) {
+        const bool gram = ti < (C / 16) * (C / N);
+        const int  t = ti % ((C / 16) * (C / N)), r = (t / (C / N)) * 16, c = (t % (C / N)) * N;
+        acc        x;
+
+        // the decay is in the operands: k e^(G - G_m) and q e^(G - G_m) against k e^(G_m - G)
+        product<D>(x, gram ? s.operands.fast.k : s.operands.fast.q, s.operands.fast.kinv, r, c);
+
+#    pragma unroll
+        for (int i = 0; i < acc::ne; ++i) {
+            const int   rr = r + acc::get_i(i), cc = c + acc::get_j(i);
+            const float v = rr < valid && cc <= rr ? x.x[i] : 0.f;
+            if (gram) {
+                if (cc < rr) {
+                    s.lower[s.lower_index(rr, cc)] = v * s.beta[rr];
+                }
+            } else {
+                s.p.store(rr, cc, v);
+            }
+        }
+    }
+
+    __syncthreads();
+    // inverse = (I + A)^-1 by forward substitution
+    for (int row = warp; row < C; row += WARPS) {
+        float x[(C + 31) / 32];
+#    pragma unroll
+        for (int j = 0; j < (C + 31) / 32; ++j) {
+            const int col = lane + 32 * j;
+            x[j]          = col == row ? 1.f : (col < row ? -s.lower[s.lower_index(row, col)] : 0.f);
+        }
+        for (int pivot = row - 1; pivot > 0; --pivot) {
+            const float xp = __shfl_sync(0xffffffff, x[pivot / 32], pivot % 32, 32);
+#    pragma unroll
+            for (int j = 0; j < (C + 31) / 32; ++j) {
+                const int col = lane + 32 * j;
+                if (col < pivot) {
+                    x[j] -= xp * s.lower[s.lower_index(pivot, col)];
+                }
+            }
+        }
+#    pragma unroll
+        for (int j = 0; j < (C + 31) / 32; ++j) {
+            if (lane + 32 * j < C) {
+                s.inverse.store(row, lane + 32 * j, x[j]);
+            }
+        }
+    }
+
+    __syncthreads();
+    auto & out = prepared[blockIdx.x];
+    copy_matrix(out.p, s.p, tid);
+    copy_matrix(out.inverse, s.inverse, tid);
+#else
+    GGML_UNUSED_VARS(a, prepared);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // Each block owns V independent value columns and advances by C tokens.
 // Keep recurrent state in FP32; pack high/residual BF16 operands inside the block.
-template <int C, int V, int BLOCKS = 1, bool KDA = false>
-static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
+template <int C, int V, int BLOCKS = 1, bool KDA = false, bool PREPARED = false>
+static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args           a,
+                                                                 const gdn_prepared_matrices<C> * prepared = nullptr) {
 #if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
     static_assert(ggml_cuda_get_physical_warp_size() == 32, "GDN MMA requires 32-lane warps");
     constexpr int WARPS = 8;
@@ -202,6 +420,8 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
     }
     for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C) {
         const int valid = min((int64_t) C, a.n_tokens - t0);
+        const auto * chunk =
+            PREPARED ? prepared + ((int64_t) seq * a.H + h) * ((a.n_tokens + C - 1) / C) + t0 / C : nullptr;
         bool fast = false;  // KDA: tensor-core Gram and P for this chunk
         if constexpr (KDA) {
             // gate prefix per key dimension (one thread per dimension), beta per token
@@ -249,19 +469,25 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 for (int u = 0; u < 4; ++u) {
                     const float x = s.gate[t * DP + d + u] - (fast ? s.gm[d + u] : 0.f);
                     e[u]  = expf(x);
-                    ei[u] = fast ? expf(-x) : 0.f;
+                    if constexpr (!PREPARED) {
+                        ei[u] = fast ? expf(-x) : 0.f;
+                    }
                     s.kr[t * DP + d + u] = kv[u];
-                    if (!fast) {
-                        s.qr[t * DP + d + u] = qv[u];
+                    if constexpr (!PREPARED) {
+                        if (!fast) {
+                            s.qr[t * DP + d + u] = qv[u];
+                        }
                     }
                 }
                 s.q.store2(t, d, make_float2(qv[0] * e[0], qv[1] * e[1]));
                 s.q.store2(t, d + 2, make_float2(qv[2] * e[2], qv[3] * e[3]));
                 s.k.store2(t, d, make_float2(kv[0] * e[0], kv[1] * e[1]));
                 s.k.store2(t, d + 2, make_float2(kv[2] * e[2], kv[3] * e[3]));
-                if (fast) {
-                    s.kinv.store2(t, d, make_float2(kv[0] * ei[0], kv[1] * ei[1]));
-                    s.kinv.store2(t, d + 2, make_float2(kv[2] * ei[2], kv[3] * ei[3]));
+                if constexpr (!PREPARED) {
+                    if (fast) {
+                        s.kinv.store2(t, d, make_float2(kv[0] * ei[0], kv[1] * ei[1]));
+                        s.kinv.store2(t, d + 2, make_float2(kv[2] * ei[2], kv[3] * ei[3]));
+                    }
                 }
             } else {
                 s.q.store2(t, d, make_float2(q.x * a.scale, q.y * a.scale));
@@ -341,20 +567,25 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 }
             }
         };
-        if constexpr (KDA) {
-        if (!fast) {
-            // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay), one (r, c) pair per thread in FP32
-            constexpr int DP = shared<C, V, true>::DP;
-            static_assert(C * C <= 256, "one pair per thread");
-            if (tid < C * C) {
-                const int r = tid / C, c = tid % C;
-                float     sp = 0.f, sa = 0.f;
-                if (c <= r && r < valid) {
-                    const float * qr = s.qr + r * DP;
-                    const float * kr = s.kr + r * DP;
-                    const float * kc = s.kr + c * DP;
-                    const float * gr = s.gate + r * DP;
-                    const float * gc = s.gate + c * DP;
+        if constexpr (PREPARED) {
+            static_assert(KDA && C == 16 && V == 16, "prepared KDA matrices schedule");
+            copy_matrix(s.p, chunk->p, tid);
+            copy_matrix(s.inverse, chunk->inverse, tid);
+        } else {
+            if constexpr (KDA) {
+                if (!fast) {
+                    // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay), one (r, c) pair per thread in FP32
+                    constexpr int DP = shared<C, V, true>::DP;
+                    static_assert(C * C <= 256, "one pair per thread");
+                    if (tid < C * C) {
+                        const int r = tid / C, c = tid % C;
+                        float     sp = 0.f, sa = 0.f;
+                        if (c <= r && r < valid) {
+                            const float * qr = s.qr + r * DP;
+                            const float * kr = s.kr + r * DP;
+                            const float * kc = s.kr + c * DP;
+                            const float * gr = s.gate + r * DP;
+                            const float * gc = s.gate + c * DP;
 #pragma unroll 8
                     for (int d = 0; d < D; ++d) {
                         const float e  = expf(gr[d] - gc[d]);
@@ -396,13 +627,15 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 }
             }
         }
+        }
         if constexpr (V == 32) {
             project();
         }
         __syncthreads();
-        // inverse = (I + A)^-1 by forward substitution
-        for (int row = warp; row < C; row += WARPS) {
-            float x[(C + 31) / 32];
+        if constexpr (!PREPARED) {
+            // inverse = (I + A)^-1 by forward substitution
+            for (int row = warp; row < C; row += WARPS) {
+                float x[(C + 31) / 32];
 #pragma unroll
             for (int j = 0; j < (C + 31) / 32; ++j) {
                 const int col = lane + 32 * j;
@@ -424,6 +657,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                     s.inverse.store(row, lane + 32 * j, x[j]);
                 }
             }
+        }
         }
         if constexpr (V != 32) {
             project();
@@ -501,7 +735,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
 #endif // defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
 }
 
-template <int C, int V, int BLOCKS = 1, bool KDA = false> bool init(int device) {
+template <int C, int V, int BLOCKS = 1, bool KDA = false, bool PREPARED = false> bool init(int device) {
     static std::once_flag once[GGML_CUDA_MAX_DEVICES];
     static bool           available[GGML_CUDA_MAX_DEVICES] = {};
     std::call_once(once[device], [device] {
@@ -509,9 +743,21 @@ template <int C, int V, int BLOCKS = 1, bool KDA = false> bool init(int device) 
         if (sizeof(shared<C, V, KDA>) > ggml_cuda_info().devices[device].smpbo) {
             return;
         }
-        const auto status = cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS, KDA>,
-                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(shared<C, V, KDA>));
+        const auto status =
+            cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS, KDA, PREPARED>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(shared<C, V, KDA>));
         available[device] = status == cudaSuccess;
+        if constexpr (PREPARED) {
+            if (available[device]) {
+                const auto prep_status =
+                    cudaFuncSetAttribute((const void *) gdn_prepare_matrices<C>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(gdn_prepare_shared<C>));
+                available[device] = prep_status == cudaSuccess;
+                if (prep_status != cudaSuccess) {
+                    (void) cudaGetLastError();
+                }
+            }
+        }
         if (status != cudaSuccess) {
             (void) cudaGetLastError();
         }
@@ -568,7 +814,8 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
 }
 }  // namespace
 
-bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cudaStream_t stream) {
+bool ggml_cuda_gdn_mma_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_mma_args & a, cudaStream_t stream) {
+    const int device = ctx.device;
     if (!a.state_out) {
         return false;
     }
@@ -579,6 +826,23 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
 #ifdef GGML_USE_HIP
     gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
 #else
+    if (path == gdn_path::kda_slice16 && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_ADA_LOVELACE &&
+        a.H == 16 && a.H_k == 16 && a.n_seqs == 1 && a.rq3 == 1 && a.n_tokens >= 256 && a.n_tokens <= 2048 &&
+        init<16, 16, 1, true, true>(device)) {
+        const int64_t chunks = (a.n_tokens + 15) / 16;
+        const size_t  count  = chunks * a.H * a.n_seqs;
+        static_assert(sizeof(gdn_prepared_matrices<16>) == 2048, "prepared chunk layout");
+        static_assert(sizeof(gdn_prepare_shared<16>) == 36480, "compact producer shared layout");
+        static_assert(sizeof(gdn_prepared_matrices<16>) * 128 * 16 == 4 * 1024 * 1024, "bounded preparation buffer");
+        ggml_cuda_pool_alloc<gdn_prepared_matrices<16>> prepared(ctx.pool());
+        prepared.alloc(count);
+        gdn_prepare_matrices<16><<<count, dim3(32, 8), sizeof(gdn_prepare_shared<16>), stream>>>(a, prepared.get());
+        CUDA_CHECK(cudaGetLastError());
+        gdn_single<16, 16, 1, true, true>
+            <<<a.H * 8, dim3(32, 8), sizeof(shared<16, 16, true>), stream>>>(a, prepared.get());
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     if (path == gdn_path::kda_slice16) {
         gdn_single<16, 16, 1, true><<<a.H * a.n_seqs * 8, dim3(32, 8), sizeof(shared<16, 16, true>), stream>>>(a);
     } else if (path == gdn_path::kda_slice32) {

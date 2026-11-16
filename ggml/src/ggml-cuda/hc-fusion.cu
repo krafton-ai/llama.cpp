@@ -110,10 +110,15 @@ static __global__ void rms_norm_mat_vec_part_f32(
 
 // many tokens: one block per (split, 32 tokens) covers every row, one lane per token, so x is read once and no
 // cross-lane sums are needed. Tiles of x (padded rows: lane t reads row t) and of w go through shared memory
-template <typename T>
-static __global__ void rms_norm_mat_vec_part_pp_f32(
-        const float * x, const T * w, float * part, const int nrows_w, const int chunk, const int nt,
-        const int64_t sx1, const int64_t sw1) {
+template <typename T, bool vector_x = false>
+static __global__ void rms_norm_mat_vec_part_pp_f32(const float * x,
+                                                    const T *     w,
+                                                    float *       part,
+                                                    const int     nrows_w,
+                                                    const int     chunk,
+                                                    const int     nt,
+                                                    const int64_t sx1,
+                                                    const int64_t sw1) {
     constexpr int n_rows = RMS_MV_PP_WARPS*RMS_MV_PP_ROWS;
     const int s      = blockIdx.x;
     const int t0     = blockIdx.z*WARP_SIZE;
@@ -130,15 +135,49 @@ static __global__ void rms_norm_mat_vec_part_pp_f32(
     float acc[RMS_MV_PP_ROWS] = {0.0f};
     for (int i0 = 0; i0 < chunk; i0 += RMS_MV_PP_TILE) {
         const int len = min(RMS_MV_PP_TILE, chunk - i0);
-        for (int j = tid; j < WARP_SIZE*len; j += RMS_MV_PP_WARPS*WARP_SIZE) {
-            const int t = j/len;
-            const int i = j - t*len;
-            xs[t][i] = t0 + t < nt ? x[(int64_t) (t0 + t)*sx1 + (int64_t) s*chunk + i0 + i] : 0.0f;
+        if constexpr (vector_x) {
+            // Keep the shared layout and FMA order; only group aligned input copies.
+            const int len4 = len / 4;
+            for (int j = tid; j < WARP_SIZE * len4; j += RMS_MV_PP_WARPS * WARP_SIZE) {
+                const int    t        = j / len4;
+                const int    i        = 4 * (j - t * len4);
+                const float4 xv       = t0 + t < nt ?
+                                            *(const float4 *) (x + (int64_t) (t0 + t) * sx1 + (int64_t) s * chunk + i0 + i) :
+                                            make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                *(float4 *) &xs[t][i] = xv;
+            }
+        } else {
+            for (int j = tid; j < WARP_SIZE * len; j += RMS_MV_PP_WARPS * WARP_SIZE) {
+                const int t = j / len;
+                const int i = j - t * len;
+                xs[t][i]    = t0 + t < nt ? x[(int64_t) (t0 + t) * sx1 + (int64_t) s * chunk + i0 + i] : 0.0f;
+            }
         }
-        for (int j = tid; j < nrows_w*len; j += RMS_MV_PP_WARPS*WARP_SIZE) {
-            const int k = j/len;
-            const int i = j - k*len;
-            ws[k][i] = ggml_cuda_cast<float>(w[(int64_t) k*sw1 + (int64_t) s*chunk + i0 + i]);
+        if (vector_x && nrows_w == 17 && chunk == 384 && len % 4 == 0 && sw1 % 4 == 0 &&
+            reinterpret_cast<uintptr_t>(w) % (4 * sizeof(T)) == 0) {
+            // Preserve each FP32 conversion and the shared/FMA layout; group only aligned weight copies.
+            const int len4 = len / 4;
+            for (int j = tid; j < nrows_w * len4; j += RMS_MV_PP_WARPS * WARP_SIZE) {
+                const int k  = j / len4;
+                const int i  = 4 * (j - k * len4);
+                const T * wr = w + (int64_t) k * sw1 + (int64_t) s * chunk + i0 + i;
+                float4    wv;
+                if constexpr (std::is_same_v<T, half>) {
+                    const half2 lo = *(const half2 *) wr;
+                    const half2 hi = *(const half2 *) (wr + 2);
+                    wv             = make_float4(ggml_cuda_cast<float>(lo.x), ggml_cuda_cast<float>(lo.y),
+                                                 ggml_cuda_cast<float>(hi.x), ggml_cuda_cast<float>(hi.y));
+                } else {
+                    wv = *(const float4 *) wr;
+                }
+                *(float4 *) &ws[k][i] = wv;
+            }
+        } else {
+            for (int j = tid; j < nrows_w * len; j += RMS_MV_PP_WARPS * WARP_SIZE) {
+                const int k = j / len;
+                const int i = j - k * len;
+                ws[k][i]    = ggml_cuda_cast<float>(w[(int64_t) k * sw1 + (int64_t) s * chunk + i0 + i]);
+            }
         }
         __syncthreads();
         for (int i = 0; i < len; i += 4) {
@@ -213,7 +252,12 @@ static void rms_norm_mat_vec_part_launch(
     if (nt > 1 && nrows_w + 1 <= RMS_MV_PP_WARPS*RMS_MV_PP_ROWS && chunk % 4 == 0) {
         const dim3 grid(nsplit, 1, (nt + WARP_SIZE - 1)/WARP_SIZE);
         const ggml_cuda_kernel_launch_params lp(grid, dim3(WARP_SIZE, RMS_MV_PP_WARPS), 0, stream);
-        ggml_cuda_kernel_launch(rms_norm_mat_vec_part_pp_f32<T>, lp, x, w, part, nrows_w, chunk, nt, sx1, sw1);
+        if (nrows_w == 17 && chunk == 384 && sx1 % 4 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0) {
+            ggml_cuda_kernel_launch((rms_norm_mat_vec_part_pp_f32<T, true>), lp, x, w, part, nrows_w, chunk, nt, sx1,
+                                    sw1);
+        } else {
+            ggml_cuda_kernel_launch(rms_norm_mat_vec_part_pp_f32<T>, lp, x, w, part, nrows_w, chunk, nt, sx1, sw1);
+        }
         return;
     }
     const int n_row_groups = (nrows_w + 1 + RMS_MV_WARPS - 1)/RMS_MV_WARPS;
