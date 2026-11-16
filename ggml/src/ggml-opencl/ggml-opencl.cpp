@@ -1414,19 +1414,11 @@ struct ggml_backend_opencl_context {
 
     ~ggml_backend_opencl_context() {
         release_ncol_kernels();
-        if (kernel_gemm_noshuffle_q4_k_f32_acc32_r2) { clReleaseKernel(kernel_gemm_noshuffle_q4_k_f32_acc32_r2); }
-        if (kernel_ssm_conv_silu_prefill) { clReleaseKernel(kernel_ssm_conv_silu_prefill); }
-        if (kernel_ssm_conv_copy_input) { clReleaseKernel(kernel_ssm_conv_copy_input); }
-        if (kernel_ssm_conv_copy_state) { clReleaseKernel(kernel_ssm_conv_copy_state); }
-        if (kernel_rms_norm_mul_mm_f16_f32_smallm) {
-            clReleaseKernel(kernel_rms_norm_mul_mm_f16_f32_smallm);
-        }
-        if (kernel_adreno_xmem_store_dst_f32_coalesced) {
-            clReleaseKernel(kernel_adreno_xmem_store_dst_f32_coalesced);
-        }
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         if (kernel_adreno_xmem_pack_src_f32_k) {
             clReleaseKernel(kernel_adreno_xmem_pack_src_f32_k);
         }
+#endif
     }
 
     void free() {
@@ -1471,22 +1463,30 @@ struct ggml_backend_opencl_context {
 
 ggml_backend_opencl_device_context::~ggml_backend_opencl_device_context() {
     if (backend_ctx) {
-        for (cl_kernel & kernel : backend_ctx->kernel_soft_max_4_cached) {
-            if (kernel) {
-                clReleaseKernel(kernel);
-                kernel = nullptr;
+        cl_kernel * kernels[] = {
+            &backend_ctx->kernel_dsv4_hc_post_sum_v4,
+            &backend_ctx->kernel_rms_norm_mul_mm_f16_f32_smallm,
+            &backend_ctx->kernel_ssm_conv_silu_prefill,
+            &backend_ctx->kernel_ssm_conv_copy_input,
+            &backend_ctx->kernel_ssm_conv_copy_state,
+            &backend_ctx->kernel_soft_max_4_cached[0],
+            &backend_ctx->kernel_soft_max_4_cached[1],
+            &backend_ctx->kernel_soft_max_4_cached[2],
+            &backend_ctx->kernel_soft_max_4_cached[3],
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+            &backend_ctx->kernel_adreno_xmem_store_dst_f32_coalesced,
+            &backend_ctx->kernel_gemm_noshuffle_q4_k_f32_acc32_r2,
+            &backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4,
+#endif
+        };
+        for (cl_kernel * kernel : kernels) {
+            if (*kernel) {
+                clReleaseKernel(*kernel);
+                *kernel = nullptr;
             }
         }
     }
-    if (backend_ctx && backend_ctx->kernel_dsv4_hc_post_sum_v4) {
-        clReleaseKernel(backend_ctx->kernel_dsv4_hc_post_sum_v4);
-        backend_ctx->kernel_dsv4_hc_post_sum_v4 = nullptr;
-    }
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    if (backend_ctx && backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4) {
-        clReleaseKernel(backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4);
-        backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4 = nullptr;
-    }
     // Backend contexts are cached across ref_count reaching zero. Only the
     // owning device registry's destruction ends this optional kernel's life.
     if (backend_ctx && backend_ctx->kernel_mla_qk_prefill) {
