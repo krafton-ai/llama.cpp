@@ -10558,11 +10558,14 @@ struct test_rms_norm_mul_add_bcast : public test_case {
     }
 };
 
-// GGML_OP_CONCAT(conv state, new token) + CPY(new conv state -> cache) + SSM_CONV + SILU: one decode step of a short
-// conv, in the node order of build_conv_state
+// Short convolution and state update in the node order of build_conv_state.
 struct test_concat_ssm_conv_silu : public test_case {
     const int64_t d_conv;
     const int64_t n_ch;
+    const int64_t n_tokens;
+    const int variant;
+    const int64_t n_seqs;
+    std::vector<ggml_tensor *> checked;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -10570,31 +10573,47 @@ struct test_concat_ssm_conv_silu : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR2(d_conv, n_ch);
+        return VARS_TO_STR5(d_conv, n_ch, n_tokens, variant, n_seqs);
     }
 
     bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
 
-    test_concat_ssm_conv_silu(int64_t d_conv, int64_t n_ch)
-        : d_conv(d_conv), n_ch(n_ch) {}
+    test_concat_ssm_conv_silu(int64_t d_conv, int64_t n_ch, int64_t n_tokens = 1, int variant = 0, int64_t n_seqs = 1)
+        : d_conv(d_conv), n_ch(n_ch), n_tokens(n_tokens), variant(variant), n_seqs(n_seqs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv - 1, n_ch);
+        checked.clear();
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, n_ch, n_seqs);
         ggml_set_name(state, "state");
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, 1);
+        ggml_tensor * x;
+        if (variant == 1) {
+            ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (n_ch + 16) * n_tokens * n_seqs + 16);
+            x = ggml_view_3d(ctx, storage, n_ch, n_tokens, n_seqs, (n_ch + 16) * sizeof(float), (n_ch + 16) * n_tokens * sizeof(float), 64);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ch, n_tokens, n_seqs);
+        }
         ggml_set_name(x, "x");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_ch);
         ggml_set_name(w, "w");
-        ggml_tensor * cache = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (d_conv - 1)*n_ch);
+        ggml_tensor * cache = variant == 5 ? ggml_reshape_1d(ctx, state, (d_conv - 1) * n_ch * n_seqs) : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (d_conv - 1) * n_ch * n_seqs);
         ggml_set_name(cache, "cache");
 
         ggml_tensor * cat  = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
-        ggml_tensor * last = ggml_view_2d(ctx, cat, d_conv - 1, n_ch, cat->nb[1], ggml_element_size(cat));
+        ggml_tensor * last = ggml_view_3d(ctx, cat, d_conv - 1, n_ch, n_seqs, cat->nb[1], cat->nb[2], n_tokens * ggml_element_size(cat));
         ggml_tensor * cpy  = ggml_cpy(ctx, last, cache);
-        ggml_tensor * act  = ggml_silu(ctx, ggml_ssm_conv(ctx, cat, w));
+        ggml_tensor * conv = ggml_ssm_conv(ctx, cat, w);
+        ggml_tensor * act  = ggml_silu(ctx, conv);
+        if (variant == 2) { ggml_set_output(cat); checked.push_back(cat); }
+        if (variant == 3) { ggml_set_output(conv); checked.push_back(conv); }
 
         // both results in one output, the copy first
-        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, cpy, d_conv - 1, n_ch), ggml_reshape_2d(ctx, act, 1, n_ch), 0);
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, cpy, ggml_nelements(cpy)), ggml_reshape_1d(ctx, act, ggml_nelements(act)), 0);
+        if (variant == 4) {
+            ggml_tensor * extra = ggml_scale(ctx, cat, 0.5f);
+            out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, extra, ggml_nelements(extra)), 0);
+        }
+        if (!checked.empty()) { checked.push_back(out); }
         ggml_set_name(out, "out");
         return out;
     }
@@ -14626,6 +14645,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 3000));
     test_cases.emplace_back(new test_concat_ssm_conv_silu(3, 64));
     test_cases.emplace_back(new test_concat_ssm_conv_silu(8, 50));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 6144, 256));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 6144, 257));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 3072, 256));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(8, 6148, 33));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(2, 256, 16));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 6144, 64));
+    for (int variant : {1, 2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 6144, 256, variant));
+    }
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 256, 7));
+    test_cases.emplace_back(new test_concat_ssm_conv_silu(4, 256, 64, 0, 2));
 
     test_cases.emplace_back(new test_dsv4_hc_post_sum(512, 1));
     test_cases.emplace_back(new test_dsv4_hc_post_sum(31, 3));

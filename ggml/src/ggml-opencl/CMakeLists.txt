@@ -222,6 +222,7 @@ set(GGML_OPENCL_KERNELS
     sqr
     sqrt
     ssm_conv
+    ssm_conv_silu_prefill
     ssm_scan
     gated_delta_net
     sub

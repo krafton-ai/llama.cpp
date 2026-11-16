@@ -906,6 +906,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rms_norm_mul_sigmoid_mul      = nullptr;
     cl_kernel kernel_rms_norm_mul_add_bcast        = nullptr;
     cl_kernel kernel_concat_ssm_conv_silu          = nullptr;
+    cl_kernel kernel_ssm_conv_silu_prefill         = nullptr;
+    cl_kernel kernel_ssm_conv_copy_input           = nullptr;
+    cl_kernel kernel_ssm_conv_copy_state           = nullptr;
     cl_kernel kernel_dsv4_hc_post_sum              = nullptr;
     cl_kernel kernel_dsv4_hc_post_sum_v4           = nullptr;
     cl_kernel kernel_fill;
@@ -1410,6 +1413,9 @@ struct ggml_backend_opencl_context {
 
     ~ggml_backend_opencl_context() {
         release_ncol_kernels();
+        if (kernel_ssm_conv_silu_prefill) { clReleaseKernel(kernel_ssm_conv_silu_prefill); }
+        if (kernel_ssm_conv_copy_input) { clReleaseKernel(kernel_ssm_conv_copy_input); }
+        if (kernel_ssm_conv_copy_state) { clReleaseKernel(kernel_ssm_conv_copy_state); }
         if (kernel_rms_norm_mul_mm_f16_f32_smallm) {
             clReleaseKernel(kernel_rms_norm_mul_mm_f16_f32_smallm);
         }
@@ -4084,6 +4090,44 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32_t = clCreateKernel(prog, "kernel_ssm_conv_f32_f32_t", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
+    }
+
+    if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string source {
+            #include "ssm_conv_silu_prefill.cl.h"
+        };
+#else
+        const std::string source = read_file("ssm_conv_silu_prefill.cl");
+#endif
+        cl_kernel conv = ggml_cl_build_optional_kernel(backend_ctx, source, compile_opts, "kernel_ssm_conv_silu_prefill", 64);
+        if (conv) {
+            cl_program program = nullptr;
+            cl_kernel copy = nullptr, state = nullptr;
+            bool valid = clGetKernelInfo(conv, CL_KERNEL_PROGRAM, sizeof(program), &program, nullptr) == CL_SUCCESS;
+            if (valid) {
+                copy = clCreateKernel(program, "kernel_ssm_conv_copy_input", &err);
+                valid = err == CL_SUCCESS;
+            }
+            if (valid) {
+                state = clCreateKernel(program, "kernel_ssm_conv_copy_state", &err);
+                valid = err == CL_SUCCESS;
+            }
+            for (cl_kernel k : {copy, state}) {
+                size_t limit = 0;
+                valid = valid && k && clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
+                    sizeof(limit), &limit, nullptr) == CL_SUCCESS && limit >= 64;
+            }
+            if (valid) {
+                backend_ctx->kernel_ssm_conv_silu_prefill = conv;
+                backend_ctx->kernel_ssm_conv_copy_input = copy;
+                backend_ctx->kernel_ssm_conv_copy_state = state;
+            } else {
+                clReleaseKernel(conv);
+                if (copy) { clReleaseKernel(copy); }
+                if (state) { clReleaseKernel(state); }
+            }
+        }
     }
 
     // ssm_scan
@@ -9302,16 +9346,25 @@ static bool ggml_opencl_only_users(const ggml_cgraph * cgraph,
     return true;
 }
 
-// one decode token of the delta-net short conv: CONCAT(conv state, x^T) at node i, then the CPY of the new state
-// into the recurrent cache, SSM_CONV and SILU. Returns the SILU node, the CPY and the SSM_CONV in nodes[]
-static bool ggml_opencl_match_concat_ssm_conv_silu(const ggml_cgraph * cgraph, int i, const ggml_tensor * nodes[3]) {
+// Match the short convolution and its state update. Return SILU, CPY and SSM_CONV in nodes[].
+static bool ggml_opencl_match_concat_ssm_conv_silu(ggml_backend_opencl_context * ctx, const ggml_cgraph * cgraph, int i, const ggml_tensor * nodes[3]) {
     const ggml_tensor * cat = cgraph->nodes[i];
     const ggml_tensor * st  = cat->src[0];
     const ggml_tensor * x   = cat->src[1];
-    const int64_t       nc = cat->ne[0], nch = cat->ne[1];
+    if (st->ne[0] < 1 || st->ne[0] > 7 || x->ne[0] < 1 || x->ne[0] > 512) {
+        return false;
+    }
+    const int64_t       nc = st->ne[0] + 1, nch = cat->ne[1], nt = x->ne[0];
+    const bool prefill = nt >= 16;
     if (ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || st->type != GGML_TYPE_F32 ||
-        x->type != GGML_TYPE_F32 || nc < 2 || nc > 8 || x->ne[0] != 1 || st->ne[0] != nc - 1 || cat->ne[2] != 1 ||
+        x->type != GGML_TYPE_F32 || nc < 2 || nc > 8 || (!prefill && nt != 1) || cat->ne[0] != nt + nc - 1 || cat->ne[2] != 1 ||
         cat->ne[3] != 1) {
+        return false;
+    }
+    if (prefill && (!ctx->kernel_ssm_conv_silu_prefill ||
+        nt > 512 || nch < 256 || nch > 8192 || !ggml_is_contiguous(st) || !ggml_is_contiguous(cat) ||
+        x->nb[1] != sizeof(float) || x->nb[0] % sizeof(float) || x->nb[0] / sizeof(float) < (size_t) nch ||
+        x->nb[0] / sizeof(float) > (size_t) INT_MAX / (size_t) nt)) {
         return false;
     }
     const int j1 = ggml_opencl_next_compute(cgraph, i);
@@ -9331,7 +9384,7 @@ static bool ggml_opencl_match_concat_ssm_conv_silu(const ggml_cgraph * cgraph, i
     const ggml_tensor * conv = cgraph->nodes[j2];
     const ggml_tensor * act  = cgraph->nodes[j3];
     const ggml_tensor * last = cpy->src[0];
-    if (cpy->op != GGML_OP_CPY || last == nullptr || last->view_src != cat || last->view_offs != sizeof(float) ||
+    if (cpy->op != GGML_OP_CPY || last == nullptr || last->view_src != cat || last->view_offs != nt * sizeof(float) ||
         last->ne[0] != nc - 1 || last->ne[1] != nch || last->nb[1] != cat->nb[1] || cpy->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(cpy) || ggml_nelements(cpy) != (nc - 1) * nch || cpy->src[1] == nullptr ||
         cpy->src[1]->extra == nullptr) {
@@ -9348,17 +9401,34 @@ static bool ggml_opencl_match_concat_ssm_conv_silu(const ggml_cgraph * cgraph, i
     if (!ggml_opencl_only_users(cgraph, cat, cpy, conv) || !ggml_opencl_only_users(cgraph, conv, act, nullptr)) {
         return false;
     }
-    // the fused kernel writes the outputs while it reads the inputs: no output may overlap an input, except the
-    // same element read and written by one work item (x[c] -> y[c], or the new state over the old one in place)
+    if (prefill) {
+        if (!ggml_is_contiguous(conv->src[1]) || conv->ne[0] != nch || conv->ne[1] != nt) {
+            return false;
+        }
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if ((n->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                (n == cat || n == conv || n->view_src == cat || n->view_src == conv)) {
+                return false;
+            }
+        }
+    }
+    // Decode allows only element-wise input aliases. Prefill copies x to cat before writing the output.
     const ggml_cl_range rs = ggml_cl_tensor_range(st), rx = ggml_cl_tensor_range(x),
                         rw = ggml_cl_tensor_range(conv->src[1]);
-    const ggml_cl_range ry = ggml_cl_tensor_range(act), rd = ggml_cl_tensor_range(cpy);
+    const ggml_cl_range ry = ggml_cl_tensor_range(act), rd = ggml_cl_tensor_range(cpy), rc = ggml_cl_tensor_range(cat);
     const bool          y_on_x = ry.buf == rx.buf && ry.first == rx.first && x->nb[1] == sizeof(float);
     const bool          s_on_s = rd.buf == rs.buf && rd.first == rs.first && ggml_is_contiguous(st);
-    if ((ggml_cl_ranges_overlap(ry, rx) && !y_on_x) || ggml_cl_ranges_overlap(ry, rs) ||
+    if ((ggml_cl_ranges_overlap(ry, rx) && !prefill && !y_on_x) || ggml_cl_ranges_overlap(ry, rs) ||
         ggml_cl_ranges_overlap(ry, rw) || ggml_cl_ranges_overlap(ry, rd) ||
         (ggml_cl_ranges_overlap(rd, rs) && !s_on_s) || ggml_cl_ranges_overlap(rd, rx) ||
         ggml_cl_ranges_overlap(rd, rw)) {
+        return false;
+    }
+    if (prefill && (ggml_cl_ranges_overlap(rc, rx) || ggml_cl_ranges_overlap(rc, rs) ||
+        ggml_cl_ranges_overlap(rc, rw) || ggml_cl_ranges_overlap(rc, ry) || ggml_cl_ranges_overlap(rc, rd) ||
+        (rs.first % sizeof(float)) || (rx.first % sizeof(float)) || (rw.first % sizeof(float)) ||
+        (ry.first % sizeof(float)) || (rd.first % sizeof(float)) || (rc.first % sizeof(float)))) {
         return false;
     }
     // nodes between run after the fused kernel: none may touch the outputs or overwrite the inputs
@@ -9370,13 +9440,13 @@ static bool ggml_opencl_match_concat_ssm_conv_silu(const ggml_cgraph * cgraph, i
         }
         const ggml_cl_range rn = ggml_cl_tensor_range(n);
         if (ggml_cl_ranges_overlap(rn, ry) || ggml_cl_ranges_overlap(rn, rd) || ggml_cl_ranges_overlap(rn, rs) ||
-            ggml_cl_ranges_overlap(rn, rx) || ggml_cl_ranges_overlap(rn, rw)) {
+            ggml_cl_ranges_overlap(rn, rx) || ggml_cl_ranges_overlap(rn, rw) || (prefill && ggml_cl_ranges_overlap(rn, rc))) {
             return false;
         }
         for (int k = 0; k < GGML_MAX_SRC; ++k) {
             if (n->src[k] && n->src[k]->extra) {
                 const ggml_cl_range rk = ggml_cl_tensor_range(n->src[k]);
-                if (ggml_cl_ranges_overlap(rk, ry) || ggml_cl_ranges_overlap(rk, rd)) {
+                if (ggml_cl_ranges_overlap(rk, ry) || ggml_cl_ranges_overlap(rk, rd) || (prefill && ggml_cl_ranges_overlap(rk, rc))) {
                     return false;
                 }
             }
@@ -10319,6 +10389,42 @@ static void ggml_opencl_fused_concat_ssm_conv_silu(ggml_backend_t            bac
     const ggml_tensor *           x           = cat->src[1];
     const ggml_tensor *           w           = nodes[2]->src[1];
 
+    if (x->ne[0] > 1) {
+        const int C = (int) cat->ne[1], T = (int) x->ne[0], W = (int) st->ne[0] + 1;
+        const int pitch = (int) (x->nb[0] / sizeof(float));
+        size_t lws[] = {64, 1}, gws[] = {(size_t) CEIL_DIV(C, 64) * 64, (size_t) T};
+        cl_uint idx = 0;
+        cl_kernel k = backend_ctx->kernel_ssm_conv_copy_input;
+        ggml_opencl_arg_tensor(k, idx, x);
+        ggml_opencl_arg_tensor(k, idx, cat);
+        CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &C));
+        CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &T));
+        CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &pitch));
+        backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, cat);
+
+        k = backend_ctx->kernel_ssm_conv_silu_prefill;
+        idx = 0;
+        ggml_opencl_arg_tensor(k, idx, st);
+        ggml_opencl_arg_tensor(k, idx, cat);
+        ggml_opencl_arg_tensor(k, idx, w);
+        ggml_opencl_arg_tensor(k, idx, nodes[0]);
+        CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &C));
+        CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &T));
+        CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &W));
+        backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, nodes[0]);
+
+        k = backend_ctx->kernel_ssm_conv_copy_state;
+        idx = 0;
+        ggml_opencl_arg_tensor(k, idx, cat);
+        ggml_opencl_arg_tensor(k, idx, nodes[1]);
+        CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &C));
+        CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &T));
+        CL_CHECK(clSetKernelArg(k, idx++, sizeof(int), &W));
+        gws[1] = 1;
+        backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, nodes[1]);
+        return;
+    }
+
     const int      nc   = (int) cat->ne[0];
     const int      nch  = (int) cat->ne[1];
     const cl_ulong nbs0 = st->nb[0];
@@ -10469,7 +10575,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
         if (!backend_ctx->disable_fusion && backend_ctx->kernel_concat_ssm_conv_silu && node->op == GGML_OP_CONCAT &&
-            ggml_opencl_match_concat_ssm_conv_silu(cgraph, i, fused_skip)) {
+            ggml_opencl_match_concat_ssm_conv_silu(backend_ctx, cgraph, i, fused_skip)) {
             ggml_opencl_fused_concat_ssm_conv_silu(backend, node, fused_skip);
             continue;
         }
