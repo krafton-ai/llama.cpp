@@ -5215,7 +5215,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             if (m.conv == i) {
 #ifdef GGML_CUDA_DEBUG
-                GGML_LOG_INFO("%s: fused conv state %s: %d copies, %d tokens, l2_norm %d, state from cache row %d\n", __func__,
+                GGML_LOG_INFO("%s: fused conv state %s: %d copies, %d tokens, l2_norm %d, uses cached state: %d\n", __func__,
                               node->name, m.args.n_copies, m.args.n_t, m.args.y_l2 != nullptr, m.args.state_row != nullptr);
 #endif
                 // one token: with the f_a product and the two gates of the layer in one launch
@@ -5307,7 +5307,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0 || from_rows) {
 #ifdef GGML_CUDA_DEBUG
-            GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes), state from cache row %d\n",
+            GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes), uses cached state: %d\n",
                           __func__, node->name, nodes_to_skip, from_rows);
 #endif
             ggml_cuda_op_gated_delta_net_fused(*cuda_ctx, node, nodes_to_skip > 0 ? &fused_state_cpy : nullptr,
