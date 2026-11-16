@@ -8442,7 +8442,6 @@ static void ggml_vk_mla_expand_kv(ggml_backend_vk_context * ctx, vk_context& sub
 // MLA decode (DeepSeek / Raon-1 shape): 1 to 8 query tokens (MT: speculative verify), 16 to 64 query heads on one
 // latent head of 576 with V the first 512 of each K row. The scalar flash attention reads every K row once per head there (the heads exceed one GQA
 // workgroup); this kernel reads it once per workgroup for all heads, then reduces the splits like flash attention.
-// AMD only for now
 static bool ggml_vk_fa_mla_decode(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k,
         const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     if (ctx->device->vendor_id != VK_VENDOR_ID_AMD) {
