@@ -5,6 +5,8 @@
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
+
 void llama_model_raon1_nano::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,       hparams.n_embd_head_k_mla_impl);
@@ -442,6 +444,29 @@ llama_model_raon1_nano::graph::graph(const llama_model & model, const llm_graph_
         ggml_tensor * comb;
         ggml_tensor * cur = build_hc_pre(inp, layer.hc_attn_fn, layer.hc_attn_base, layer.hc_attn_chart, layer.attn_norm, &post, &comb, il);
         cb(cur, "attn_norm", il);
+        const bool cache_only = il == n_layer - 1 && !hparams.is_recr(il) && n_outputs == 0 && n_tokens > 1 && ubatch.n_seqs == 1 && ubatch.token && out_ids &&
+            cparams.causal_attn && !cparams.flash_attn && !cparams.embeddings && !cparams.embeddings_nextn && !cparams.training && !cparams.pipeline_parallel && !cparams.cb_eval &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; });
+        if (cache_only) {
+            const int64_t rank = hparams.n_lora_kv;
+            const int64_t nr = hparams.n_rot();
+            const auto * mctx_k = inp_attn->mctx;
+            ggml_tensor * kc = mctx_k->get_k(ctx0, il);
+            if (kc->type == GGML_TYPE_F16 && kc->ne[0] == rank + nr && kc->ne[1] == 1 && kc->ne[3] == 1) {
+                // Later chunks need this layer's cache, but not its output.
+                ggml_tensor * kv = build_lora_mm(layer.wkv_a_mqa, cur);
+                ggml_tensor * latent = ggml_view_2d(ctx0, kv, rank, n_tokens, kv->nb[1], 0);
+                latent = ggml_mul(ctx0, ggml_rms_norm(ctx0, latent, hparams.f_norm_rms_eps_latent), layer.attn_kv_a_norm);
+                ggml_tensor * extra = ggml_view_3d(ctx0, kv, nr, 1, n_tokens, kv->nb[1], kv->nb[1], rank*kv->nb[0]);
+                latent = ggml_reshape_3d(ctx0, latent, rank, 1, n_tokens);
+                ggml_tensor * k = ggml_concat(ctx0, latent, extra, 0);
+                ggml_build_forward_expand(gf, latent);
+                ggml_build_forward_expand(gf, k);
+                ggml_build_forward_expand(gf, mctx_k->cpy_k(ctx0, k, inp_attn->get_k_idxs(), il));
+                res->t_embd = ggml_get_rows(ctx0, cur, out_ids);
+                return;
+            }
+        }
         if (hparams.is_recr(il)) {
             cur = build_rda_layer(cur, layer, inp_rs, il);
         } else {
