@@ -921,6 +921,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
     cl_kernel kernel_diag_f32;
     cl_kernel kernel_soft_max, kernel_soft_max_4;
+    cl_kernel kernel_soft_max_4_cached[4] = {};
     cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16;
     ggml_opencl_fa_kernels fa;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -1453,6 +1454,14 @@ struct ggml_backend_opencl_context {
 };
 
 ggml_backend_opencl_device_context::~ggml_backend_opencl_device_context() {
+    if (backend_ctx) {
+        for (cl_kernel & kernel : backend_ctx->kernel_soft_max_4_cached) {
+            if (kernel) {
+                clReleaseKernel(kernel);
+                kernel = nullptr;
+            }
+        }
+    }
     if (backend_ctx && backend_ctx->kernel_dsv4_hc_post_sum_v4) {
         clReleaseKernel(backend_ctx->kernel_dsv4_hc_post_sum_v4);
         backend_ctx->kernel_dsv4_hc_post_sum_v4 = nullptr;
@@ -3455,6 +3464,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_soft_max_4 = clCreateKernel(backend_ctx->program_softmax_4_f32, "kernel_soft_max_4", &err), err));
+        if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
+            const int capacities[] = { 1, 4, 16, 32 };
+            for (int i = 0; i < 4; ++i) {
+                backend_ctx->kernel_soft_max_4_cached[i] = ggml_cl_build_optional_kernel(
+                    backend_ctx, kernel_src, compile_opts + " -DSOFT_MAX_4_CACHED -DSOFTMAX_CACHE_ITEMS=" + std::to_string(capacities[i]),
+                    "kernel_soft_max_4_cached", 64);
+            }
+        }
         // softmax that leaves the division to the normalizing PV split (see ggml_cl_soft_max)
         backend_ctx->kernel_soft_max_4_exp_sum = ggml_cl_build_optional_kernel(
             backend_ctx, kernel_src, compile_opts + " -DSOFT_MAX_4_EXP_SUM", "kernel_soft_max_4_exp_sum", 64);
@@ -31788,6 +31805,14 @@ static void ggml_cl_soft_max_ext(ggml_backend_t      backend,
             kernel = backend_ctx->kernel_soft_max_f16;
         } else {
             kernel = backend_ctx->kernel_soft_max;
+        }
+    }
+
+    if (!exp_sum && !use_f16 && backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E &&
+        ne01 > 1 && ne00 > 0 && ne00 <= 8192 && ne00 % 4 == 0) {
+        const int variant = ne00 <= 256 ? 0 : ne00 <= 1024 ? 1 : ne00 <= 4096 ? 2 : 3;
+        if (backend_ctx->kernel_soft_max_4_cached[variant]) {
+            kernel = backend_ctx->kernel_soft_max_4_cached[variant];
         }
     }
 
