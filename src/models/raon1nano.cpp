@@ -1,9 +1,7 @@
-#include "models.h"
-
 #include "llama-impl.h"
-
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
+#include "models.h"
 
 #include <algorithm>
 
@@ -359,6 +357,10 @@ ggml_tensor * llama_model_raon1_nano::graph::build_mla_layer(
             ggml_tensor * kq_limits = inp_attn_k->get_kq_limits(ctx0, ubatch);
             ggml_tensor * kq_mask   = kq_limits ? kq_limits : inp_attn_k->get_kq_mask();
             ggml_tensor * out = nullptr;
+            std::vector<ggml_tensor *> outputs;
+            if (g < n_head) {
+                outputs.reserve(n_head / g);
+            }
             for (int64_t h0 = 0; h0 < n_head; h0 += g) {
                 ggml_tensor * kvg = ggml_mla_expand_kv(ctx0, kc2, layer.wk_b, layer.wv_b, (int32_t) h0, (int32_t) g);
                 res->add_fused_node({LLM_FUSED_OP_MLA_EXPAND_KV, kvg, il});
@@ -367,7 +369,23 @@ ggml_tensor * llama_model_raon1_nano::graph::build_mla_layer(
                 ggml_tensor * vg = ggml_view_3d(ctx0, kvg, nv, g, n_kv, nv*e16, nv*g*e16, nk*g*n_kv*e16);
                 ggml_tensor * qg = ggml_view_3d(ctx0, q, nk, g, n_tokens, nk*q->nb[0], q->nb[1], h0*nk*q->nb[0]);
                 ggml_tensor * og = build_attn_mha(qg, kg, vg, nullptr, kq_mask, nullptr, nullptr, 0, 1.0f/sqrtf(nk), il);
-                out = out ? ggml_concat(ctx0, out, og, 0) : og;
+                if (g == n_head) {
+                    out = og;
+                } else {
+                    outputs.push_back(og);
+                }
+            }
+            // Preserve head order without recopying the whole prefix for every group.
+            while (outputs.size() > 1) {
+                size_t n = 0;
+                for (size_t i = 0; i < outputs.size(); i += 2) {
+                    outputs[n++] =
+                        i + 1 < outputs.size() ? ggml_concat(ctx0, outputs[i], outputs[i + 1], 0) : outputs[i];
+                }
+                outputs.resize(n);
+            }
+            if (!outputs.empty()) {
+                out = outputs.front();
             }
             cb(out, "mla_expanded", il);
             out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, cur)));
@@ -444,16 +462,24 @@ llama_model_raon1_nano::graph::graph(const llama_model & model, const llm_graph_
         ggml_tensor * comb;
         ggml_tensor * cur = build_hc_pre(inp, layer.hc_attn_fn, layer.hc_attn_base, layer.hc_attn_chart, layer.attn_norm, &post, &comb, il);
         cb(cur, "attn_norm", il);
-        const bool cache_only = il == n_layer - 1 && !hparams.is_recr(il) && n_outputs == 0 && n_tokens > 1 && ubatch.n_seqs == 1 && ubatch.token && out_ids &&
-            cparams.causal_attn && !cparams.flash_attn && !cparams.embeddings && !cparams.embeddings_nextn && !cparams.training && !cparams.pipeline_parallel && !cparams.cb_eval &&
-            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; });
+        // Later chunks need this layer's cache, but not its output. Keep hidden-state observers on the full path.
+        const bool cache_only =
+            il == n_layer - 1 && !hparams.is_recr(il) && n_outputs == 0 && ubatch.n_seqs == 1 && cparams.causal_attn &&
+            !cparams.embeddings && !cparams.embeddings_nextn && !cparams.training && !cparams.pipeline_parallel &&
+            !cparams.cb_eval &&
+            std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
+                         [](bool enabled) { return enabled; }) &&
+            ((!cparams.flash_attn && n_tokens > 1 && ubatch.token && out_ids &&
+              cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) ||
+             (cparams.flash_attn && cparams.mla_expand && n_tokens > (int64_t) cparams.mla_expand_min_tokens &&
+              cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP));
         if (cache_only) {
             const int64_t rank = hparams.n_lora_kv;
             const int64_t nr = hparams.n_rot();
             const auto * mctx_k = inp_attn->mctx;
             ggml_tensor * kc = mctx_k->get_k(ctx0, il);
-            if (kc->type == GGML_TYPE_F16 && kc->ne[0] == rank + nr && kc->ne[1] == 1 && kc->ne[3] == 1) {
-                // Later chunks need this layer's cache, but not its output.
+            if (kc->type == GGML_TYPE_F16 && (cparams.flash_attn || kc->ne[0] == rank + nr) && kc->ne[1] == 1 &&
+                kc->ne[3] == 1) {
                 ggml_tensor * kv = build_lora_mm(layer.wkv_a_mqa, cur);
                 ggml_tensor * latent = ggml_view_2d(ctx0, kv, rank, n_tokens, kv->nb[1], 0);
                 latent = ggml_mul(ctx0, ggml_rms_norm(ctx0, latent, hparams.f_norm_rms_eps_latent), layer.attn_kv_a_norm);
@@ -463,6 +489,7 @@ llama_model_raon1_nano::graph::graph(const llama_model & model, const llm_graph_
                 ggml_build_forward_expand(gf, latent);
                 ggml_build_forward_expand(gf, k);
                 ggml_build_forward_expand(gf, mctx_k->cpy_k(ctx0, k, inp_attn->get_k_idxs(), il));
+                // Keep the empty output-index input reachable for set_inputs and graph reuse.
                 res->t_embd = ggml_get_rows(ctx0, cur, out_ids);
                 return;
             }
