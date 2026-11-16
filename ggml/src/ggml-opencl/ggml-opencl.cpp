@@ -1327,6 +1327,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_convert_block_q4_k_tiled_ns;    // tiled-wide convert (opt-in)
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_mc3;  // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_acc32_r2 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_acc32;  // F32 accumulator (GGML_PREC_F32)
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_32b_trans_ila_a8_bin;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_ila_a8_bin;
@@ -1413,6 +1414,7 @@ struct ggml_backend_opencl_context {
 
     ~ggml_backend_opencl_context() {
         release_ncol_kernels();
+        if (kernel_gemm_noshuffle_q4_k_f32_acc32_r2) { clReleaseKernel(kernel_gemm_noshuffle_q4_k_f32_acc32_r2); }
         if (kernel_ssm_conv_silu_prefill) { clReleaseKernel(kernel_ssm_conv_silu_prefill); }
         if (kernel_ssm_conv_copy_input) { clReleaseKernel(kernel_ssm_conv_copy_input); }
         if (kernel_ssm_conv_copy_state) { clReleaseKernel(kernel_ssm_conv_copy_state); }
@@ -4870,6 +4872,26 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_kimg", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+        if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
+            cl_program row2 = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
+                kernel_src.c_str(), compile_opts + " -DQ4_ACC32_R2", false, "q4_acc32_r2");
+            if (row2) {
+                cl_kernel k = ggml_cl_create_optional_kernel(backend_ctx, row2, "kernel_gemm_noshuffle_q4_k_f32_acc32_r2", 64);
+                if (k) {
+                    const size_t lws[] = {1, 64, 1};
+                    size_t subgroup = 0, count = 0;
+                    if (clGetKernelSubGroupInfo(k, backend_ctx->device, CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
+                            sizeof(lws), lws, sizeof(subgroup), &subgroup, nullptr) != CL_SUCCESS ||
+                        clGetKernelSubGroupInfo(k, backend_ctx->device, CL_KERNEL_SUB_GROUP_COUNT_FOR_NDRANGE,
+                            sizeof(lws), lws, sizeof(count), &count, nullptr) != CL_SUCCESS || subgroup != 64 || count != 1) {
+                        clReleaseKernel(k);
+                        k = nullptr;
+                    }
+                }
+                backend_ctx->kernel_gemm_noshuffle_q4_k_f32_acc32_r2 = k;
+                CL_CHECK(clReleaseProgram(row2));
+            }
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -24806,6 +24828,13 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                : use_r1   ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1
                : use_kimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg
                           : backend_ctx->kernel_gemm_noshuffle_q4_k_f32;
+        const bool use_acc32_r2 = use_acc32 && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_acc32_r2 &&
+            ne01 == 1536 && ne00 == 6144 && ne1 >= 9 && ne1 <= 512 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            dst->ne[2] == 1 && dst->ne[3] == 1;
+        if (use_acc32_r2) {
+            kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_acc32_r2;
+        }
         int padded_N = N + padding;
 
         if (use_kimg) {
@@ -24855,12 +24884,12 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             local_work_size[1] = 128;
             local_work_size[2] = 1;
         } else {
-            // Default: x2-unified base kernel is the 4-row (gx<<2) tile.
+            // Each work item handles eight tokens and two or four output rows.
             global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
-            global_work_size[1] = (size_t)CEIL_DIV(ne01, 4);
+            global_work_size[1] = (size_t)CEIL_DIV(ne01, use_acc32_r2 ? 2 : 4);
             global_work_size[2] = 1;
             local_work_size[0] = 1;
-            local_work_size[1] = 128;
+            local_work_size[1] = use_acc32_r2 ? 64 : 128;
             local_work_size[2] = 1;
         }
 

@@ -14648,6 +14648,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 1536, 1536, 3, false));
     test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 2112, 2816, 3, true));
 
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 256, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 257, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 64, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 65, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 9, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 512, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 512, 6144, 9, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 5888, 9, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 8, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 513, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 1, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q4_K, 1536, 6144, 256, false));
+
     for (int64_t n_tokens : {1, 4, 8, 9}) {
         test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 2048, 17, n_tokens));
     }
