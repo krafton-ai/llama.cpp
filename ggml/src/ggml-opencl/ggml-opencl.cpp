@@ -25177,7 +25177,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         if (!use_o4_global && !use_tiled) {
             // image for ql
             img_fmt.image_channel_order = CL_R;
-            img_fmt.image_channel_data_type = CL_FLOAT;
+            img_fmt.image_channel_data_type = CL_UNSIGNED_INT32;
             memset(&img_desc, 0, sizeof(img_desc));
             img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
             img_desc.image_width = ne01 * ne00 / 8;

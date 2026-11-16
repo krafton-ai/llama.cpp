@@ -6750,6 +6750,30 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_mul_mat_precision : public test_mul_mat {
+    const bool f32;
+
+    test_mul_mat_precision(ggml_type type, int64_t m, int64_t k, int64_t n, bool f32)
+        : test_mul_mat(type, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}), f32(f32) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_PRECISION";
+    }
+
+    std::string vars() override {
+        return test_mul_mat::vars() + "," + VARS_TO_STR1(f32);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        if (f32) {
+            ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        }
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -14610,6 +14634,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 1024, 8, 64));
     test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 6144, 24, 256));
     test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F32, 6144, 17, 256));
+
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 8192, 1536, 1, false));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 8192, 1536, 1, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 1536, 6144, 1, false));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 1536, 6144, 1, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 6144, 1536, 1, false));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 1536, 1536, 1, false));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 2112, 2816, 1, false));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 512, 512, 1, false));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 32768, 512, 1, false));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 33024, 512, 1, true));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 1536, 1536, 3, false));
+    test_cases.emplace_back(new test_mul_mat_precision(GGML_TYPE_Q6_K, 2112, 2816, 3, true));
 
     for (int64_t n_tokens : {1, 4, 8, 9}) {
         test_cases.emplace_back(new test_rms_norm_mul_mat_add(GGML_TYPE_F16, 2048, 17, n_tokens));
