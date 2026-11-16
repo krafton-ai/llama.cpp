@@ -10869,7 +10869,6 @@ inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #endif
 }
 
-#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 // MLA latent head at decode: one row of n_head heads sharing one KV head is n_head rows of one head, so the tile
 // reads K and V once instead of once per head. Sinks and the ALiBi slope are per head and rule the fold out
 static bool ggml_cl_fa_fold_heads_to_rows(const ggml_tensor * op) {
@@ -10880,6 +10879,7 @@ static bool ggml_cl_fa_fold_heads_to_rows(const ggml_tensor * op) {
            op->src[4] == nullptr && max_bias == 0.0f;
 }
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
     if (backend_ctx->fa.kernel_flash_attn_f32_f16_bin == nullptr) {
         return false;
