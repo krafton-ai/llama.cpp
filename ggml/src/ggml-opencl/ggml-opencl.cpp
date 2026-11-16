@@ -907,6 +907,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rms_norm_mul_add_bcast        = nullptr;
     cl_kernel kernel_concat_ssm_conv_silu          = nullptr;
     cl_kernel kernel_dsv4_hc_post_sum              = nullptr;
+    cl_kernel kernel_dsv4_hc_post_sum_v4           = nullptr;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
@@ -1452,6 +1453,10 @@ struct ggml_backend_opencl_context {
 };
 
 ggml_backend_opencl_device_context::~ggml_backend_opencl_device_context() {
+    if (backend_ctx && backend_ctx->kernel_dsv4_hc_post_sum_v4) {
+        clReleaseKernel(backend_ctx->kernel_dsv4_hc_post_sum_v4);
+        backend_ctx->kernel_dsv4_hc_post_sum_v4 = nullptr;
+    }
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     if (backend_ctx && backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4) {
         clReleaseKernel(backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4);
@@ -1971,6 +1976,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_add_bcast = clCreateKernel(prog, "kernel_rms_norm_mul_add_bcast", &err), err));
         CL_CHECK((backend_ctx->kernel_concat_ssm_conv_silu = clCreateKernel(prog, "kernel_concat_ssm_conv_silu", &err), err));
         CL_CHECK((backend_ctx->kernel_dsv4_hc_post_sum = clCreateKernel(prog, "kernel_dsv4_hc_post_sum", &err), err));
+        CL_CHECK((backend_ctx->kernel_dsv4_hc_post_sum_v4 = clCreateKernel(prog, "kernel_dsv4_hc_post_sum_v4", &err), err));
+        size_t post_max_wg = 0;
+        CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_dsv4_hc_post_sum_v4, backend_ctx->device,
+                                         CL_KERNEL_WORK_GROUP_SIZE, sizeof(post_max_wg), &post_max_wg, nullptr));
+        if (post_max_wg < 64) {
+            CL_CHECK(clReleaseKernel(backend_ctx->kernel_dsv4_hc_post_sum_v4));
+            backend_ctx->kernel_dsv4_hc_post_sum_v4 = nullptr;
+        }
         // the fusion kernels use 256-wide work-groups; without them the unfused graph runs
         cl_kernel * fused[] = {
             &backend_ctx->kernel_rms_norm_mul_mat_add_part_f16,
@@ -9895,6 +9908,12 @@ static void ggml_opencl_dsv4_hc_post_sum(ggml_backend_t backend, const ggml_tens
     const cl_ulong nb1      = hp->nb[1];
     const cl_ulong nb2      = hp->nb[2];
     const cl_ulong nbs1     = sum ? sum->nb[1] : hp->nb[2];
+    const bool use_vector = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E &&
+                            backend_ctx->kernel_dsv4_hc_post_sum_v4 && nt > 1 && n % 4 == 0 &&
+                            nbx0 == sizeof(float) && nbr0 == sizeof(float) && nb0 == sizeof(float);
+    if (use_vector) {
+        kernel = backend_ctx->kernel_dsv4_hc_post_sum_v4;
+    }
 
     // the sum goes through the scratch buffer when the allocator gave it the memory of an input or of the streams
     bool via_tmp = false;
@@ -9946,7 +9965,8 @@ static void ggml_opencl_dsv4_hc_post_sum(ggml_backend_t backend, const ggml_tens
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbs1));
 
     size_t lws[2] = { 64, 1 };
-    size_t gws[2] = { (size_t) (n + 63) / 64 * 64, (size_t) nt };
+    const size_t columns = use_vector ? n / 4 : n;
+    size_t gws[2] = { (columns + 63) / 64 * 64, (size_t) nt };
     backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, hp);
     if (via_tmp) {
         ggml_tensor_extra_cl * es = (ggml_tensor_extra_cl *) sum->extra;

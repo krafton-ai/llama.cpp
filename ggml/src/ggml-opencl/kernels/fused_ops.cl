@@ -473,6 +473,67 @@ kernel void kernel_dsv4_hc_post_sum(
     }
 }
 
+// Four adjacent coordinates share each stream coefficient.
+kernel void kernel_dsv4_hc_post_sum_v4(
+        global const char * x,
+        ulong offset_x,
+        ulong nbx0,
+        ulong nbx1,
+        global const char * res,
+        ulong offset_r,
+        ulong nbr0,
+        ulong nbr1,
+        ulong nbr2,
+        global const char * post,
+        ulong offset_p,
+        ulong nbp0,
+        ulong nbp1,
+        global const char * comb,
+        ulong offset_c,
+        ulong nbc0,
+        ulong nbc1,
+        ulong nbc2,
+        global char * dst,
+        ulong offsetd,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        int n,
+        int nt,
+        int hc,
+        int has_comb,
+        int has_sum,
+        global char * sdst,
+        ulong offset_sd,
+        ulong nbs1) {
+    const int i = 4 * get_global_id(0);
+    const int t = get_global_id(1);
+    if (i >= n || t >= nt) {
+        return;
+    }
+    float4 rv[FUSED_MAX_HC];
+    for (int s = 0; s < hc; ++s) {
+        rv[s] = vload4(0, (global const float *) (res + offset_r + i * nbr0 + s * nbr1 + t * nbr2));
+    }
+    const float4 xv = vload4(0, (global const float *) (x + offset_x + i * nbx0 + t * nbx1));
+    float4 tot = 0.0f;
+    for (int d = 0; d < hc; ++d) {
+        float4 v = xv * *(global const float *) (post + offset_p + d * nbp0 + t * nbp1);
+        if (has_comb) {
+            for (int s = 0; s < hc; ++s) {
+                v += rv[s] * *(global const float *) (comb + offset_c + d * nbc0 + s * nbc1 + t * nbc2);
+            }
+        } else {
+            v += rv[d];
+        }
+        vstore4(v, 0, (global float *) (dst + offsetd + i * nb0 + d * nb1 + t * nb2));
+        tot += v;
+    }
+    if (has_sum) {
+        vstore4(tot, 0, (global float *) (sdst + offset_sd + i * sizeof(float) + t * nbs1));
+    }
+}
+
 //------------------------------------------------------------------------------
 // concat_ssm_conv_silu: one token of CONCAT(state, x^T) -> CPY(new state) -> SSM_CONV -> SILU.
 // Item c: v = [state[0..nc-2, c], x[c]], y[c] = silu(sum_k v[k] w[k, c]), new state = v[1..nc-1]

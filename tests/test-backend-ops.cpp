@@ -14603,6 +14603,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post_sum(512, 1));
     test_cases.emplace_back(new test_dsv4_hc_post_sum(31, 3));
     test_cases.emplace_back(new test_dsv4_hc_post_sum(2560, 5));
+    test_cases.emplace_back(new test_dsv4_hc_post_sum(1536, 256));
+    test_cases.emplace_back(new test_dsv4_hc_post_sum(1532, 17));
 
     // only the final state, copied into the cache
     test_cases.emplace_back(new test_gated_delta_net_state_cpy(4, 32,  1, 1));
