@@ -236,8 +236,25 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_cok(
     }
 }
 
-// F32-accumulator variant: selected when the graph requests GGML_PREC_F32 for the matmul
-// (ggml_prec_set_acc). Same weight/activation layout and launch geometry as the half-accumulator kernel.
+#ifdef ACC32_TILE4
+typedef float4 acc32_float_t;
+typedef half4 acc32_half_t;
+#define ACC32_COLS 4
+#define ACC32_CONVERT convert_float4
+inline half4 acc32_read(read_only image1d_buffer_t src, int row, int col, int stride) {
+    return read_imageh(src, col + row * stride);
+}
+#else
+typedef float8 acc32_float_t;
+typedef half8 acc32_half_t;
+#define ACC32_COLS 8
+#define ACC32_CONVERT convert_float8
+inline half8 acc32_read(read_only image1d_buffer_t src, int row, int col, int stride) {
+    return (half8) (read_imageh(src, col * 2 + row * stride), read_imageh(src, col * 2 + 1 + row * stride));
+}
+#endif
+
+// F32 accumulators for GGML_PREC_F32; the weight and activation layouts stay the same.
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
 #endif
@@ -264,8 +281,8 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_acc32(
     int gx = get_global_id(1);  // m
     int gx_2 = gx << 2;
 
-    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-    half8 B;
+    acc32_float_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    acc32_half_t B;
     half4 dequantized_weights;
 
     global const ushort * ptr_ql = src0_ql + gx_2;
@@ -284,50 +301,46 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_acc32(
             float4 dqf;
             ushort4 bits4 = vload4(0, ptr_ql + (i/4)*m);
             uchar4  bits2 = vload4(0, ptr_qh + (i/4)*m);
-            B.s0123 = read_imageh(src1, gy*2 + (i + 0)*n_4 + 0);
-            B.s4567 = read_imageh(src1, gy*2 + (i + 0)*n_4 + 1);
+            B = acc32_read(src1, i + 0, gy, n_4);
             dqf.s0 = (convert_float((bits4.s0 & 0x000F) | ((bits2.s0 & 0x03) << 4)) - 32.f) * sc.s0;
             dqf.s1 = (convert_float((bits4.s1 & 0x000F) | ((bits2.s1 & 0x03) << 4)) - 32.f) * sc.s1;
             dqf.s2 = (convert_float((bits4.s2 & 0x000F) | ((bits2.s2 & 0x03) << 4)) - 32.f) * sc.s2;
             dqf.s3 = (convert_float((bits4.s3 & 0x000F) | ((bits2.s3 & 0x03) << 4)) - 32.f) * sc.s3;
-            c0 += convert_float8(B) * dqf.s0;
-            c1 += convert_float8(B) * dqf.s1;
-            c2 += convert_float8(B) * dqf.s2;
-            c3 += convert_float8(B) * dqf.s3;
-            B.s0123 = read_imageh(src1, gy*2 + (i + 1)*n_4 + 0);
-            B.s4567 = read_imageh(src1, gy*2 + (i + 1)*n_4 + 1);
+            c0 += ACC32_CONVERT(B) * dqf.s0;
+            c1 += ACC32_CONVERT(B) * dqf.s1;
+            c2 += ACC32_CONVERT(B) * dqf.s2;
+            c3 += ACC32_CONVERT(B) * dqf.s3;
+            B = acc32_read(src1, i + 1, gy, n_4);
             dqf.s0 = (convert_float(((bits4.s0 & 0x00F0) >> 4) | ((bits2.s0 & 0x0C) << 2)) - 32.f) * sc.s0;
             dqf.s1 = (convert_float(((bits4.s1 & 0x00F0) >> 4) | ((bits2.s1 & 0x0C) << 2)) - 32.f) * sc.s1;
             dqf.s2 = (convert_float(((bits4.s2 & 0x00F0) >> 4) | ((bits2.s2 & 0x0C) << 2)) - 32.f) * sc.s2;
             dqf.s3 = (convert_float(((bits4.s3 & 0x00F0) >> 4) | ((bits2.s3 & 0x0C) << 2)) - 32.f) * sc.s3;
-            c0 += convert_float8(B) * dqf.s0;
-            c1 += convert_float8(B) * dqf.s1;
-            c2 += convert_float8(B) * dqf.s2;
-            c3 += convert_float8(B) * dqf.s3;
-            B.s0123 = read_imageh(src1, gy*2 + (i + 2)*n_4 + 0);
-            B.s4567 = read_imageh(src1, gy*2 + (i + 2)*n_4 + 1);
+            c0 += ACC32_CONVERT(B) * dqf.s0;
+            c1 += ACC32_CONVERT(B) * dqf.s1;
+            c2 += ACC32_CONVERT(B) * dqf.s2;
+            c3 += ACC32_CONVERT(B) * dqf.s3;
+            B = acc32_read(src1, i + 2, gy, n_4);
             dqf.s0 = (convert_float(((bits4.s0 & 0x0F00) >> 8) | (bits2.s0 & 0x30)) - 32.f) * sc.s0;
             dqf.s1 = (convert_float(((bits4.s1 & 0x0F00) >> 8) | (bits2.s1 & 0x30)) - 32.f) * sc.s1;
             dqf.s2 = (convert_float(((bits4.s2 & 0x0F00) >> 8) | (bits2.s2 & 0x30)) - 32.f) * sc.s2;
             dqf.s3 = (convert_float(((bits4.s3 & 0x0F00) >> 8) | (bits2.s3 & 0x30)) - 32.f) * sc.s3;
-            c0 += convert_float8(B) * dqf.s0;
-            c1 += convert_float8(B) * dqf.s1;
-            c2 += convert_float8(B) * dqf.s2;
-            c3 += convert_float8(B) * dqf.s3;
-            B.s0123 = read_imageh(src1, gy*2 + (i + 3)*n_4 + 0);
-            B.s4567 = read_imageh(src1, gy*2 + (i + 3)*n_4 + 1);
+            c0 += ACC32_CONVERT(B) * dqf.s0;
+            c1 += ACC32_CONVERT(B) * dqf.s1;
+            c2 += ACC32_CONVERT(B) * dqf.s2;
+            c3 += ACC32_CONVERT(B) * dqf.s3;
+            B = acc32_read(src1, i + 3, gy, n_4);
             dqf.s0 = (convert_float(((bits4.s0 & mask_f000) >> 12) | ((bits2.s0 & mask_c0) >> 2)) - 32.f) * sc.s0;
             dqf.s1 = (convert_float(((bits4.s1 & mask_f000) >> 12) | ((bits2.s1 & mask_c0) >> 2)) - 32.f) * sc.s1;
             dqf.s2 = (convert_float(((bits4.s2 & mask_f000) >> 12) | ((bits2.s2 & mask_c0) >> 2)) - 32.f) * sc.s2;
             dqf.s3 = (convert_float(((bits4.s3 & mask_f000) >> 12) | ((bits2.s3 & mask_c0) >> 2)) - 32.f) * sc.s3;
-            c0 += convert_float8(B) * dqf.s0;
-            c1 += convert_float8(B) * dqf.s1;
-            c2 += convert_float8(B) * dqf.s2;
-            c3 += convert_float8(B) * dqf.s3;
+            c0 += ACC32_CONVERT(B) * dqf.s0;
+            c1 += ACC32_CONVERT(B) * dqf.s1;
+            c2 += ACC32_CONVERT(B) * dqf.s2;
+            c3 += ACC32_CONVERT(B) * dqf.s3;
         }
     }
 
-    int idx = (gy << 3) * m + (gx << 2);
+    int idx = gy * ACC32_COLS * m + (gx << 2);
 
     if (idx + 3 < m * n_no_padding) {
         vstore4((float4) (c0.s0, c1.s0, c2.s0, c3.s0), 0, dst + idx);
@@ -345,6 +358,7 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_acc32(
         vstore4((float4) (c0.s3, c1.s3, c2.s3, c3.s3), 0, dst + idx);
         idx += m;
     }
+#ifndef ACC32_TILE4
     if (idx + 3 < m * n_no_padding) {
         vstore4((float4) (c0.s4, c1.s4, c2.s4, c3.s4), 0, dst + idx);
         idx += m;
@@ -360,4 +374,5 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_acc32(
     if (idx + 3 < m * n_no_padding) {
         vstore4((float4) (c0.s7, c1.s7, c2.s7, c3.s7), 0, dst + idx);
     }
+#endif
 }

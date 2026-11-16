@@ -14496,6 +14496,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
     // GGML_PREC_F32 matmuls with sums beyond the F16 range, GEMV and GEMM
+    for (int64_t n : {5, 9}) {
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q6_K, 512, n, 4096));
+    }
+    for (int64_t n : {255, 256, 257, 512}) {
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q6_K, 1536, n, 6144));
+    }
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
         for (int64_t n : {1, 8, 16, 64}) {
             test_cases.emplace_back(new test_mul_mat_prec_f32(type_a, 512, n, 4096));
@@ -14704,6 +14710,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q6_K, 1536, 256, 6144));
 
     // gated delta net prompt processing at a 16-head, 128-wide state, with plain and KDA gates
     for (bool kda : {false, true}) {

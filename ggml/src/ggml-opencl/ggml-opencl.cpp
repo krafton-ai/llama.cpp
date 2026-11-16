@@ -1342,6 +1342,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_mc3;        // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_acc32;      // F32 accumulator (GGML_PREC_F32)
+    cl_kernel kernel_gemm_noshuffle_q6_K_f32_acc32_tile4 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_cok;
     cl_kernel kernel_gemm_noshuffle_q6_k_f32_32b_trans_ila_a8_bin;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_ila_a8_bin;
@@ -1452,6 +1453,10 @@ struct ggml_backend_opencl_context {
 
 ggml_backend_opencl_device_context::~ggml_backend_opencl_device_context() {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    if (backend_ctx && backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4) {
+        clReleaseKernel(backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4);
+        backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4 = nullptr;
+    }
     // Backend contexts are cached across ref_count reaching zero. Only the
     // owning device registry's destruction ends this optional kernel's life.
     if (backend_ctx && backend_ctx->kernel_mla_qk_prefill) {
@@ -5858,6 +5863,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_acc32", &err), err));
+        if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
+            cl_kernel k = ggml_cl_build_optional_kernel(backend_ctx, kernel_src, CL_moe_compile_opts + " -DACC32_TILE4",
+                "kernel_gemm_noshuffle_q6_K_f32_acc32", 256);
+            if (k) {
+                const size_t lws[] = {2, 128, 1};
+                size_t subgroup = 0, count = 0;
+                if (clGetKernelSubGroupInfo(k, backend_ctx->device, CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
+                        sizeof(lws), lws, sizeof(subgroup), &subgroup, nullptr) != CL_SUCCESS ||
+                    clGetKernelSubGroupInfo(k, backend_ctx->device, CL_KERNEL_SUB_GROUP_COUNT_FOR_NDRANGE,
+                        sizeof(lws), lws, sizeof(count), &count, nullptr) != CL_SUCCESS || subgroup != 128 || count != 2) {
+                    clReleaseKernel(k);
+                    k = nullptr;
+                }
+            }
+            backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4 = k;
+        }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_cok", &err), err));
         GGML_LOG_CONT(".");
     }
@@ -25149,8 +25170,10 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         static const bool q6k_gemm_cok  = (q6k_cok_env != nullptr) && (atoi(q6k_cok_env) != 0);
         // GGML_PREC_F32 (ggml_prec_set_acc): F32-accumulator kernel, see the q4_K path
         const bool use_q6k_acc32 = ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
+        // Use a smaller accumulator tile for wide down projections on X1E.
+        const bool use_q6k_tile4 = use_q6k_acc32 && backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4 && ne01 == 1536 && ne00 == 6144 && ne1 >= 256;
         const bool use_q6k_cok = !use_q6k_acc32 && q6k_gemm_cok && (ne1 <= 8);
-        kernel = use_q6k_acc32 ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32
+        kernel = use_q6k_acc32 ? (use_q6k_tile4 ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32_tile4 : backend_ctx->kernel_gemm_noshuffle_q6_K_f32_acc32)
                : use_q6k_cok ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok
                              : backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
         int padded_N = ne1 + padding;
@@ -25182,7 +25205,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             local_work_size[1] = 8;               // COK_NSG
             local_work_size[2] = 1;
         } else {
-            global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
+            global_work_size[0] = (size_t)CEIL_DIV(ne1, use_q6k_tile4 ? 4 : 8);
             global_work_size[1] = (size_t)CEIL_DIV(ne01, 4);
             global_work_size[2] = 1;
             local_work_size[0] = 2;
