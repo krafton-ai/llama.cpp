@@ -53,6 +53,7 @@ struct ggml_metal {
 
     // command buffer state
     int n_cb;           // number of extra threads used to submit the command buffers
+    int n_cb_default;   // n_cb requested at backend creation (batch graphs)
     int n_nodes_0;      // number of nodes submitted by the main thread
     int n_nodes_1;      // remaining number of nodes submitted by the n_cb threads
     int n_nodes_per_cb;
@@ -481,6 +482,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_SUCCESS;
     }
 
+    // Small graphs use two worker command buffers; larger batches keep the configured count.
+    const int n_cb_wanted = gf->nodes[0]->ne[1] <= 8 ? 2 : ctx->n_cb_default;
+    if (ctx->n_cb != n_cb_wanted) {
+        ggml_metal_set_n_cb(ctx, n_cb_wanted);
+    }
+
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
 
@@ -706,6 +713,7 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    if (ctx->n_cb_default == 0 && n_cb != 0) { ctx->n_cb_default = n_cb; }
     // when fusion stats are collected the graph must be encoded by a single thread so the
     // counters are race-free; override whatever the caller requested
     if (ggml_metal_fusion_info_stats(ctx->finfo)) {
