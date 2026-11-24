@@ -1,5 +1,6 @@
 #include "raon-hc-fuse.cuh"
 #include "ggml-impl.h"
+#include "ssm-conv.cuh"
 
 #include <cstdlib>
 #include <cstdio>
@@ -282,6 +283,41 @@ static __global__ void raon_hc_dp_f32(const float * mix, const float * scale_w, 
     dst[i0 * sd0 + idst * sd1] = sum;
 }
 
+// RDA gate chains.
+static __device__ __forceinline__ float rhc_softplus(float x) { return (x > 20.0f) ? x : logf(1.0f + expf(x)); }  // unary.cu op_softplus
+
+// E: NEG -> SOFTPLUS                                  (erase gate: softplus(-beta))
+static __global__ void raon_rda_e_f32(const float * x, const int n, float * dst) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = rhc_softplus(-x[i]);
+    }
+}
+
+// D: ADD(beta, delta) -> NEG -> SOFTPLUS -> SUB(erase, .) -> EXP -> MUL(v, .)   (per head h = i / head_dim)
+static __global__ void raon_rda_d_f32(const float * beta, const float * delta, const float * erase, const float * v, const int head_dim,
+        const int n, float * dst) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const int h = i / head_dim;
+        const float w  = rhc_softplus(-(beta[h] + delta[h]));
+        const float ex = expf(erase[h] - w);
+        dst[i] = v[i] * ex;
+    }
+}
+
+// F: MUL(t, a[h]) -> SCALE(s1,b1) -> SIGMOID -> SCALE(s2,b2)   (t = x + dt_bias already computed by the fused MUL_MAT bias)
+static __global__ void raon_rda_f_f32(const float * t, const float * a, const int head_dim, const int nh, const float s1, const float b1,
+        const float s2, const float b2, const int n, float * dst) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float u = __fmul_rn(t[i], a[(i / head_dim) % nh]);
+        const float v = s1 * u + b1;
+        const float g = rhc_sigmoid(v);
+        dst[i] = s2 * g + b2;
+    }
+}
+
 static constexpr int raon_fusion_max_tokens = 100000;
 
 // the fused kernels read inputs (many of them broadcast per head/token) and write the output in one launch. The ggml allocator may place the
@@ -474,6 +510,74 @@ bool ggml_cuda_raon_hc_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * c
             raon_hc_c_f32<<<(int) d1->ne[2], 16, 0, stream>>>((const float *) d1->src[0]->data, (const float *) d1->src[1]->data,
                     (const float *) sb->src[1]->data, (const float *) sg->src[0]->data, mn, mx, s, b, (float *) a2->data);
             *n_skip = 13;
+            return true;
+        }
+    }
+
+    if (nd[0]->op == GGML_OP_UNARY && nd[1]->op == GGML_OP_UNARY && ggml_get_unary_op(nd[0]) == GGML_UNARY_OP_NEG &&
+            ggml_get_unary_op(nd[1]) == GGML_UNARY_OP_SOFTPLUS) {
+        static const enum ggml_op ops[2] = { GGML_OP_UNARY, GGML_OP_UNARY };
+        const int outputs[1] = { i + 1 };
+        ggml_tensor * x = nd[0]->src[0], * dst = nd[1];
+        if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, outputs, 1) && rhc_f32c(x) && rhc_f32c(dst) && ggml_nelements(x) == ggml_nelements(dst) &&
+                ggml_nelements(dst) <= 256 * raon_fusion_max_tokens && nd[1]->src[0] == nd[0] && rhc_ok(dst, x, true)) {
+            raon_rda_e_f32<<<((int) ggml_nelements(dst) + 255) / 256, 256, 0, stream>>>((const float *) x->data, (int) ggml_nelements(dst), (float *) dst->data);
+            *n_skip = 1;
+            return true;
+        }
+    }
+
+    if (nd[0]->op == GGML_OP_ADD && i + 6 <= cgraph->n_nodes && nd[1]->op == GGML_OP_UNARY && nd[2]->op == GGML_OP_UNARY &&
+            nd[3]->op == GGML_OP_SUB && nd[4]->op == GGML_OP_UNARY && nd[5]->op == GGML_OP_MUL &&
+            ggml_get_unary_op(nd[1]) == GGML_UNARY_OP_NEG && ggml_get_unary_op(nd[2]) == GGML_UNARY_OP_SOFTPLUS && ggml_get_unary_op(nd[4]) == GGML_UNARY_OP_EXP) {
+        static const enum ggml_op ops[6] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL };
+        const int outputs[1] = { i + 5 };
+        ggml_tensor * add = nd[0], * sub = nd[3], * mul = nd[5];
+        const int64_t nh = add->ne[1];
+        if (ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 1) && add->ne[0] == 1 && add->ne[2] >= 1 && add->ne[2] <= raon_fusion_max_tokens && add->ne[3] == 1 && mul->ne[2] == add->ne[2] && rhc_f32c(add->src[0]) && rhc_f32c(add->src[1]) &&
+                add->src[0]->ne[0] == 1 && add->src[1]->ne[0] == 1 && add->src[0]->ne[1] == nh && add->src[1]->ne[1] == nh &&
+                sub->src[1] == nd[2] && nd[2]->src[0] == nd[1] && nd[1]->src[0] == add && nd[4]->src[0] == sub && mul->src[1] == nd[4] &&
+                rhc_f32c(sub->src[0]) && sub->src[0]->ne[0] == 1 && sub->src[0]->ne[1] == nh && rhc_f32c(mul->src[0]) && rhc_f32c(mul) &&
+                mul->ne[1] == nh && mul->ne[3] == 1 && mul->src[0]->ne[0] == mul->ne[0] && mul->src[0]->ne[1] == nh && ggml_nelements(add->src[0]) == nh * add->ne[2] && ggml_nelements(add->src[1]) == nh * add->ne[2] && ggml_nelements(sub->src[0]) == nh * add->ne[2] && rhc_ok(mul, add->src[0], false) && rhc_ok(mul, add->src[1], false) && rhc_ok(mul, sub->src[0], false) && rhc_ok(mul, mul->src[0], true)) {
+            const int n = (int) ggml_nelements(mul);
+            raon_rda_d_f32<<<(n + 255) / 256, 256, 0, stream>>>((const float *) add->src[0]->data, (const float *) add->src[1]->data,
+                    (const float *) sub->src[0]->data, (const float *) mul->src[0]->data, (int) mul->ne[0], n, (float *) mul->data);
+            *n_skip = 5;
+            return true;
+        }
+    }
+
+    // F: the ADD(+dt bias) is already folded into the preceding MUL_MAT by ggml-cuda, so the chain starts at MUL(a[h])
+    if (nd[0]->op == GGML_OP_MUL && nd[1]->op == GGML_OP_SCALE && nd[2]->op == GGML_OP_UNARY && nd[3]->op == GGML_OP_SCALE &&
+            ggml_get_unary_op(nd[2]) == GGML_UNARY_OP_SIGMOID) {
+        static const enum ggml_op ops[4] = { GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
+        const int outputs[1] = { i + 3 };
+        ggml_tensor * mul = nd[0], * out = nd[3];
+        if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, outputs, 1) && rhc_f32c(mul->src[0]) && mul->src[0]->type == GGML_TYPE_F32 &&
+                rhc_f32c(mul) && mul->src[1]->type == GGML_TYPE_F32 && rhc_f32c(mul->src[1]) && mul->ne[2] >= 1 && mul->ne[2] <= raon_fusion_max_tokens && mul->ne[3] == 1 && mul->src[1]->ne[2] == 1 &&
+                mul->src[1]->ne[0] == 1 && mul->src[1]->ne[1] == mul->ne[1] && ggml_nelements(mul->src[0]) == ggml_nelements(mul) &&
+                rhc_f32c(out) && ggml_nelements(out) == ggml_nelements(mul) && nd[1]->src[0] == mul && nd[2]->src[0] == nd[1] && nd[3]->src[0] == nd[2] && rhc_ok(out, mul->src[0], true) && rhc_ok(out, mul->src[1], false)) {
+            float s1, b1, s2, b2;
+            memcpy(&s1, (const float *) nd[1]->op_params + 0, sizeof(float)); memcpy(&b1, (const float *) nd[1]->op_params + 1, sizeof(float));
+            memcpy(&s2, (const float *) nd[3]->op_params + 0, sizeof(float)); memcpy(&b2, (const float *) nd[3]->op_params + 1, sizeof(float));
+            const int n = (int) ggml_nelements(out);
+            raon_rda_f_f32<<<(n + 255) / 256, 256, 0, stream>>>((const float *) mul->src[0]->data, (const float *) mul->src[1]->data,
+                    (int) mul->ne[0], (int) mul->ne[1], s1, b1, s2, b2, n, (float *) out->data);
+            *n_skip = 3;
+            return true;
+        }
+    }
+
+    // G: SSM_CONV -> RESHAPE -> SILU: ggml-cuda only fuses SSM_CONV+SILU when adjacent; reuse its fused path across the reshape (n_tokens == 1)
+    if (nd[0]->op == GGML_OP_SSM_CONV && nd[1]->op == GGML_OP_RESHAPE && nd[2]->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(nd[2]) == GGML_UNARY_OP_SILU) {
+        static const enum ggml_op ops[3] = { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_UNARY };
+        const int outputs[1] = { i + 2 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1) && nd[1]->src[0] == nd[0] && nd[2]->src[0] == nd[1] &&
+                ggml_nelements(nd[0]) == ggml_nelements(nd[2]) && nd[0]->ne[1] == 1 && nd[0]->ne[2] == 1 && rhc_f32c(nd[2]) && rhc_f32c(nd[0]) &&
+                nd[2]->ne[0] == nd[0]->ne[0] && nd[2]->ne[1] == 1 && nd[2]->ne[2] == 1) {  // n_tokens == 1 only: with more tokens the reused ssm_conv path was not deterministic
+            ggml_cuda_op_ssm_conv(ctx, nd[0], nullptr, nd[2]);
+            *n_skip = 2;
             return true;
         }
     }
