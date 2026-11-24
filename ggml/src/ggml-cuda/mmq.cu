@@ -222,6 +222,15 @@ void ggml_cuda_mul_mat_q(
             }
         }
     }
+    // Smaller expert tiles reduce padding during prompt processing.
+    if (ids && ne12 >= 256) {
+        constexpr int expert_tile = 64;
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, expert_tile, fallback, cc, prec_src1);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            J_best = expert_tile;
+            nthreads_best = config.nthreads;
+        }
+    }
     GGML_ASSERT(J_best > 0);
 
     // A tile of size J can read in at most J - 1 extra columns.
