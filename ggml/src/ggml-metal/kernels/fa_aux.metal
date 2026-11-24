@@ -483,3 +483,186 @@ template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_
 template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0>;
+
+// decode attention for the MLA latent MQA (dk576/dv512, one F16 KV head, V = first 512 elements of the K row).
+// One threadgroup = 8 heads of one query token x one KV split (NWG splits, each a contiguous range of 64-key chunks);
+// S = Q*K^T and O += P*V use 8x8 simdgroup MMAs; the per-split partial (unnormalized O, S, M) goes to the same tmp layout
+// the vec kernel uses, so kernel_flash_attn_ext_vec_reduce combines the splits.
+kernel void kernel_flash_attn_ext_mla_dec(
+        constant ggml_metal_kargs_flash_attn_ext_mla_dec & args,
+        device const char * q,
+        device const char * k,
+        device const char * mask,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short DK = 576;
+    constexpr short DV = 512;
+    constexpr short C  = 64;
+
+    const int hb  = tgpig.x;
+    const int iq1 = tgpig.y;
+    const int iwg = tgpig.z;
+    const int t   = sgitg*32 + tiisg;
+
+    threadgroup half  * sq  = (threadgroup half  *) (shmem);            // [8][576]
+    threadgroup float * sS  = (threadgroup float *) (shmem + 9216);     // [8][64]
+    threadgroup half  * sP  = (threadgroup half  *) (shmem + 11264);    // [8][64]
+    threadgroup float * sMS = (threadgroup float *) (shmem + 12288);    // [8]
+    threadgroup float * sD  = (threadgroup float *) (shmem + 12352);    // [4][64]
+    threadgroup float * sO  = (threadgroup float *) (shmem);            // [8][512] (aliases sq/sS/sP: only used after the KV loop)
+
+    // queries: 8 heads of token iq1
+    for (int i = t; i < 8*(DK/4); i += 128) {
+        const int r = i/(DK/4);
+        const int c = i%(DK/4);
+        device const float4 * qq = (device const float4 *) (q + iq1*args.nb01 + (hb*8 + r)*args.nb02);
+        ((threadgroup half4 *) (sq + r*DK))[c] = (half4) qq[c];
+    }
+
+    const int nch = args.ne11/C;
+    const int c0  = (iwg*nch)/args.nwg;
+    const int c1  = ((iwg + 1)*nch)/args.nwg;
+
+    const int r  = t/16;
+    const int cb = (t%16)*4;
+
+    float M     = -FLT_MAX/2;
+    float Spart = 0.0f;
+
+    simdgroup_float8x8 mO[16];
+    for (short j = 0; j < 16; ++j) {
+        mO[j] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    const int ns10 = (int) (args.nb11/2);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const char * mrow = mask + iq1*args.nb31;
+
+    for (int c = c0; c < c1; ++c) {
+        const int ic = c*C;
+
+        // S = Q*K^T for key blocks 2*sgitg, 2*sgitg + 1
+        {
+            device const half * pk0 = (device const half *) (k + (ic + (2*sgitg + 0)*8)*args.nb11);
+            device const half * pk1 = (device const half *) (k + (ic + (2*sgitg + 1)*8)*args.nb11);
+
+            simdgroup_float8x8 a0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            simdgroup_float8x8 a1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+            simdgroup_half8x8 mq;
+            simdgroup_half8x8 mk0;
+            simdgroup_half8x8 mk1;
+
+            for (short i = 0; i < DK/8; ++i) {
+                simdgroup_load(mk0, pk0 + 8*i, ns10, 0, true);
+                simdgroup_load(mk1, pk1 + 8*i, ns10, 0, true);
+                simdgroup_load(mq,  sq  + 8*i, DK);
+
+                simdgroup_multiply_accumulate(a0, mq, mk0, a0);
+                simdgroup_multiply_accumulate(a1, mq, mk1, a1);
+            }
+
+            simdgroup_store(a0, sS + (2*sgitg + 0)*8, C);
+            simdgroup_store(a1, sS + (2*sgitg + 1)*8, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // online softmax: 16 threads per row, 4 columns each
+        {
+            const float4 s4 = *((threadgroup float4 *) (sS + r*C + cb));
+            const half4  m4 = *((device const half4 *) (mrow + (ic + cb)*2));
+            const float4 s  = s4*args.scale + float4(m4);
+
+            float mx = max(max(s[0], s[1]), max(s[2], s[3]));
+            mx = max(mx, simd_shuffle_xor(mx, 1));
+            mx = max(mx, simd_shuffle_xor(mx, 2));
+            mx = max(mx, simd_shuffle_xor(mx, 4));
+            mx = max(mx, simd_shuffle_xor(mx, 8));
+
+            const float Mn = max(M, mx);
+            const float ms = exp(M - Mn);
+            const float4 p = exp(s - Mn);
+
+            Spart = Spart*ms + (p[0] + p[1] + p[2] + p[3]);
+            M = Mn;
+
+            *((threadgroup half4 *) (sP + r*C + cb)) = half4(p);
+
+            if ((t%16) == 0) {
+                sMS[r] = ms;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O = diag(ms)*O
+        {
+            for (short e = tiisg; e < 64; e += 32) {
+                sD[sgitg*64 + e] = (e/8 == e%8) ? sMS[e/8] : 0.0f;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_float8x8 mD;
+            simdgroup_load(mD, sD + sgitg*64, 8);
+
+            for (short j = 0; j < 16; ++j) {
+                simdgroup_float8x8 tmp;
+                simdgroup_multiply(tmp, mD, mO[j]);
+                mO[j] = tmp;
+            }
+        }
+
+        // O += P*V (V = first 512 elements of the K row), this simdgroup owns 128 output columns
+        for (short kb = 0; kb < C/8; ++kb) {
+            simdgroup_half8x8 mP;
+            simdgroup_load(mP, sP + kb*8, C);
+
+            device const half * pv = (device const half *) (k + (ic + kb*8)*args.nb11) + sgitg*128;
+
+            for (short j = 0; j < 16; ++j) {
+                simdgroup_half8x8 mv;
+                simdgroup_load(mv, pv + 8*j, ns10);
+                simdgroup_multiply_accumulate(mO[j], mP, mv, mO[j]);
+            }
+        }
+    }
+
+    // total S of the row
+    float Sx = Spart;
+    Sx += simd_shuffle_xor(Sx, 1);
+    Sx += simd_shuffle_xor(Sx, 2);
+    Sx += simd_shuffle_xor(Sx, 4);
+    Sx += simd_shuffle_xor(Sx, 8);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = 0; j < 16; ++j) {
+        simdgroup_store(mO[j], sO + sgitg*128 + j*8, DV);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int64_t nrows = (int64_t) args.ne1*args.ne2;
+
+    device float4 * dst4 = (device float4 *) dst;
+    device float  * dst1 = (device float  *) dst + nrows*DV*args.nwg;
+
+    for (int i = t; i < 8*(DV/4); i += 128) {
+        const int rr = i/(DV/4);
+        const int cc = i%(DV/4);
+        const int64_t rid = (int64_t) (hb*8 + rr) + (int64_t) iq1*args.ne1;
+        dst4[rid*(DV/4)*args.nwg + (int64_t) args.nwg*cc + iwg] = ((threadgroup float4 *) (sO + rr*DV))[cc];
+    }
+
+    if ((t%16) == 0) {
+        const int64_t rid = (int64_t) (hb*8 + r) + (int64_t) iq1*args.ne1;
+        dst1[rid*(2*args.nwg) + 2*iwg + 0] = Sx;
+        dst1[rid*(2*args.nwg) + 2*iwg + 1] = M;
+    }
+}

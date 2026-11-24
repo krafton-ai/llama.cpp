@@ -4093,6 +4093,63 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
     } else {
+        // MMA + KV-split decode attention for the MLA latent MQA (dk576/dv512, one F16 KV head, V = K rows)
+        {
+
+            if (!use_sparse && has_mask && !has_sinks && !has_bias && !has_scap &&
+                ne00 == 576 && ne20 == 512 && op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
+                op->src[1]->data == op->src[2]->data && nb21 == nb11 && nb10 == sizeof(ggml_fp16_t) &&
+                ne12 == 1 && ne02 % 8 == 0 && ne03 == 1 && ne31 >= ne01 && ne32 == 1 && ne33 == 1 && nb31 % 8 == 0 &&
+                ne11 % 64 == 0 && ne11 >= 1024 && nb01 % 16 == 0 && nb02 % 16 == 0) {
+                const int32_t nwg = 32;
+
+                GGML_ASSERT(ne01*ne02*ne03 == ne1*ne2*ne3);
+
+                ggml_metal_kargs_flash_attn_ext_mla_dec args = {
+                    /*.nb01  =*/ nb01,
+                    /*.nb02  =*/ nb02,
+                    /*.nb11  =*/ nb11,
+                    /*.nb31  =*/ nb31,
+                    /*.ne02  =*/ ne02,
+                    /*.ne11  =*/ ne11,
+                    /*.ne1   =*/ ne1,
+                    /*.ne2   =*/ ne2,
+                    /*.nwg   =*/ nwg,
+                    /*.scale =*/ scale,
+                };
+
+                auto pipeline = ggml_metal_library_get_pipeline(lib, "kernel_flash_attn_ext_mla_dec");
+                if (!pipeline.pipeline) {
+                    pipeline = ggml_metal_library_compile_pipeline(lib, "kernel_flash_attn_ext_mla_dec", "kernel_flash_attn_ext_mla_dec", nullptr);
+                }
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_k,    2);
+                ggml_metal_encoder_set_buffer  (enc, bid_src3, 3);
+                ggml_metal_encoder_set_buffer  (enc, bid_tmp,  4);
+
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, 16384, 0);
+                ggml_metal_encoder_dispatch_threadgroups(enc, ne02/8, ne01, nwg, 128, 1, 1);
+
+                ggml_metal_op_concurrency_reset(ctx);
+
+                ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = { (int32_t) (ne1*ne2*ne3) };
+
+                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline0);
+                ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, ne1*ne2*ne3, 1, 1, 32*nwg, 1, 1);
+
+                return 1;
+            }
+        }
+
         // half4x4 kernel
         // sparse: the index lists are per query row, so a threadgroup can share KV with Q == 1 only
         auto cfg = use_sparse

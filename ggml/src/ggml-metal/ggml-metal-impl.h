@@ -500,6 +500,20 @@ typedef struct {
     int32_t  nrows;
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
 
+// MMA + KV-split decode attention for the MLA latent MQA (dk576/dv512, F16 K = V rows)
+typedef struct {
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb11;   // K/V row stride in bytes (V is the first 512 elements of the K row)
+    uint64_t nb31;   // mask row stride in bytes
+    int32_t  ne02;
+    int32_t  ne11;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  nwg;
+    float    scale;
+} ggml_metal_kargs_flash_attn_ext_mla_dec;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne02;
