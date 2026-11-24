@@ -174,6 +174,114 @@ static __global__ void raon_hc_c_f32(const float * e, const float * chart, const
 
 
 
+// mHC combination for one token.
+// D: MUL(mix9, scale) -> ADD(base) -> CONT[3,3] -> MUL_MAT(C[3,4], z) [4,3] -> TRANSPOSE+CONT [3,4] -> MUL_MAT(C, .) [4,4] -> hc_c chain (DIV ... ADD).
+// The ggml cuBLAS sgemm with K = 3 (ampere_sgemm_32x32_sliced1x4_tn) is reproduced bitwise by a zero-initialised ascending FMA chain: fma(a2,b2,fma(a1,b1,fma(a0,b0,0))) (checked on the real tensors; a standalone cublasSgemm test picks a different kernel and is not representative).
+static __device__ __forceinline__ float rhc_dot3(const float a0, const float a1, const float a2, const float b0, const float b1, const float b2, const int var) {
+    if (var == 0) { return __fmaf_rn(a2, b2, __fmaf_rn(a1, b1, __fmaf_rn(a0, b0, 0.0f))); }                        // zero-initialised ascending fma chain (n == 1 cublas kernel)
+    return __fadd_rn(__fadd_rn(__fadd_rn(0.0f, __fmul_rn(a0, b0)), __fmul_rn(a1, b1)), __fmul_rn(a2, b2));             // separately rounded products (batched cublas kernel)
+}
+static __global__ void raon_hc_d_f32(const float * mix, const int mix_stride, const float * scale_w, const float * base_w, const float * cm, const float * chart, const float * ident,
+        const float * gamma_w, const float cl_min, const float cl_max, const float sc, const float bi, float * dst, const int var) {
+    __shared__ float s_z[9], s_r[12], s_rt[12], s_e[16], s_neg[16];
+    const int k = threadIdx.x;   // 16 threads, one token per block
+    mix += (size_t) blockIdx.x * mix_stride; dst += (size_t) blockIdx.x * 16;
+    if (k < 9) {
+        s_z[k] = __fadd_rn(__fmul_rn(mix[k], scale_w[0]), base_w[k]);
+    }
+    __syncthreads();
+    if (k < 12) {                // sgemm 1: r[m + 4n] = sum_j cm[j + 3m] * z[j + 3n]
+        const int m = k % 4, n = k / 4;
+        s_r[k] = rhc_dot3(cm[0 + m * 3], cm[1 + m * 3], cm[2 + m * 3], s_z[0 + n * 3], s_z[1 + n * 3], s_z[2 + n * 3], var);
+    }
+    __syncthreads();
+    if (k < 12) {                // transpose: rt[i0 + 3*i1] = r[i1 + 4*i0]
+        const int i0 = k % 3, i1 = k / 3;
+        s_rt[k] = s_r[i1 + i0 * 4];
+    }
+    __syncthreads();
+    {                            // sgemm 2: e[m + 4n] = sum_j cm[j + 3m] * rt[j + 3n]
+        const int m = k % 4, n = k / 4;
+        s_e[k] = rhc_dot3(cm[0 + m * 3], cm[1 + m * 3], cm[2 + m * 3], s_rt[0 + n * 3], s_rt[1 + n * 3], s_rt[2 + n * 3], var);
+    }
+    __syncthreads();
+    const float t = s_e[k] / chart[k];
+    s_neg[k] = -t;
+    __syncthreads();
+    float rho = -FLT_MAX;
+    for (int i = 0; i < 16; ++i) {
+        rho = max(rho, s_neg[i]);
+    }
+    rho = fminf(fmaxf(rho, cl_min), cl_max);
+    rho = sc * rho + bi;
+    const float phi   = __fadd_rn(s_e[k] / rho, chart[k]);
+    const float diff  = __fsub_rn(phi, ident[k]);
+    const float gamma = rhc_sigmoid(gamma_w[0]);
+    dst[k] = __fadd_rn(__fmul_rn(diff, gamma), ident[k]);
+}
+
+// mHC combination and post update for one token.
+// DP: the D chain above (every block recomputes the 4x4 comb matrix in shared memory: 16 active threads, uniform barriers) followed by
+// dsv4_hc_post_f32<true,false>: dst[i0 + idst*n_embd] = x[i0] * post[idst] + sum_isrc residual[i0, isrc] * comb[idst, isrc]  (same statements as the original kernel).
+static __global__ void raon_hc_dp_f32(const float * mix, const float * scale_w, const float * base_w, const float * cm, const float * chart, const float * ident,
+        const float * gamma_w, const float cl_min, const float cl_max, const float sc, const float bi, const int var,
+        const float * x, const float * residual, const float * post, float * dst,
+        const int64_t n_embd, const int64_t hc, const int64_t sx0, const int64_t sr0, const int64_t sr1, const int64_t sp0,
+        const int64_t sc0, const int64_t sc1, const int64_t sd0, const int64_t sd1) {
+    __shared__ float s_z[9], s_r[12], s_rt[12], s_e[16], s_neg[16], s_comb[16];
+    const int k = threadIdx.x;
+    const bool act = k < 16;
+    if (k < 9) {
+        s_z[k] = __fadd_rn(__fmul_rn(mix[k], scale_w[0]), base_w[k]);
+    }
+    __syncthreads();
+    if (k < 12) {
+        const int m = k % 4, n = k / 4;
+        s_r[k] = rhc_dot3(cm[0 + m * 3], cm[1 + m * 3], cm[2 + m * 3], s_z[0 + n * 3], s_z[1 + n * 3], s_z[2 + n * 3], var);
+    }
+    __syncthreads();
+    if (k < 12) {
+        const int i0 = k % 3, i1 = k / 3;
+        s_rt[k] = s_r[i1 + i0 * 4];
+    }
+    __syncthreads();
+    if (act) {
+        const int m = k % 4, n = k / 4;
+        s_e[k] = rhc_dot3(cm[0 + m * 3], cm[1 + m * 3], cm[2 + m * 3], s_rt[0 + n * 3], s_rt[1 + n * 3], s_rt[2 + n * 3], var);
+    }
+    __syncthreads();
+    if (act) {
+        const float t = s_e[k] / chart[k];
+        s_neg[k] = -t;
+    }
+    __syncthreads();
+    if (act) {
+        float rho = -FLT_MAX;
+        for (int i = 0; i < 16; ++i) {
+            rho = max(rho, s_neg[i]);
+        }
+        rho = fminf(fmaxf(rho, cl_min), cl_max);
+        rho = sc * rho + bi;
+        const float phi   = __fadd_rn(s_e[k] / rho, chart[k]);
+        const float diff  = __fsub_rn(phi, ident[k]);
+        const float gamma = rhc_sigmoid(gamma_w[0]);
+        s_comb[k] = __fadd_rn(__fmul_rn(diff, gamma), ident[k]);
+    }
+    __syncthreads();
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ir >= n_embd * hc) {
+        return;
+    }
+    const int64_t i0   = ir % n_embd;
+    const int64_t idst = ir / n_embd;
+    const float p = post[idst * sp0];
+    float sum = x[i0 * sx0] * p;
+    for (int64_t isrc = 0; isrc < hc; ++isrc) {
+        sum += residual[i0 * sr0 + isrc * sr1] * s_comb[idst * sc0 + isrc * sc1];
+    }
+    dst[i0 * sd0 + idst * sd1] = sum;
+}
+
 static constexpr int raon_fusion_max_tokens = 100000;
 
 // the fused kernels read inputs (many of them broadcast per head/token) and write the output in one launch. The ggml allocator may place the
@@ -197,6 +305,70 @@ bool ggml_cuda_raon_hc_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * c
     }
     ggml_tensor ** nd = cgraph->nodes + i;
     cudaStream_t stream = ctx.stream();
+
+    if (nd[0]->op == GGML_OP_MUL && i + 22 <= cgraph->n_nodes) {
+        static const enum ggml_op ops[22] = { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_CONT, GGML_OP_MUL_MAT, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT,
+            GGML_OP_DIV, GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_POOL_1D, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_DIV, GGML_OP_ADD, GGML_OP_SUB,
+            GGML_OP_VIEW, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+        const int outputs[1] = { i + 21 };
+        ggml_tensor * mul = nd[0], * add = nd[2], * ct = nd[3], * m1 = nd[4], * ct2 = nd[6], * m2 = nd[7], * d1 = nd[8], * pool = nd[11], * cl = nd[12], * scn = nd[13],
+                    * d2 = nd[15], * a1 = nd[16], * sb = nd[17], * sg = nd[19], * ml = nd[20], * a2 = nd[21];
+        const int64_t nt = mul->src[0]->ne[1];
+        bool ok = true;
+        for (int q = 0; q < 22 && ok; ++q) { ok = nd[q]->op == ops[q]; }
+        if (ok && nd[9]->op == GGML_OP_UNARY && ggml_get_unary_op(nd[9]) == GGML_UNARY_OP_NEG && ggml_get_unary_op(sg) == GGML_UNARY_OP_SIGMOID &&
+                ggml_can_fuse_subgraph(cgraph, i, 22, ops, outputs, 1) &&
+                mul->src[0]->type == GGML_TYPE_F32 && mul->src[0]->ne[0] == 9 && mul->src[0]->ne[1] >= 1 && mul->src[0]->ne[1] <= raon_fusion_max_tokens && mul->src[0]->ne[2] == 1 && mul->src[0]->ne[3] == 1 && mul->src[0]->nb[0] == 4 && mul->src[0]->nb[1] % 4 == 0 && ggml_nelements(mul->src[1]) == 1 &&
+                add->src[0] == mul && add->src[1]->type == GGML_TYPE_F32 && ggml_nelements(add->src[1]) == 9 && rhc_f32c(add->src[1]) &&
+                ct->src[0] == add && rhc_f32c(ct) && ct->ne[0] == 3 && ct->ne[1] == 3 && ct->ne[2] == nt && ct->ne[3] == 1 &&
+                m1->src[1] == ct && m1->src[0]->type == GGML_TYPE_F32 && rhc_f32c(m1->src[0]) && m1->src[0]->ne[0] == 3 && m1->src[0]->ne[1] == 4 && m1->src[0]->ne[2] == 1 && m1->src[0]->ne[3] == 1 &&
+                m1->ne[0] == 4 && m1->ne[1] == 3 && m1->ne[2] == nt && m1->ne[3] == 1 && rhc_f32c(m1) &&
+                nd[5]->src[0] == m1 && ct2->src[0] == nd[5] && rhc_f32c(ct2) && ct2->ne[0] == 3 && ct2->ne[1] == 4 && ct2->ne[2] == nt && ct2->ne[3] == 1 &&
+                m2->src[1] == ct2 && m2->src[0] == m1->src[0] && m2->ne[0] == 4 && m2->ne[1] == 4 && m2->ne[2] == nt && m2->ne[3] == 1 && rhc_f32c(m2) &&
+                d1->src[0] == m2 && d2->src[0] == m2 && d1->src[1] == a1->src[1] && sb->src[1] == a2->src[1] &&
+                rhc_f32c(d1->src[1]) && rhc_f32c(sb->src[1]) && ggml_nelements(d1->src[1]) == 16 && ggml_nelements(sb->src[1]) == 16 && rhc_f32c(a2) && a2->ne[0] == 4 && a2->ne[1] == 4 && a2->ne[2] == nt &&
+                ggml_nelements(sg->src[0]) == 1 && sg->src[0]->type == GGML_TYPE_F32 && ml->src[0] == sb && ml->src[1] == sg &&
+                pool->op_params != nullptr && ((const int32_t *) pool->op_params)[0] == GGML_OP_POOL_MAX &&
+                ((const int32_t *) pool->op_params)[1] == 16 && ((const int32_t *) pool->op_params)[2] == 16 && ((const int32_t *) pool->op_params)[3] == 0 && rhc_ok(a2, mul->src[0], false) && rhc_ok(a2, mul->src[1], false) && rhc_ok(a2, add->src[1], false) && rhc_ok(a2, m1->src[0], false) && rhc_ok(a2, d1->src[1], false) && rhc_ok(a2, sb->src[1], false) && rhc_ok(a2, sg->src[0], false)) {
+            float mn, mx, s, b;
+            memcpy(&mn, (const float *) cl->op_params + 0, sizeof(float));
+            memcpy(&mx, (const float *) cl->op_params + 1, sizeof(float));
+            memcpy(&s,  (const float *) scn->op_params + 0, sizeof(float));
+            memcpy(&b,  (const float *) scn->op_params + 1, sizeof(float));
+            // n == 1: the ggml cublas sgemm is a zero-initialised ascending fma chain; n > 1: the batched cublas kernel sums separately rounded
+            // products in ascending order
+            const int dot_var = nt == 1 ? 0 : 1;
+            // n_tokens == 1 and the chain is directly consumed by the DSV4_HC_POST that follows -> one kernel for both (a2 is not written: it has no other consumer)
+            if (nt == 1 && i + 23 <= cgraph->n_nodes && nd[22]->op == GGML_OP_DSV4_HC_POST) {
+                static const enum ggml_op ops23[23] = { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_CONT, GGML_OP_MUL_MAT, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT,
+                    GGML_OP_DIV, GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_POOL_1D, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_DIV, GGML_OP_ADD, GGML_OP_SUB,
+                    GGML_OP_VIEW, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_DSV4_HC_POST };
+                const int outputs23[1] = { i + 22 };
+                ggml_tensor * po = nd[22];
+                const ggml_tensor * px = po->src[0], * pr = po->src[1], * pp = po->src[2];
+                if (po->src[3] == a2 && px && pr && pp && px->type == GGML_TYPE_F32 && pr->type == GGML_TYPE_F32 && pp->type == GGML_TYPE_F32 && po->type == GGML_TYPE_F32 &&
+                        px->ne[1] == 1 && pr->ne[1] == 4 && pr->ne[2] == 1 && px->ne[0] == pr->ne[0] && po->ne[0] == px->ne[0] && po->ne[1] == 4 && po->ne[2] == 1 &&
+                        px->nb[0] % 4 == 0 && pr->nb[0] % 4 == 0 && pr->nb[1] % 4 == 0 && pp->nb[0] % 4 == 0 && po->nb[0] % 4 == 0 && po->nb[1] % 4 == 0 &&
+                        a2->nb[0] == 4 && a2->nb[1] == 16 &&
+                        ggml_can_fuse_subgraph(cgraph, i, 23, ops23, outputs23, 1) &&
+                        rhc_ok(po, mul->src[0], false) && rhc_ok(po, mul->src[1], false) && rhc_ok(po, add->src[1], false) && rhc_ok(po, m1->src[0], false) &&
+                        rhc_ok(po, d1->src[1], false) && rhc_ok(po, sb->src[1], false) && rhc_ok(po, sg->src[0], false) && rhc_ok(po, pp, false)) {
+                    const int64_t nr = po->ne[0] * 4;
+                    raon_hc_dp_f32<<<(int) ((nr + 255) / 256), 256, 0, stream>>>((const float *) mul->src[0]->data, (const float *) mul->src[1]->data, (const float *) add->src[1]->data,
+                            (const float *) m1->src[0]->data, (const float *) d1->src[1]->data, (const float *) sb->src[1]->data, (const float *) sg->src[0]->data, mn, mx, s, b, dot_var,
+                            (const float *) px->data, (const float *) pr->data, (const float *) pp->data, (float *) po->data,
+                            po->ne[0], 4, (int64_t) (px->nb[0] / 4), (int64_t) (pr->nb[0] / 4), (int64_t) (pr->nb[1] / 4), (int64_t) (pp->nb[0] / 4),
+                            (int64_t) (a2->nb[0] / 4), (int64_t) (a2->nb[1] / 4), (int64_t) (po->nb[0] / 4), (int64_t) (po->nb[1] / 4));
+                    *n_skip = 22;
+                    return true;
+                }
+            }
+            raon_hc_d_f32<<<(int) nt, 16, 0, stream>>>((const float *) mul->src[0]->data, (int) (mul->src[0]->nb[1] / 4), (const float *) mul->src[1]->data, (const float *) add->src[1]->data,
+                    (const float *) m1->src[0]->data, (const float *) d1->src[1]->data, (const float *) sb->src[1]->data, (const float *) sg->src[0]->data, mn, mx, s, b, (float *) a2->data, dot_var);
+            *n_skip = 21;
+            return true;
+        }
+    }
 
     if (nd[0]->op == GGML_OP_SQR) {
         static const enum ggml_op ops[11] = { GGML_OP_SQR, GGML_OP_MEAN, GGML_OP_SCALE, GGML_OP_SQRT, GGML_OP_DIV, GGML_OP_VIEW,
