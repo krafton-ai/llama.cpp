@@ -1,3 +1,4 @@
+#include <vector>
 #include "ggml-metal-ops.h"
 
 #include "ggml.h"
@@ -238,6 +239,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             if (fusion) {
                 // fused kernels write to the last node of the group, not necessarily to the first node's dst
                 is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + n_fuse - 1));
+                // the RAON mHC fused kernels read tensors (e.g. the mixraw mat-vec result) that belong to no checked node: always barrier
+                if (ggml_metal_fusion_get_id(fusion) >= GGML_METAL_FUSION_RAON_HC_A && ggml_metal_fusion_get_id(fusion) <= GGML_METAL_FUSION_RAON_HC_C) {
+                    is_concurrent = false;
+                }
             }
         }
 
@@ -283,6 +288,17 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    bool raon_hc_done = false;
+    if (ctx->use_fusion() && (node->op == GGML_OP_SQR || node->op == GGML_OP_MUL || node->op == GGML_OP_DIV || node->op == GGML_OP_ADD || node->op == GGML_OP_UNARY || node->op == GGML_OP_SCALE || node->op == GGML_OP_MUL_MAT)) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) >= GGML_METAL_FUSION_RAON_HC_A && ggml_metal_fusion_get_id(fusion) <= GGML_METAL_FUSION_RAON_HC_C) {
+            n_fuse = ggml_metal_op_raon_hc(ctx, idx, n, (int) ggml_metal_fusion_get_id(fusion));
+            raon_hc_done = true;
+        }
+    }
+
+    if (!raon_hc_done)
     switch (node->op) {
         case GGML_OP_CONCAT:
             {
@@ -2330,6 +2346,136 @@ int ggml_metal_op_pool_1d(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
 
     return 1;
+}
+
+static int ggml_metal_op_raon_hc_a(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    // pattern A: nodes SQR MEAN SCALE SQRT DIV MUL ADD SIGMOID
+    GGML_ASSERT(n_fuse == 8);
+    ggml_tensor * sqr = ctx->node(idx);
+    ggml_tensor * scl = ctx->node(idx + 2);
+    ggml_tensor * dv  = ctx->node(idx + 4);
+    ggml_tensor * mul = ctx->node(idx + 5);
+    ggml_tensor * add = ctx->node(idx + 6);
+    ggml_tensor * sg  = ctx->node(idx + 7);
+
+    ggml_metal_kargs_raon_hc_a args = {
+        /*.ne00_4 =*/ (int32_t) (sqr->src[0]->ne[0] / 4),
+        /*.ne00   =*/ (int32_t)  sqr->src[0]->ne[0],
+        /*.nmix   =*/ (int32_t)  dv->ne[0],
+        /*.npre   =*/ (int32_t)  sg->ne[0],
+        /*.sc     =*/ ggml_get_op_params_f32(scl, 0),
+        /*.bi     =*/ ggml_get_op_params_f32(scl, 1),
+        /*.x_nb1  =*/ sqr->src[0]->nb[1],
+        /*.mr_nb1 =*/ dv->src[0]->nb[1],
+        /*.mx_nb1 =*/ dv->nb[1],
+        /*.pre_nb1=*/ sg->nb[1],
+    };
+    const int ntok = (int) sqr->src[0]->ne[1];
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, "kernel_raon_hc_a_f32");
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, "kernel_raon_hc_a_f32", "kernel_raon_hc_a_f32", nullptr);
+    }
+
+    // same thread count as the unfused sum_rows (float4 path): sets the order of the partial sums
+    int nth = 32;
+    const int ne4 = args.ne00_4;
+    while (nth < ne4 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+        nth *= 2;
+    }
+    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    nth = std::min(nth, ne4);
+    GGML_ASSERT(nth >= 64 && nth >= args.nmix);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sqr->src[0]),     1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dv->src[0]),      2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[1]),     3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(add->src[1]),     4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dv),              5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sg),              6);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float)*4 + 16, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ntok, 1, 1, nth, 1, 1);
+
+    return n_fuse;
+}
+
+
+static ggml_metal_pipeline_with_params ggml_metal_raon_pipeline(ggml_metal_library_t lib, const char * name) {
+    ggml_metal_pipeline_with_params p = ggml_metal_library_get_pipeline(lib, name);
+    if (!p.pipeline) {
+        p = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return p;
+}
+
+static int ggml_metal_op_raon_hc_bz(ggml_metal_op_t ctx, int idx, int n_fuse, bool is_z) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_tensor * mul = ctx->node(idx);
+    ggml_tensor * add = ctx->node(idx + 1);
+    ggml_tensor * out = ctx->node(idx + n_fuse - 1);
+    const int ntok_bz = is_z ? (int) out->ne[2] : (int) out->ne[1];
+    ggml_metal_kargs_raon_hc_bz args = { (int32_t) (ggml_nelements(out) / ntok_bz), 0.0f, 0.0f, mul->src[0]->nb[1], is_z ? (uint64_t) (4*ggml_nelements(out)/ntok_bz) : out->nb[1] };
+    if (is_z) { args.z_nb1 = mul->src[0]->nb[1]; }
+    if (!is_z) {
+        ggml_tensor * scn = ctx->node(idx + 3);
+        args.sc = ggml_get_op_params_f32(scn, 0);
+        args.bi = ggml_get_op_params_f32(scn, 1);
+    }
+    auto pipeline = ggml_metal_raon_pipeline(lib, is_z ? "kernel_raon_hc_z_f32" : "kernel_raon_hc_b_f32");
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(add->src[1]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(out),         4);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ntok_bz, 1, 1, 32, 1, 1);
+    return n_fuse;
+}
+
+static int ggml_metal_op_raon_hc_c(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+    GGML_ASSERT(n_fuse == 11);
+    ggml_tensor * d1  = ctx->node(idx);
+    ggml_tensor * cl  = ctx->node(idx + 3);
+    ggml_tensor * scn = ctx->node(idx + 4);
+    ggml_tensor * sb  = ctx->node(idx + 7);
+    ggml_tensor * sg  = ctx->node(idx + 8);
+    ggml_tensor * a2  = ctx->node(idx + 10);
+    ggml_metal_kargs_raon_hc_c args = {
+        ggml_get_op_params_f32(cl, 0), ggml_get_op_params_f32(cl, 1),
+        ggml_get_op_params_f32(scn, 0), ggml_get_op_params_f32(scn, 1),
+        d1->src[0]->nb[2], a2->nb[2],
+    };
+    const int ntok_c = (int) d1->ne[2];
+    auto pipeline = ggml_metal_raon_pipeline(lib, "kernel_raon_hc_c_f32");
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(d1->src[0]),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(d1->src[1]),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sb->src[1]),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sg->src[0]),  4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a2),          5);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ntok_c, 1, 1, 32, 1, 1);
+    return n_fuse;
+}
+
+int ggml_metal_op_raon_hc(ggml_metal_op_t ctx, int idx, int n_fuse, int id) {
+    switch ((ggml_metal_fusion_id) id) {
+        case GGML_METAL_FUSION_RAON_HC_A: return ggml_metal_op_raon_hc_a(ctx, idx, n_fuse);
+        case GGML_METAL_FUSION_RAON_HC_B: return ggml_metal_op_raon_hc_bz(ctx, idx, n_fuse, false);
+        case GGML_METAL_FUSION_RAON_HC_Z: return ggml_metal_op_raon_hc_bz(ctx, idx, n_fuse, true);
+        case GGML_METAL_FUSION_RAON_HC_C: return ggml_metal_op_raon_hc_c(ctx, idx, n_fuse);
+        default: GGML_ABORT("raon hc fusion id");
+    }
 }
 
 int ggml_metal_op_fwht(ggml_metal_op_t ctx, int idx) {

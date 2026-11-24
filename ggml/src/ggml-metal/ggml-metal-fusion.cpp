@@ -757,6 +757,137 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
+
+static constexpr int64_t raon_fusion_max_tokens = 4096;
+
+static bool ggml_metal_raon_hc_f32c(const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); }
+
+// subgraph check over the raw span (the empty VIEW/RESHAPE nodes between the compute nodes are part of the group, so that uses through them are counted)
+static bool ggml_metal_raon_hc_subgraph(const ggml_metal_fusion * fusion, const ggml_cgraph * gf, const int * node_idxs, int idx, const int * out_pos, int n_out) {
+    const int n_ops = (int) fusion->ops.size();
+    const int raw_start = node_idxs[idx];
+    const int raw_end   = node_idxs[idx + n_ops - 1];
+    const int raw_count = raw_end - raw_start + 1;
+    if (raw_count != (int) fusion->ops_all.size() || raw_count > GGML_METAL_FUSION_MAX) {
+        return false;
+    }
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < raw_count; ++i) {
+        raw_idxs[i] = raw_start + i;
+        if (gf->nodes[raw_start + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+    int outputs[4];
+    for (int i = 0; i < n_out; ++i) {
+        outputs[i] = node_idxs[idx + out_pos[i]];
+    }
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, fusion->ops_all.data(), outputs, n_out);
+}
+
+// Raon-1 mHC pattern A (decode, one token): SQR -> MEAN -> SCALE -> SQRT -> DIV(mixraw, rms) -> MUL(view of mixes, scale) -> ADD(base) -> SIGMOID
+static bool ggml_metal_fusion_check_raon_hc_a(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * sqr = nodes[0], * mean = nodes[1], * scl = nodes[2], * sqrt_n = nodes[3], * dv = nodes[4], * mul = nodes[5], * add = nodes[6], * sg = nodes[7];
+    if (sg->op != GGML_OP_UNARY || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const int out_pos[2] = { 7, 4 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 2)) {
+        return false;
+    }
+    const ggml_tensor * x = sqr->src[0];
+    const int64_t nt = x->ne[1];   // tokens
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || nt < 1 || nt > raon_fusion_max_tokens || x->ne[2] != 1 || x->ne[3] != 1 || (x->ne[0] % 4) != 0) {
+        return false;
+    }
+    if (mean->src[0] != sqr || scl->src[0] != mean || sqrt_n->src[0] != scl || dv->src[1] != sqrt_n) {
+        return false;
+    }
+    const ggml_tensor * mixraw = dv->src[0];
+    if (mixraw->type != GGML_TYPE_F32 || mixraw->ne[0] > 32 || mixraw->ne[1] != nt || mixraw->ne[2] != 1 || dv->ne[0] != mixraw->ne[0] || dv->ne[1] != nt || !ggml_is_contiguous(dv) ||
+            dv->type != GGML_TYPE_F32 || !ggml_is_contiguous(mixraw)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(sg) || sg->type != GGML_TYPE_F32 || sg->ne[0] > 32 || sg->ne[1] != nt || sg->ne[2] != 1 || sg->ne[0] > dv->ne[0]) {
+        return false;
+    }
+    if (mul->src[1]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 || ggml_nelements(mul->src[1]) != 1 ||
+            ggml_nelements(add->src[1]) != sg->ne[0] || mul->src[0]->view_src != dv || ggml_nelements(mul->src[0]) != sg->ne[0]*nt ||
+            mul->src[0]->view_offs != 0 || add->src[0] != mul || sg->src[0] != add || !ggml_is_contiguous(add->src[1])) {
+        return false;
+    }
+    if (scl->op_params == nullptr) {
+        return false;
+    }
+    return true;
+}
+
+static const std::vector<ggml_op> ops_raon_hc_a = {
+    GGML_OP_SQR, GGML_OP_MEAN, GGML_OP_SCALE, GGML_OP_SQRT, GGML_OP_DIV, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY
+};
+
+
+// pattern B: MUL(z view, scale) -> ADD(base) -> SIGMOID -> SCALE
+static bool ggml_metal_fusion_check_raon_hc_b(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes, const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * mul = nodes[0], * add = nodes[1], * sg = nodes[2], * sc = nodes[3];
+    if (sg->op != GGML_OP_UNARY || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID) { return false; }
+    const int out_pos[1] = { 3 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1)) { return false; }
+    return ggml_metal_raon_hc_f32c(sc) && sc->ne[0] <= 32 && sc->ne[1] >= 1 && sc->ne[1] <= raon_fusion_max_tokens && sc->ne[2] == 1 && sc->ne[3] == 1 &&
+           mul->src[0]->type == GGML_TYPE_F32 && ggml_nelements(mul->src[0]) == ggml_nelements(sc) && mul->src[0]->ne[0] == sc->ne[0] && mul->src[0]->ne[1] == sc->ne[1] && mul->src[0]->nb[0] == 4 &&
+           ggml_nelements(mul->src[1]) == 1 && mul->src[1]->type == GGML_TYPE_F32 &&
+           ggml_nelements(add->src[1]) == sc->ne[0] && add->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(add->src[1]) &&
+           add->src[0] == mul && sg->src[0] == add && sc->src[0] == sg;
+}
+
+// pattern Z: MUL(z view, scale) -> ADD(base) -> CONT
+static bool ggml_metal_fusion_check_raon_hc_z(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes, const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * mul = nodes[0], * add = nodes[1], * ct = nodes[2];
+    const int out_pos[1] = { 2 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1)) { return false; }
+    const int64_t mz = ct->ne[0]*ct->ne[1];   // elements per token
+    return ggml_metal_raon_hc_f32c(ct) && mz <= 32 && ct->ne[2] >= 1 && ct->ne[2] <= raon_fusion_max_tokens && ct->ne[3] == 1 && mul->src[0]->type == GGML_TYPE_F32 &&
+           ggml_nelements(mul->src[0]) == ggml_nelements(ct) && mul->src[0]->ne[0] == mz && mul->src[0]->ne[1] == ct->ne[2] && mul->src[0]->nb[0] == 4 &&
+           ggml_nelements(mul->src[1]) == 1 && mul->src[1]->type == GGML_TYPE_F32 &&
+           ggml_nelements(add->src[1]) == mz && add->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(add->src[1]) &&
+           add->src[0] == mul && ct->src[0] == add;
+}
+
+// pattern C: DIV NEG POOL_1D CLAMP SCALE DIV ADD SUB SIGMOID MUL ADD (4x4)
+static bool ggml_metal_fusion_check_raon_hc_c(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes, const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * d1 = nodes[0], * ng = nodes[1], * pool = nodes[2], * cl = nodes[3], * scn = nodes[4], * d2 = nodes[5], * a1 = nodes[6], * sb = nodes[7], * sg = nodes[8], * ml = nodes[9], * a2 = nodes[10];
+    if (ng->op != GGML_OP_UNARY || ggml_get_unary_op(ng) != GGML_UNARY_OP_NEG || sg->op != GGML_OP_UNARY || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID) { return false; }
+    const int out_pos[1] = { 10 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1)) { return false; }
+    const int32_t * pp = (const int32_t *) pool->op_params;
+    return d1->ne[0] == 4 && d1->ne[1] == 4 && d1->ne[2] >= 1 && d1->ne[2] <= raon_fusion_max_tokens && d1->ne[3] == 1 && ggml_metal_raon_hc_f32c(d1) && ggml_metal_raon_hc_f32c(a2) && ggml_nelements(d1->src[1]) == 16 && ggml_nelements(sb->src[1]) == 16 && ggml_nelements(d1->src[0]) == ggml_nelements(d1) &&
+           d1->src[0] == d2->src[0] && d1->src[1] == a1->src[1] && sb->src[1] == a2->src[1] &&
+           ggml_metal_raon_hc_f32c(d1->src[0]) && ggml_metal_raon_hc_f32c(d1->src[1]) && ggml_metal_raon_hc_f32c(sb->src[1]) &&
+           ggml_nelements(sg->src[0]) == 1 && sg->src[0]->type == GGML_TYPE_F32 && ml->src[0] == sb && ml->src[1] == sg &&
+           pp != nullptr && pp[0] == GGML_OP_POOL_MAX && pp[1] == 16 && pp[2] == 16 && pp[3] == 0 && cl->op_params != nullptr && scn->op_params != nullptr;
+}
+
+static const std::vector<ggml_op> ops_raon_hc_b = { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_raon_hc_z = { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_CONT };
+static const std::vector<ggml_op> ops_raon_hc_c = {
+    GGML_OP_DIV, GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_POOL_1D, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_DIV, GGML_OP_ADD, GGML_OP_SUB, GGML_OP_VIEW, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD
+};
+
+
+
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_norm_mul_add,           {},     false, ggml_metal_fusion_check_norm },
@@ -785,6 +916,10 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_RAON_HC_A,      ops_raon_hc_a,              {4},    true,  ggml_metal_fusion_check_raon_hc_a },
+    { GGML_METAL_FUSION_RAON_HC_B,      ops_raon_hc_b,              {},     true,  ggml_metal_fusion_check_raon_hc_b },
+    { GGML_METAL_FUSION_RAON_HC_Z,      ops_raon_hc_z,              {},     true,  ggml_metal_fusion_check_raon_hc_z },
+    { GGML_METAL_FUSION_RAON_HC_C,      ops_raon_hc_c,              {},     true,  ggml_metal_fusion_check_raon_hc_c },
 };
 
 // ---- alloc deps -----------------------------------------------------------

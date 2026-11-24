@@ -1395,4 +1395,35 @@ typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 
+// Raon-1 mHC site fusions
+typedef struct {
+    int32_t ne00_4;   // x elements / 4
+    int32_t ne00;     // x elements
+    int32_t nmix;
+    int32_t npre;
+    float   sc;
+    float   bi;
+    uint64_t x_nb1;    // token strides (bytes)
+    uint64_t mr_nb1;
+    uint64_t mx_nb1;
+    uint64_t pre_nb1;
+} ggml_metal_kargs_raon_hc_a;
+
+typedef struct {
+    int32_t n;
+    float   sc;
+    float   bi;
+    uint64_t z_nb1;   // token strides (bytes)
+    uint64_t d_nb1;
+} ggml_metal_kargs_raon_hc_bz;
+
+typedef struct {
+    float mn;
+    float mx;
+    float sc;
+    float bi;
+    uint64_t e_nb;   // token stride of e (bytes)
+    uint64_t d_nb;   // token stride of dst
+} ggml_metal_kargs_raon_hc_c;
+
 #endif // GGML_METAL_IMPL

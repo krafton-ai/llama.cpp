@@ -772,3 +772,169 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// pattern A: SQR -> MEAN(sum_rows, float4 path, same thread count/order) -> SCALE -> SQRT -> DIV(mixraw, rms) -> MUL(scale) -> ADD(base) -> SIGMOID
+// one threadgroup of 1024 threads; outputs mixes (the DIV result) and pre (the SIGMOID result)
+kernel void kernel_raon_hc_a_f32(
+        constant ggml_metal_kargs_raon_hc_a & args,
+        device const float4 * x,
+        device const float  * mixraw,
+        device const float  * scale_w,
+        device const float  * base_w,
+        device       float  * mixes,
+        device       float  * pre,
+        threadgroup  char   * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    threadgroup float4 * shmem_t = (threadgroup float4 *) shmem;
+    device const float4 * xt  = (device const float4 *) ((device const char *) x      + tgpig.x*args.x_nb1);
+    device const float  * mrt = (device const float  *) ((device const char *) mixraw + tgpig.x*args.mr_nb1);
+    device       float  * mxt = (device       float  *) ((device       char *) mixes  + tgpig.x*args.mx_nb1);
+    device       float  * prt = (device       float  *) ((device       char *) pre    + tgpig.x*args.pre_nb1);
+
+    if (sgitg == 0) {
+        shmem_t[tiisg] = 0.0f;
+    }
+
+    float4 sumf = float4(0.0f);
+
+    for (int i0 = tpitg.x; i0 < args.ne00_4; i0 += ntg.x) {
+        float4 v  = xt[i0];
+        float4 sq = v*v;
+        // the SQR kernel stored the rounded square before sum_rows added it: no fma contraction
+        sq[0] = simd_shuffle(sq[0], tiisg);
+        sq[1] = simd_shuffle(sq[1], tiisg);
+        sq[2] = simd_shuffle(sq[2], tiisg);
+        sq[3] = simd_shuffle(sq[3], tiisg);
+        sumf += sq;
+    }
+
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_t[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_t[tiisg];
+    sumf = simd_sum(sumf);
+
+    // every thread holds the same sum; each step is made opaque (a lane shuffle) so that it is rounded like the separate kernels were,
+    // without fast-math re-association across the original kernel boundaries (a/c*s+b -> a*(s/c)+b, fma formation)
+    float mean = sum(sumf) / (4*(args.ne00_4));
+    mean = simd_shuffle(mean, tiisg);
+    float t = args.sc * mean + args.bi;   // kernel_unary scale
+    t = simd_shuffle(t, tiisg);
+    float rms = sqrt(t);                   // kernel_unary sqrt
+    rms = simd_shuffle(rms, tiisg);
+
+    const uint  i  = tpitg.x;
+    const uint  ic = i < (uint) args.nmix ? i : 0;
+    float m = mrt[ic] / rms;               // kernel_bin DIV
+    m = simd_shuffle(m, tiisg);
+
+    if (i < (uint) args.nmix) {
+        mxt[i] = m;
+    }
+
+    float t1 = m * scale_w[0];                          // MUL result is rounded in memory before the ADD
+    t1 = simd_shuffle(t1, tiisg);
+
+    if (i < (uint) args.npre) {
+        const float a = t1 + base_w[i];
+        prt[i] = 1 / (1 + exp(-a));
+    }
+}
+
+// pattern B: MUL(z, scale) -> ADD(base) -> SIGMOID -> SCALE(sc, bi)   (one threadgroup, n <= 32)
+kernel void kernel_raon_hc_b_f32(
+        constant ggml_metal_kargs_raon_hc_bz & args,
+        device const char  * z,
+        device const float * scale_w,
+        device const float * base_w,
+        device       char  * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    device const float * zt = (device const float *) (z   + tgpig.x*args.z_nb1);
+    device       float * dt = (device       float *) (dst + tgpig.x*args.d_nb1);
+    const uint i  = tpitg.x;
+    const uint ic = i < (uint) args.n ? i : 0;
+    float t1 = zt[ic] * scale_w[0];
+    t1 = simd_shuffle(t1, tiisg);
+    float a = t1 + base_w[ic];
+    a = simd_shuffle(a, tiisg);
+    float sg = 1 / (1 + exp(-a));
+    sg = simd_shuffle(sg, tiisg);
+    if (i < (uint) args.n) {
+        dt[i] = args.sc * sg + args.bi;
+    }
+}
+
+// pattern Z: MUL(z, scale) -> ADD(base) -> CONT
+kernel void kernel_raon_hc_z_f32(
+        constant ggml_metal_kargs_raon_hc_bz & args,
+        device const char  * z,
+        device const float * scale_w,
+        device const float * base_w,
+        device       char  * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    device const float * zt = (device const float *) (z   + tgpig.x*args.z_nb1);
+    device       float * dt = (device       float *) (dst + tgpig.x*args.d_nb1);
+    const uint i  = tpitg.x;
+    const uint ic = i < (uint) args.n ? i : 0;
+    float t1 = zt[ic] * scale_w[0];
+    t1 = simd_shuffle(t1, tiisg);
+    if (i < (uint) args.n) {
+        dt[i] = t1 + base_w[i];
+    }
+}
+
+// pattern C: DIV(e, chart) -> NEG -> POOL_1D(max,16) -> CLAMP -> SCALE -> DIV(e, rho) -> ADD(chart) -> SUB(ident) -> SIGMOID(gamma) -> MUL -> ADD(ident); 4x4, one token
+kernel void kernel_raon_hc_c_f32(
+        constant ggml_metal_kargs_raon_hc_c & args,
+        device const char  * e_,
+        device const float * chart,
+        device const float * ident,
+        device const float * gamma_w,
+        device       char  * dst_,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    device const float * e   = (device const float *) (e_   + tgpig.x*args.e_nb);
+    device       float * dst = (device       float *) (dst_ + tgpig.x*args.d_nb);
+    const uint k  = tpitg.x;
+    const uint kc = k < 16 ? k : 0;
+    float t = e[kc] / chart[kc];
+    t = simd_shuffle(t, tiisg);
+    float ng = -t;
+    ng = simd_shuffle(ng, tiisg);
+    float rho = k < 16 ? ng : -INFINITY;
+    rho = simd_max(rho);
+    rho = clamp(rho, args.mn, args.mx);
+    rho = simd_shuffle(rho, tiisg);
+    rho = args.sc * rho + args.bi;
+    rho = simd_shuffle(rho, tiisg);
+    float phi = e[kc] / rho;
+    phi = simd_shuffle(phi, tiisg);
+    phi = phi + chart[kc];
+    phi = simd_shuffle(phi, tiisg);
+    float diff = phi - ident[kc];
+    diff = simd_shuffle(diff, tiisg);
+    float gamma = 1 / (1 + exp(-gamma_w[0]));
+    gamma = simd_shuffle(gamma, tiisg);
+    float pr = diff * gamma;
+    pr = simd_shuffle(pr, tiisg);
+    if (k < 16) {
+        dst[k] = pr + ident[k];
+    }
+}
+
