@@ -283,6 +283,19 @@ static __global__ void raon_hc_dp_f32(const float * mix, const float * scale_w, 
     dst[i0 * sd0 + idst * sd1] = sum;
 }
 
+// RDA convolution state update for one token.
+// CC: CONCAT(state[3,n], x[1,n]) -> dst[4,n], followed by CPY(view of dst columns 1..3 -> conv-state cache [3,n]): one kernel writes both.
+static __global__ void raon_cc_f32(const float * s0, const float * s1, float * dst, float * cache, const int n,
+        const int64_t s0_0, const int64_t s0_1, const int64_t s1_1, const int64_t c_0, const int64_t c_1) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) {
+        return;
+    }
+    const float a0 = s0[0 * s0_0 + j * s0_1], a1 = s0[1 * s0_0 + j * s0_1], a2 = s0[2 * s0_0 + j * s0_1], a3 = s1[j * s1_1];
+    dst[0 + 4 * j] = a0; dst[1 + 4 * j] = a1; dst[2 + 4 * j] = a2; dst[3 + 4 * j] = a3;
+    cache[0 * c_0 + j * c_1] = a1; cache[1 * c_0 + j * c_1] = a2; cache[2 * c_0 + j * c_1] = a3;
+}
+
 // RDA gate chains.
 static __device__ __forceinline__ float rhc_softplus(float x) { return (x > 20.0f) ? x : logf(1.0f + expf(x)); }  // unary.cu op_softplus
 
@@ -334,6 +347,25 @@ static bool rhc_ok(const ggml_tensor * out, const ggml_tensor * in, bool exact_o
 }
 
 static bool rhc_f32c(const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); }
+
+// the view nodes between nd[i] and nd[i+j] (one of them views a persistent cache tensor, which ggml_can_fuse_subgraph rejects) must have no consumer outside the span
+static bool rhc_views_private(const ggml_cgraph * cgraph, int i, int j) {
+    for (int q = 1; q < j; ++q) {
+        if (cgraph->nodes[i + q]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+    }
+    for (int k = 0; k < cgraph->n_nodes; ++k) {
+        if (k >= i && k <= i + j) { continue; }
+        const ggml_tensor * n = cgraph->nodes[k];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            for (int q = 1; q < j; ++q) {
+                if (n->src[s] == cgraph->nodes[i + q]) { return false; }
+            }
+        }
+    }
+    return true;
+}
 
 bool ggml_cuda_raon_hc_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * n_skip) {
     if (i + 14 > cgraph->n_nodes) {
@@ -579,6 +611,32 @@ bool ggml_cuda_raon_hc_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * c
             ggml_cuda_op_ssm_conv(ctx, nd[0], nullptr, nd[2]);
             *n_skip = 2;
             return true;
+        }
+    }
+
+    // RDA conv-state update: CONCAT([3,n] state, [1,n] x) + CPY(last 3 columns -> state cache), n_tokens == 1
+    if (nd[0]->op == GGML_OP_CONCAT) {
+        int j = 0;
+        for (int q = 1; q <= 4 && i + q < cgraph->n_nodes; ++q) {
+            const ggml_op o = nd[q]->op;
+            if (o == GGML_OP_CPY) { j = q; break; }
+            if (o != GGML_OP_VIEW && o != GGML_OP_RESHAPE && o != GGML_OP_PERMUTE && o != GGML_OP_TRANSPOSE && o != GGML_OP_NONE) { break; }
+        }
+        if (j > 0) {
+            ggml_tensor * cc = nd[0], * cp = nd[j];
+            const ggml_tensor * a = cc->src[0], * b = cc->src[1], * cv = cp->src[0];
+            if (a && b && cv && ((const int32_t *) cc->op_params)[0] == 0 && cc->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && cp->type == GGML_TYPE_F32 &&
+                    cc->ne[0] == 4 && cc->ne[1] == 5120 && cc->ne[2] == 1 && cc->ne[3] == 1 && rhc_f32c(cc) && a->ne[0] == 3 && a->ne[1] == 5120 && a->ne[2] == 1 && a->ne[3] == 1 &&
+                    b->ne[0] == 1 && b->ne[1] == 5120 && b->ne[2] == 1 && b->ne[3] == 1 && a->nb[0] % 4 == 0 && a->nb[1] % 4 == 0 && b->nb[1] % 4 == 0 &&
+                    cp->ne[0] == 3 && cp->ne[1] == 5120 && cp->ne[2] == 1 && cp->ne[3] == 1 && cp->nb[0] % 4 == 0 && cp->nb[1] % 4 == 0 &&
+                    cv->view_src == cc && cv->view_offs == 4 && cv->ne[0] == 3 && cv->ne[1] == 5120 && cv->nb[0] == 4 && cv->nb[1] == 16 && cp->src[0] == cv &&
+                    rhc_views_private(cgraph, i, j) &&
+                    rhc_ok(cc, a, false) && rhc_ok(cc, b, false) && rhc_ok(cp, a, false) && rhc_ok(cp, b, false) && rhc_ok(cp, cc, false)) {
+                raon_cc_f32<<<(5120 + 255) / 256, 256, 0, stream>>>((const float *) a->data, (const float *) b->data, (float *) cc->data, (float *) cp->data, 5120,
+                        (int64_t) (a->nb[0] / 4), (int64_t) (a->nb[1] / 4), (int64_t) (b->nb[1] / 4), (int64_t) (cp->nb[0] / 4), (int64_t) (cp->nb[1] / 4));
+                *n_skip = j;
+                return true;
+            }
         }
     }
 
