@@ -119,6 +119,11 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    // device-resident extracted layer inputs
+    void dev_feat_enable(const int32_t * layer_ids, int32_t n_layers);
+    bool dev_feat_ready() const { return dev_feat_on; }
+    ggml_tensor * dev_feat_acc_tensor() const { return dev_feat_acc; }
+    bool dev_feat_extract(const llm_graph_result * res, size_t token_offset, size_t n_tokens, const std::vector<int32_t> * batch_idxs);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -241,7 +246,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, const std::vector<int32_t> * batch_idxs = nullptr);
 
     //
     // graph
@@ -324,6 +329,12 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    bool                 dev_feat_on = false;
+    std::vector<int32_t> dev_feat_ids;
+    ggml_context *       dev_feat_ctx = nullptr;
+    ggml_backend_buffer_t dev_feat_buf = nullptr;
+    ggml_tensor *        dev_feat_acc = nullptr;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     struct sampling_info {

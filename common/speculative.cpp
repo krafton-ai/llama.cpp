@@ -1108,6 +1108,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_batch batch;        // noise tokens
     common_batch batch_inject; // target features for KV cache injection
 
+    bool dev_feat = false;
+    std::vector<float> dev_zero_row;
     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
 
     std::vector<common_sampler_ptr> smpls;
@@ -1266,6 +1268,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        dev_feat = !is_lilicorr;
+        if (dev_feat) {
+            llama_dev_feat_enable(ctx_tgt, target_layer_ids, (int32_t) target_layer_ids_n);
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1342,6 +1349,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        const bool dev_now = dev_feat && llama_dev_feat_ready(ctx_tgt); // the target context may have fallen back to host rows (buffer allocation failure)
+        if (dev_now) { llama_synchronize(ctx_tgt); dev_zero_row.assign((size_t) n_embd_enc, 0.0f); }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1361,6 +1370,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
+                if (!dev_now) {
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
@@ -1374,13 +1384,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                } // !dev_feat gather
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
-                    batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    const float * row_ptr = dev_now ? dev_zero_row.data() : features_buf.data() + (size_t) i * n_embd_enc;
+                    batch_inject.add_embd({ row_ptr, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
+                if (dev_now) { llama_dev_feat_set_source(ctx_tgt, i_batch_beg[seq_id] + offset, n_chunk); }
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                if (dev_now) {
+                    const int32_t used = llama_dev_feat_consumed();
+                    llama_dev_feat_set_source(ctx_tgt, 0, 0);
+                    if (used < 1) { GGML_ABORT("DFlash device features were not consumed by the draft input"); }
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);

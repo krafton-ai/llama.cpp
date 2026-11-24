@@ -103,6 +103,15 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// keep the extracted target layer inputs on the device, concatenated per token row in the given layer order
+// ([n_layers * n_embd_layer_inp, n_batch] F32), and let a draft context read them from there instead of from host rows.
+LLAMA_API void llama_dev_feat_enable(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
+LLAMA_API bool llama_dev_feat_ready(struct llama_context * ctx);
+// rows [row_off, row_off + n_rows) of the device accumulation buffer of ctx are the embedding source of the next draft decode (n_rows == 0 clears)
+LLAMA_API void llama_dev_feat_set_source(struct llama_context * ctx, int64_t row_off, int64_t n_rows);
+// number of draft set_input calls that consumed the device source since the last set_source
+LLAMA_API int32_t llama_dev_feat_consumed(void);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
@@ -168,3 +177,8 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+
+struct ggml_tensor;
+// internal (C++), used by llm_graph_input_embd::set_input
+bool llama_dev_feat_src_get(struct ggml_tensor ** acc, int64_t * row_off, int64_t * n_rows);
+void llama_dev_feat_src_mark_consumed(void);

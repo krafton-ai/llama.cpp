@@ -576,6 +576,9 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    if (dev_feat_buf) { ggml_backend_buffer_free(dev_feat_buf); }
+    if (dev_feat_ctx) { ggml_free(dev_feat_ctx); }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -2124,7 +2127,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
-        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens, (ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens) ? &ubatch.data->batch_idxs : nullptr);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2389,7 +2392,106 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+// Device-resident target layer inputs
+static ggml_tensor * g_dev_feat_src_acc  = nullptr;
+static int64_t       g_dev_feat_src_off  = 0;
+static int64_t       g_dev_feat_src_rows = 0;
+static int32_t       g_dev_feat_consumed = 0;
+
+bool llama_dev_feat_src_get(ggml_tensor ** acc, int64_t * row_off, int64_t * n_rows) {
+    if (g_dev_feat_src_rows <= 0 || !g_dev_feat_src_acc) { return false; }
+    *acc = g_dev_feat_src_acc; *row_off = g_dev_feat_src_off; *n_rows = g_dev_feat_src_rows;
+    return true;
+}
+void llama_dev_feat_src_mark_consumed(void) { g_dev_feat_consumed++; }
+
+void llama_context::dev_feat_enable(const int32_t * layer_ids, int32_t n_layers) {
+    for (int32_t i = 0; i < n_layers; ++i) {
+        const auto dev = model.dev_layer(layer_ids[i]);
+        const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+            return;
+        }
+    }
+    dev_feat_ids.assign(layer_ids, layer_ids + n_layers);
+    dev_feat_on = true;
+}
+
+bool llama_context::dev_feat_extract(const llm_graph_result * res, size_t token_offset, size_t n_tokens, const std::vector<int32_t> * batch_idxs) {
+    const size_t n_layers = dev_feat_ids.size();
+    const size_t row_floats = model.hparams.n_embd_layer_inp();
+    ggml_backend_t backend = nullptr;
+    for (size_t k = 0; k < n_layers; ++k) {
+        ggml_tensor * t = res->get_layer_inp(dev_feat_ids[k]);
+        if (!t) { GGML_ABORT("layer input tensor not found"); }
+        if (!backend) { backend = ggml_backend_sched_get_tensor_backend(sched.get(), t); }
+    }
+    GGML_ASSERT(backend != nullptr);
+    if (!dev_feat_acc) {
+        ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+        dev_feat_ctx = ggml_init(ip);
+        dev_feat_acc = ggml_new_tensor_2d(dev_feat_ctx, GGML_TYPE_F32, (int64_t) (n_layers * row_floats), (int64_t) cparams.n_batch);
+        dev_feat_buf = ggml_backend_alloc_ctx_tensors(dev_feat_ctx, backend);
+        if (!dev_feat_buf) {
+            // fall back to the host extraction path for this and the following decodes
+            LLAMA_LOG_WARN("%s: could not allocate the device feature buffer, using the host path\n", __func__);
+            ggml_free(dev_feat_ctx);
+            dev_feat_ctx = nullptr; dev_feat_acc = nullptr; dev_feat_on = false;
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: device feature buffer %.1f MiB (%zu layers x %zu floats x %u rows)\n", __func__,
+                ggml_backend_buffer_get_size(dev_feat_buf) / (1024.0 * 1024.0), n_layers, row_floats, cparams.n_batch);
+    }
+    // destination row of token t of this ubatch: its index in the decode batch (the host path reorders rows afterwards, see output_reorder)
+    std::vector<int32_t> dst_rows(n_tokens);
+    for (size_t t = 0; t < n_tokens; ++t) {
+        dst_rows[t] = batch_idxs ? (*batch_idxs)[t] : (int32_t) (token_offset + t);
+        GGML_ASSERT(dst_rows[t] >= 0 && dst_rows[t] < dev_feat_acc->ne[1]);
+    }
+    // runs of consecutive destination rows
+    std::vector<std::pair<size_t, size_t>> runs; // (first token, length)
+    for (size_t t = 0; t < n_tokens; ) {
+        size_t len = 1;
+        while (t + len < n_tokens && dst_rows[t + len] == dst_rows[t] + (int32_t) len) { len++; }
+        runs.emplace_back(t, len);
+        t += len;
+    }
+
+    const size_t gsz = 16 * n_layers * runs.size() + 32; // hash set of the graph needs room for the views and leaves too
+    ggml_init_params ip = { ggml_tensor_overhead() * (n_layers * 3 * runs.size() + 4) + ggml_graph_overhead_custom(gsz, false), nullptr, true };
+    ggml_context * c2 = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph_custom(c2, gsz, false);
+    for (size_t k = 0; k < n_layers; ++k) {
+        ggml_tensor * t = res->get_layer_inp(dev_feat_ids[k]);
+        GGML_ASSERT(ggml_nbytes(t) == n_tokens * row_floats * sizeof(float));
+        for (const auto & run : runs) {
+            // a leaf aliasing the extracted tensor rows (t belongs to the target graph: walking its parents would visit that whole graph)
+            ggml_tensor * src = ggml_new_tensor_2d(c2, GGML_TYPE_F32, (int64_t) row_floats, (int64_t) run.second);
+            src->data = (char *) t->data + run.first * row_floats * sizeof(float); src->buffer = t->buffer;
+            ggml_tensor * dst = ggml_view_2d(c2, dev_feat_acc, (int64_t) row_floats, (int64_t) run.second, dev_feat_acc->nb[1],
+                    (size_t) dst_rows[run.first] * dev_feat_acc->nb[1] + k * row_floats * sizeof(float));
+            ggml_build_forward_expand(gf, ggml_cpy(c2, src, dst));
+        }
+    }
+    ggml_status st = ggml_backend_graph_compute_async(backend, gf);
+    ggml_free(c2);
+    if (st != GGML_STATUS_SUCCESS) { GGML_ABORT("dev_feat_extract: graph compute failed"); }
+    return true;
+}
+
+void llama_dev_feat_enable(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers) { ctx->dev_feat_enable(layer_ids, n_layers); }
+bool llama_dev_feat_ready(llama_context * ctx) { return ctx->dev_feat_ready(); }
+void llama_dev_feat_set_source(llama_context * ctx, int64_t row_off, int64_t n_rows) {
+    g_dev_feat_consumed = 0;
+    if (n_rows <= 0) { g_dev_feat_src_acc = nullptr; g_dev_feat_src_rows = 0; return; }
+    g_dev_feat_src_acc = ctx->dev_feat_acc_tensor(); g_dev_feat_src_off = row_off; g_dev_feat_src_rows = n_rows;
+}
+int32_t llama_dev_feat_consumed(void) { return g_dev_feat_consumed; }
+
+bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, const std::vector<int32_t> * batch_idxs) {
+    if (dev_feat_on && dev_feat_extract(res, token_offset, n_tokens, batch_idxs)) {
+        return true;
+    }
     bool extracted = false;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {

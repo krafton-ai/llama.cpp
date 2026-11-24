@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-batch.h"
+#include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
 
@@ -79,7 +80,19 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
 
         const int64_t n_tokens = ubatch->n_tokens;
 
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+        // embedding rows already on the device (target extraction buffer): one device-to-device copy
+        ggml_tensor * dev_acc = nullptr; int64_t dev_off = 0, dev_rows = 0;
+        if (llama_dev_feat_src_get(&dev_acc, &dev_off, &dev_rows) && dev_rows == n_tokens && dev_acc->ne[0] == embd->ne[0]) {
+            ggml_tensor v = *dev_acc;
+            v.ne[1] = n_tokens; v.ne[2] = 1; v.ne[3] = 1;
+            v.nb[2] = v.nb[1] * n_tokens; v.nb[3] = v.nb[2];
+            v.data = (char *) dev_acc->data + dev_off * dev_acc->nb[1];
+            v.view_src = nullptr; v.view_offs = 0;
+            ggml_backend_tensor_copy(&v, embd);
+            llama_dev_feat_src_mark_consumed();
+        } else {
+            ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+        }
     }
 
     if (ubatch->is_mixed() && embd) {
