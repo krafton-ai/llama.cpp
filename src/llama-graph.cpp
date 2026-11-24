@@ -3364,6 +3364,65 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_attn_mla_expand(
+        llm_graph_input_attn_k * inp,
+        ggml_tensor * q_full,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * wk_b,
+        ggml_tensor * wv_b,
+            float     kq_scale,
+            int       il) const {
+    ggml_build_forward_expand(gf, q_full);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);   // [576, n_kv, 1, ns]
+    if (k->type != GGML_TYPE_F16 || k->ne[3] != 1 || k->ne[1] != 1) {
+        return nullptr;
+    }
+    const int64_t rank = v_cur->ne[0];             // 512
+    const int64_t nr   = k->ne[0] - rank;          // 64
+    const int64_t nkv  = k->ne[2];
+    const int64_t H    = n_head;
+    const int64_t dn   = wk_b->ne[0];              // 128
+    const int64_t dv   = wv_b->ne[1];              // 128
+
+    // K = [K_nope(128) | rope part(64)] head-major [192,nkv,H] F16 in ONE node: an F16-out GEMM over the 512-wide latent (128 output rows) that also
+    // copies the 64 extra dims of the same cached row after the 128 outputs (op param 8 = append mode; dst declared 192 wide, GEMM computes src0->ne[1] = 128 rows).
+    // Bit-identical to the 576-contraction version (the extra products there were exact zeros appended to the same accumulation).
+    ggml_tensor * wkt = ggml_cont(ctx0, ggml_permute(ctx0, ggml_cast(ctx0, wk_b, GGML_TYPE_F32), 1, 0, 2, 3));   // [rank, dn, H] f32
+    ggml_tensor * wk_f16 = ggml_cast(ctx0, wkt, GGML_TYPE_F16);
+
+    ggml_tensor * lrow = ggml_view_2d(ctx0, k, rank, nkv, k->nb[2], 0);
+    lrow->ne[2] = H; lrow->nb[2] = 0; lrow->nb[3] = 0;                 // stride-0 over heads
+    ggml_tensor * Kx = ggml_mul_mat(ctx0, wk_f16, lrow);              // computes [dn, nkv, H]
+    Kx->type = GGML_TYPE_F16; Kx->ne[0] = dn + nr; Kx->nb[0] = 2; Kx->nb[1] = (dn + nr)*2; Kx->nb[2] = Kx->nb[1]*nkv; Kx->nb[3] = Kx->nb[2]*H;
+    ((int32_t *) Kx->op_params)[8] = 1;
+    GGML_ASSERT(nr % 4 == 0 && rank % 4 == 0);
+
+    // V: keep the (quantized) wv_b as is; the latent goes in as F32 (broadcast over heads)
+    ggml_tensor * lat32 = ggml_cast(ctx0, ggml_view_2d(ctx0, k, rank, nkv, k->nb[2], 0), GGML_TYPE_F32);
+    ggml_tensor * latb32 = ggml_view_2d(ctx0, lat32, rank, nkv, lat32->nb[1], 0);
+    latb32->ne[2] = H; latb32->nb[2] = 0; latb32->nb[3] = 0;
+    ggml_tensor * Vx = ggml_mul_mat(ctx0, wv_b, latb32);              // [dv, nkv, H]
+    Vx->type = GGML_TYPE_F16; Vx->nb[0] = 2; Vx->nb[1] = dv*2; Vx->nb[2] = Vx->nb[1]*nkv; Vx->nb[3] = Vx->nb[2]*H;
+    ggml_tensor * kbuf = Kx;
+    ggml_tensor * vbuf = Vx;
+
+    // q_full [192, H, T] -> [192, T, H]; keys/values are already head-major [d, nkv, H]
+    ggml_tensor * q = ggml_permute(ctx0, q_full, 0, 2, 1, 3);
+    ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, kbuf, vbuf, inp->get_kq_mask(), kq_scale, hparams.f_max_alibi_bias, 0.0f);
+    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+    ggml_flash_attn_ext_set_n_kv_max(cur, 0);
+    ggml_prec_set_acc(cur, GGML_PREC_F32);
+    cb(cur, "kqv_out_expand", il);
+    return ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_k_dsa * inp,
         ggml_tensor * wo,

@@ -1302,6 +1302,18 @@ struct llm_graph_context {
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
+    // MLA expanded prefill path: K/V are expanded per head from the cached latent (F16-out GEMM into head-major buffers), then plain FA 192/128.
+    // q_full: [dk(192), n_head, n_tokens] un-absorbed query. Returns [dv*n_head, n_tokens] (pre-wo), or nullptr when not applicable.
+    ggml_tensor * build_attn_mla_expand(
+            llm_graph_input_attn_k * inp,
+            ggml_tensor * q_full,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * wk_b,
+            ggml_tensor * wv_b,
+                  float   kq_scale,
+                    int   il) const;
+
     ggml_tensor * build_attn(
             llm_graph_input_attn_k * inp,
             ggml_tensor * wo,

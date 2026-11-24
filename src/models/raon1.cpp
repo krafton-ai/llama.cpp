@@ -246,7 +246,7 @@ ggml_tensor * llama_model_raon1::graph::build_rda_gate(ggml_tensor * x, ggml_ten
 
 // Raon delta attention: a gated delta-rule layer whose write gate differs from its erase gate
 ggml_tensor * llama_model_raon1::graph::build_rda_layer(
-        ggml_tensor * cur, const llama_layer & layer, llm_graph_input_rs * inp_rs, int il) {
+        ggml_tensor * cur, const llama_layer & layer, llm_graph_input_rs * inp_rs, int il, bool metal) {
     const int64_t head_dim     = hparams.n_embd_head_kda;
     const int64_t d_inner      = head_dim * n_head;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
@@ -294,7 +294,9 @@ ggml_tensor * llama_model_raon1::graph::build_rda_layer(
     state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
 
     ggml_tensor * output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, state, il);
-    output = ggml_cont(ctx0, output);
+    if (!(metal && n_tokens > 8 && ggml_is_contiguous(output))) {
+        output = ggml_cont(ctx0, output);
+    }
     cb(output, "rda_scan_out", il);
 
     // output gate, then RMSNorm(o) * sigmoid(g2)
@@ -393,7 +395,7 @@ ggml_tensor * llama_model_raon1::graph::build_hc_post(
 }
 
 ggml_tensor * llama_model_raon1::graph::build_mla_layer(
-        ggml_tensor * cur, const llama_layer & layer, llm_graph_input_attn_k * inp_attn_k, int il) {
+        ggml_tensor * cur, const llama_layer & layer, llm_graph_input_attn_k * inp_attn_k, int il, bool metal) {
     const int64_t nr = hparams.n_rot();
     const int64_t nk = hparams.n_embd_head_k_mla();
     const int64_t nn = nk - nr;
@@ -409,14 +411,23 @@ ggml_tensor * llama_model_raon1::graph::build_mla_layer(
     ggml_tensor * extra = ggml_view_3d(ctx0, kv, nr, 1, n_tokens, kv->nb[1], kv->nb[1], rank*kv->nb[0]);
     ggml_tensor * q_nope = ggml_view_3d(ctx0, q, nn, n_head, n_tokens, nk*q->nb[0], q->nb[1], 0);
     ggml_tensor * q_extra = ggml_view_3d(ctx0, q, nr, n_head, n_tokens, nk*q->nb[0], q->nb[1], nn*q->nb[0]);
-    q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
-    q_nope = build_lora_mm(layer.wk_b, q_nope);
-    q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
-    q = ggml_concat(ctx0, q_nope, q_extra, 0);
-    latent = ggml_reshape_3d(ctx0, latent, rank, 1, n_tokens);
-    ggml_tensor * k = ggml_concat(ctx0, latent, extra, 0);
-    ggml_tensor * out = build_attn(inp_attn_k, nullptr, nullptr, nullptr, q, k, latent,
-            nullptr, nullptr, layer.wv_b, 1.0f/sqrtf(nk), il);
+    ggml_tensor * out = nullptr;
+    if (metal && n_tokens > 8) {
+        ggml_tensor * q_full = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), nk, n_head, n_tokens);
+        ggml_tensor * lat_e = ggml_reshape_3d(ctx0, latent, rank, 1, n_tokens);
+        ggml_tensor * k_e = ggml_concat(ctx0, lat_e, extra, 0);
+        out = build_attn_mla_expand(inp_attn_k, q_full, k_e, lat_e, layer.wk_b, layer.wv_b, 1.0f/sqrtf(nk), il);
+    }
+    if (!out) {
+        q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
+        q_nope = build_lora_mm(layer.wk_b, q_nope);
+        q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
+        q = ggml_concat(ctx0, q_nope, q_extra, 0);
+        latent = ggml_reshape_3d(ctx0, latent, rank, 1, n_tokens);
+        ggml_tensor * k = ggml_concat(ctx0, latent, extra, 0);
+        out = build_attn(inp_attn_k, nullptr, nullptr, nullptr, q, k, latent,
+                nullptr, nullptr, layer.wv_b, 1.0f/sqrtf(nk), il);
+    }
     out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, cur)));
     cb(out, "mla_gated", il);
     return build_lora_mm(layer.wo, out);
@@ -479,10 +490,11 @@ llama_model_raon1::graph::graph(const llama_model & model, const llm_graph_param
             res->t_embd = ggml_get_rows(ctx0, cur, out_ids);
             return;
         }
+        const bool metal = reg && std::strcmp(ggml_backend_reg_name(reg), "MTL") == 0;
         if (hparams.is_recr(il)) {
-            cur = build_rda_layer(cur, layer, inp_rs, il);
+            cur = build_rda_layer(cur, layer, inp_rs, il, metal);
         } else {
-            cur = build_mla_layer(cur, layer, inp_attn, il);
+            cur = build_mla_layer(cur, layer, inp_attn, il, metal);
         }
         inp = build_hc_post(inp, cur, post, comb, il);
         cb(inp, "hc_attn_out", il);
