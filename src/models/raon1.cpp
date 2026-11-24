@@ -246,7 +246,7 @@ ggml_tensor * llama_model_raon1::graph::build_rda_gate(ggml_tensor * x, ggml_ten
 
 // Raon delta attention: a gated delta-rule layer whose write gate differs from its erase gate
 ggml_tensor * llama_model_raon1::graph::build_rda_layer(
-        ggml_tensor * cur, const llama_layer & layer, llm_graph_input_rs * inp_rs, int il, bool metal) {
+        ggml_tensor * cur, const llama_layer & layer, llm_graph_input_rs * inp_rs, int il, bool metal, bool cuda) {
     const int64_t head_dim     = hparams.n_embd_head_kda;
     const int64_t d_inner      = head_dim * n_head;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
@@ -294,7 +294,7 @@ ggml_tensor * llama_model_raon1::graph::build_rda_layer(
     state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
 
     ggml_tensor * output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, state, il);
-    if (!(metal && n_tokens > 8 && ggml_is_contiguous(output))) {
+    if (!((cuda || (metal && n_tokens > 8)) && ggml_is_contiguous(output))) {
         output = ggml_cont(ctx0, output);
     }
     cb(output, "rda_scan_out", il);
@@ -308,7 +308,9 @@ ggml_tensor * llama_model_raon1::graph::build_rda_layer(
     cb(normed, "rda_normed", il);
     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
-    gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
+    gated = cuda && ggml_is_contiguous(gated)
+        ? ggml_reshape_2d(ctx0, gated, d_inner, n_tokens)
+        : ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
     cur   = build_lora_mm(layer.wo, gated);
     cb(cur, "rda_out", il);
 
@@ -472,9 +474,11 @@ llama_model_raon1::graph::graph(const llama_model & model, const llm_graph_param
         cb(cur, "attn_norm", il);
         const auto dev = model.dev_layer(il);
         const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        const char * backend = reg ? ggml_backend_reg_name(reg) : "";
+        const bool cuda = std::strcmp(backend, "CUDA") == 0;
         // Only the cache write is needed for prompt chunks that have no outputs.
         if (il == n_layer - 1 && !hparams.is_recr(il) && n_outputs == 0 && n_tokens > 1 &&
-                reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 &&
+                cuda &&
                 cparams.causal_attn && !cparams.embeddings && !cparams.embeddings_nextn && !cparams.training &&
                 !cparams.pipeline_parallel && !cparams.cb_eval && params.samplers.empty() &&
                 std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; })) {
@@ -490,9 +494,9 @@ llama_model_raon1::graph::graph(const llama_model & model, const llm_graph_param
             res->t_embd = ggml_get_rows(ctx0, cur, out_ids);
             return;
         }
-        const bool metal = reg && std::strcmp(ggml_backend_reg_name(reg), "MTL") == 0;
+        const bool metal = std::strcmp(backend, "MTL") == 0;
         if (hparams.is_recr(il)) {
-            cur = build_rda_layer(cur, layer, inp_rs, il, metal);
+            cur = build_rda_layer(cur, layer, inp_rs, il, metal, cuda);
         } else {
             cur = build_mla_layer(cur, layer, inp_attn, il, metal);
         }

@@ -2850,7 +2850,7 @@ struct llama_model_raon1 : public llama_model_base {
         ggml_tensor * build_rda_gate(ggml_tensor * x, ggml_tensor * ssm_a);
 
         ggml_tensor * build_rda_layer(ggml_tensor * cur, const llama_layer & layer,
-                                      llm_graph_input_rs * inp_rs, int il, bool metal);
+                                      llm_graph_input_rs * inp_rs, int il, bool metal, bool cuda);
 
         ggml_tensor * build_mla_layer(ggml_tensor * cur, const llama_layer & layer,
                                       llm_graph_input_attn_k * inp_attn_k, int il, bool metal);

@@ -2995,7 +2995,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cur = ggml_mul_mat(ctx0, v_mla, cur);
             cb(cur, "fattn_mla", il);
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
-            cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
+            bool reuse_view = false;
+            if (arch == LLM_ARCH_RAON1 && ggml_is_contiguous(cur) && v_mla->buffer) {
+                const auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(v_mla->buffer));
+                const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                reuse_view = reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+            }
+            if (!reuse_view) {
+                cur = ggml_cont(ctx0, cur); // ggml_reshape_2d needs contiguous inputs.
+            }
 #endif
         }
 
