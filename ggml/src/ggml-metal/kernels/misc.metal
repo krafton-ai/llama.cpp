@@ -938,3 +938,70 @@ kernel void kernel_raon_hc_c_f32(
     }
 }
 
+// pattern G: ADD(x, dt) -> MUL(ssm_a per head) -> SCALE -> SIGMOID -> SCALE   (rda_g1, 5120 = 40 heads x 128)
+kernel void kernel_raon_rda_g_f32(
+        constant ggml_metal_kargs_raon_rda & args,
+        device const float * x,
+        device const float * dt,
+        device const float * a,
+        device       float * dst,
+        uint    gid  [[thread_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const uint ic = gid < (uint) args.n ? gid : 0;
+    const uint r = ic % (uint) args.per;                // element within the token (dt and the per-head ssm_a repeat per token)
+    float t0 = x[ic] + dt[r];
+    t0 = simd_shuffle(t0, tiisg);
+    float t1 = t0 * a[r / args.hd];
+    t1 = simd_shuffle(t1, tiisg);
+    float t2 = args.sc1 * t1 + args.bi1;
+    t2 = simd_shuffle(t2, tiisg);
+    float sg = 1 / (1 + exp(-t2));
+    sg = simd_shuffle(sg, tiisg);
+    if (gid < (uint) args.n) {
+        dst[gid] = args.sc2 * sg + args.bi2;
+    }
+}
+
+// pattern V: ADD(beta, rda) -> NEG -> SOFTPLUS -> SUB(sp1, .) -> EXP -> MUL(v_conv, per head)   (rda_v_scaled, 5120)
+kernel void kernel_raon_rda_v_f32(
+        constant ggml_metal_kargs_raon_rda & args,
+        device const float * beta,
+        device const float * rda,
+        device const float * sp1,
+        device const float * v,
+        device       float * dst,
+        uint    gid  [[thread_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const uint ic = gid < (uint) args.n ? gid : 0;
+    const uint h  = ic / args.hd;
+    float t = beta[h] + rda[h];
+    t = simd_shuffle(t, tiisg);
+    float ng = -t;
+    ng = simd_shuffle(ng, tiisg);
+    float sp = select(log(1 + exp(ng)), ng, ng > 20);
+    sp = simd_shuffle(sp, tiisg);
+    float d = sp1[h] - sp;
+    d = simd_shuffle(d, tiisg);
+    float e = exp(d);
+    e = simd_shuffle(e, tiisg);
+    if (gid < (uint) args.n) {
+        dst[gid] = v[gid] * e;
+    }
+}
+
+// pattern O: SIGMOID(g) -> MUL(normed, .) -> CONT
+kernel void kernel_raon_rda_o_f32(
+        constant ggml_metal_kargs_raon_rda & args,
+        device const float * g,
+        device const float * normed,
+        device       float * dst,
+        uint    gid  [[thread_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const uint ic = gid < (uint) args.n ? gid : 0;
+    float sg = 1 / (1 + exp(-g[ic]));
+    sg = simd_shuffle(sg, tiisg);
+    if (gid < (uint) args.n) {
+        dst[gid] = normed[gid] * sg;
+    }
+}
+

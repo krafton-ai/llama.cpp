@@ -47,6 +47,9 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_RAON_HC_B,    // MUL ADD SIGMOID SCALE
     GGML_METAL_FUSION_RAON_HC_Z,    // MUL ADD CONT
     GGML_METAL_FUSION_RAON_HC_C,    // 4x4 comb tail (11 ops)
+    GGML_METAL_FUSION_RAON_RDA_G,   // ADD MUL SCALE SIGMOID SCALE
+    GGML_METAL_FUSION_RAON_RDA_V,   // ADD NEG SOFTPLUS SUB EXP MUL
+    GGML_METAL_FUSION_RAON_RDA_O,   // SIGMOID MUL CONT
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

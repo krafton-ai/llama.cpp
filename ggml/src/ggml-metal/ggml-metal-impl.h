@@ -1426,4 +1426,15 @@ typedef struct {
     uint64_t d_nb;   // token stride of dst
 } ggml_metal_kargs_raon_hc_c;
 
+// Raon-1 RDA gating chains
+typedef struct {
+    int32_t n;       // elements
+    int32_t hd;      // elements per head (128)
+    float   sc1;
+    float   bi1;
+    float   sc2;
+    float   bi2;
+    int32_t per;     // elements per token (G: 5120)
+} ggml_metal_kargs_raon_rda;
+
 #endif // GGML_METAL_IMPL

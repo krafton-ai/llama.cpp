@@ -887,6 +887,80 @@ static const std::vector<ggml_op> ops_raon_hc_c = {
 };
 
 
+static bool ggml_metal_raon_unary_is(const ggml_tensor * t, ggml_unary_op op) { return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op; }
+
+// G: ADD(x, dt) -> [RESHAPE RESHAPE] MUL(., ssm_a) -> SCALE -> SIGMOID -> SCALE
+static bool ggml_metal_fusion_check_raon_rda_g(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes, const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * add = nodes[0], * mul = nodes[1], * s1 = nodes[2], * sg = nodes[3], * s2 = nodes[4];
+    if (!ggml_metal_raon_unary_is(sg, GGML_UNARY_OP_SIGMOID)) { return false; }
+    const int out_pos[1] = { 4 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1)) { return false; }
+    const int64_t n = ggml_nelements(add);
+    const int64_t nt = n / 5120;   // tokens
+    return n == nt*5120 && nt >= 1 && nt <= raon_fusion_max_tokens && ggml_metal_raon_hc_f32c(add->src[0]) && ggml_metal_raon_hc_f32c(add->src[1]) && add->src[0]->type == GGML_TYPE_F32 && ggml_nelements(add->src[1]) == 5120 &&
+           ggml_nelements(mul) == n && ggml_metal_raon_hc_f32c(s2) && ggml_nelements(s2) == n && mul->src[1]->type == GGML_TYPE_F32 && ggml_nelements(mul->src[1]) == 40 && ggml_is_contiguous(mul->src[1]) &&
+           mul->ne[0] == 128 && mul->ne[1] == 40 && mul->ne[2] == nt && ggml_nelements(mul->src[0]) == n && mul->src[1]->ne[0] == 1 &&
+           s1->src[0] == mul && sg->src[0] == s1 && s2->src[0] == sg && s1->op_params != nullptr && s2->op_params != nullptr;
+}
+
+// V: ADD(beta, rda) NEG SOFTPLUS SUB(sp1, .) EXP MUL(v, .)
+static bool ggml_metal_fusion_check_raon_rda_v(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes, const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * add = nodes[0], * ng = nodes[1], * sp = nodes[2], * sub = nodes[3], * ex = nodes[4], * mul = nodes[5];
+    if (!ggml_metal_raon_unary_is(ng, GGML_UNARY_OP_NEG) || !ggml_metal_raon_unary_is(sp, GGML_UNARY_OP_SOFTPLUS) || !ggml_metal_raon_unary_is(ex, GGML_UNARY_OP_EXP)) { return false; }
+    const int out_pos[1] = { 5 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1)) { return false; }
+    const int64_t nt = ggml_nelements(add) / 40;   // tokens (the per-head index is element / 128 for any token count)
+    return nt >= 1 && nt <= raon_fusion_max_tokens && ggml_nelements(add) == 40*nt && add->src[0]->type == GGML_TYPE_F32 && add->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]) &&
+           ggml_nelements(add->src[0]) == 40*nt && ggml_nelements(add->src[1]) == 40*nt && ng->src[0] == add && sp->src[0] == ng && sub->src[1] == sp &&
+           sub->src[0]->type == GGML_TYPE_F32 && ggml_nelements(sub->src[0]) == 40*nt && ggml_is_contiguous(sub->src[0]) && ex->src[0] == sub && mul->src[1] == ex &&
+           mul->src[0]->type == GGML_TYPE_F32 && ggml_nelements(mul->src[0]) == 5120*nt && ggml_is_contiguous(mul->src[0]) && ggml_metal_raon_hc_f32c(mul) && mul->ne[0] == 128 && mul->ne[1] == 40 && mul->ne[2] == nt;
+}
+
+// O: SIGMOID(g) MUL(normed, .) CONT
+static bool ggml_metal_fusion_check_raon_rda_o(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes, const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * sg = nodes[0], * mul = nodes[1], * ct = nodes[2];
+    if (!ggml_metal_raon_unary_is(sg, GGML_UNARY_OP_SIGMOID)) { return false; }
+    const int out_pos[1] = { 2 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1)) { return false; }
+    const int64_t nt = ggml_nelements(ct) / 5120;
+    return nt >= 1 && nt <= raon_fusion_max_tokens && ggml_nelements(ct) == 5120*nt && ggml_metal_raon_hc_f32c(ct) && ggml_metal_raon_hc_f32c(sg->src[0]) && ggml_nelements(sg->src[0]) == 5120*nt &&
+           mul->src[1] == sg && mul->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(mul->src[0]) && ggml_nelements(mul->src[0]) == 5120*nt && ct->src[0] == mul;
+}
+
+// SSM_CONV -> RESHAPE (view of the conv output) -> SILU. The generic SSM_CONV_SILU pattern never matches this graph: SILU reads the
+// RESHAPE node, not the SSM_CONV node, and the generic elision check only sees the two compute nodes.
+static bool ggml_metal_fusion_check_ssm_conv_reshape_silu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * conv = nodes[0];
+    const ggml_tensor * un   = nodes[1];
+    const ggml_tensor * rs   = gf->nodes[node_idxs[idx] + 1];
+    if (conv->op != GGML_OP_SSM_CONV || un->op != GGML_OP_UNARY || rs->op != GGML_OP_RESHAPE || rs->src[0] != conv || un->src[0] != rs || un->src[1]) {
+        return false;
+    }
+    if (ggml_get_unary_op(un) != GGML_UNARY_OP_SILU || conv->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32 || !ggml_is_contiguous(un) ||
+            ggml_nelements(un) != ggml_nelements(conv)) {
+        return false;
+    }
+    const int out_pos[1] = { 1 };
+    return ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1);
+}
+
+static const std::vector<ggml_op> ops_raon_rda_g = { GGML_OP_ADD, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_raon_rda_v = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_ssm_conv_reshape_silu = { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_UNARY };
+static const std::vector<ggml_op> ops_raon_rda_o = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_CONT };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -920,6 +994,10 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_RAON_HC_B,      ops_raon_hc_b,              {},     true,  ggml_metal_fusion_check_raon_hc_b },
     { GGML_METAL_FUSION_RAON_HC_Z,      ops_raon_hc_z,              {},     true,  ggml_metal_fusion_check_raon_hc_z },
     { GGML_METAL_FUSION_RAON_HC_C,      ops_raon_hc_c,              {},     true,  ggml_metal_fusion_check_raon_hc_c },
+    { GGML_METAL_FUSION_RAON_RDA_G,     ops_raon_rda_g,             {},     true,  ggml_metal_fusion_check_raon_rda_g },
+    { GGML_METAL_FUSION_RAON_RDA_V,     ops_raon_rda_v,             {},     true,  ggml_metal_fusion_check_raon_rda_v },
+    { GGML_METAL_FUSION_RAON_RDA_O,     ops_raon_rda_o,             {},     true,  ggml_metal_fusion_check_raon_rda_o },
+    { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_reshape_silu,  {},     true,  ggml_metal_fusion_check_ssm_conv_reshape_silu },
 };
 
 // ---- alloc deps -----------------------------------------------------------
