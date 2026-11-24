@@ -64,6 +64,8 @@ struct task_params {
     int32_t n_indent  =  0; // minimum line indentation for the generated text in number of whitespace characters
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
 
+    float effort_alpha = 0.0f; // reasoning effort steering alpha of the request's reasoning_effort
+
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
@@ -625,6 +627,9 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // reasoning effort steering alpha the state was computed with; states are reused only with the same alpha
+    float effort_alpha = 0.0f;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
@@ -638,6 +643,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            effort_alpha,
         };
     }
 };
@@ -686,7 +692,7 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, float effort_alpha, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
 };

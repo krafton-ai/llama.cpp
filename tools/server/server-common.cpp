@@ -1428,6 +1428,15 @@ json oaicompat_chat_params_parse(
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
     }
+    // the effort the template sees (or "none") also selects the model's reasoning effort steering (server-context.cpp)
+    {
+        auto it = inputs.chat_template_kwargs.find("reasoning_effort");
+        if (it != inputs.chat_template_kwargs.end()) {
+            llama_params["reasoning_effort"] = json::parse(it->second);
+        } else {
+            llama_params["reasoning_effort"] = json_value(body, "reasoning_effort", std::string("")) == "none" ? json("none") : json();
+        }
+    }
 
     inputs.force_pure_content = opt.force_pure_content;
 
