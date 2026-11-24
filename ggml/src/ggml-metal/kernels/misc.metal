@@ -1047,3 +1047,39 @@ kernel void kernel_raon_situ2_f32(
     }
 }
 
+// out1[r1*4 + r0] = sum_i A[r0][i]*B[r1][i] (r0 < 4, r1 < 3); out2[r1*4 + r0] = sum_i A[r0][i]*out1[i*4 + r1] (r0, r1 < 4).
+// Same sequential accumulation as kernel_mul_mv_f32_f32_short; the transposed copy (CONT) is read through its address instead.
+kernel void kernel_raon_comb_f32(
+        constant ggml_metal_kargs_raon_comb & args,
+        device const char * a,
+        device const char * b_,
+        device       char * dst_,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const ushort tid = tpitg.x;
+    device const char * b   = b_   + tgpig.x*args.b_nb2;
+    device       char * dst = dst_ + tgpig.x*args.d_nb2;
+    threadgroup float s1[12];
+    if (tid < 12) {
+        const uint r0 = tid % 4;
+        const uint r1 = tid / 4;
+        device const float * x = (device const float *) (a + r0*args.a_nb01);
+        device const float * y = (device const float *) (b + r1*args.b_nb11);
+        float res = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            res += x[i] * y[i];
+        }
+        s1[r1*4 + r0] = res;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 16) {
+        const uint r0 = tid % 4;
+        const uint r1 = tid / 4;
+        device const float * x = (device const float *) (a + r0*args.a_nb01);
+        float res = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            res += x[i] * s1[i*4 + r1];
+        }
+        ((device float *) dst)[r1*4 + r0] = res;
+    }
+}

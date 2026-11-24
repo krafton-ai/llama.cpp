@@ -983,11 +983,29 @@ static bool ggml_metal_fusion_check_raon_situ2(
     return ggml_metal_raon_situ_common(sc1, th, sc2, mul) && mul->src[1] == sc2 && mul->src[0] != sc2 && ggml_metal_raon_hc_f32c(mul->src[0]) && ggml_nelements(mul->src[0]) == ggml_nelements(mul);
 }
 
+// mHC comb matrix products with a transposed intermediate
+static bool ggml_metal_fusion_check_raon_comb(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes, const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * m1 = nodes[0], * ct = nodes[1], * m2 = nodes[2];
+    const int out_pos[1] = { 2 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1)) { return false; }
+    const ggml_tensor * tr = gf->nodes[node_idxs[idx] + 1];
+    const ggml_tensor * a = m1->src[0], * b = m1->src[1];
+    return tr->op == GGML_OP_TRANSPOSE && tr->src[0] == m1 && ct->src[0] == tr && m2->src[0] == a && m2->src[1] == ct &&
+           a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && m1->type == GGML_TYPE_F32 && m2->type == GGML_TYPE_F32 &&
+           a->ne[0] == 3 && a->ne[1] == 4 && a->ne[2] == 1 && a->ne[3] == 1 && a->nb[0] == 4 &&
+           b->ne[0] == 3 && b->ne[1] == 3 && b->ne[2] >= 1 && b->ne[2] <= raon_fusion_max_tokens && b->ne[3] == 1 && b->nb[0] == 4 &&
+           m1->ne[0] == 4 && m1->ne[1] == 3 && m1->ne[2] == b->ne[2] && m2->ne[0] == 4 && m2->ne[1] == 4 && m2->ne[2] == b->ne[2] && m2->ne[3] == 1 &&
+           ggml_is_contiguous(m1) && ggml_is_contiguous(m2) && ggml_is_contiguous(ct) && ct->ne[0] == 3 && ct->ne[1] == 4 && ct->ne[2] == b->ne[2];
+}
+
 static const std::vector<ggml_op> ops_raon_rda_g = { GGML_OP_ADD, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_raon_rda_v = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_ssm_conv_reshape_silu = { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_UNARY };
 static const std::vector<ggml_op> ops_raon_situ1 = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_raon_situ2 = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_raon_comb = { GGML_OP_MUL_MAT, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_raon_rda_o = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_CONT };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
@@ -1028,6 +1046,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_reshape_silu,  {},     true,  ggml_metal_fusion_check_ssm_conv_reshape_silu },
     { GGML_METAL_FUSION_RAON_SITU1,     ops_raon_situ1,             {},     true,  ggml_metal_fusion_check_raon_situ1 },
     { GGML_METAL_FUSION_RAON_SITU2,     ops_raon_situ2,             {},     true,  ggml_metal_fusion_check_raon_situ2 },
+    { GGML_METAL_FUSION_RAON_COMB,      ops_raon_comb,              {},     true,  ggml_metal_fusion_check_raon_comb },
 };
 
 // ---- alloc deps -----------------------------------------------------------

@@ -1437,4 +1437,12 @@ typedef struct {
     int32_t per;     // elements per token (G: 5120)
 } ggml_metal_kargs_raon_rda;
 
+// Raon-1 mHC comb: MUL_MAT(A [3,4], B [3,3]) -> TRANSPOSE -> CONT -> MUL_MAT(A, .)
+typedef struct {
+    uint64_t a_nb01;   // A row stride (bytes)
+    uint64_t b_nb11;   // B column stride (bytes)
+    uint64_t b_nb2;    // token strides
+    uint64_t d_nb2;
+} ggml_metal_kargs_raon_comb;
+
 #endif // GGML_METAL_IMPL
