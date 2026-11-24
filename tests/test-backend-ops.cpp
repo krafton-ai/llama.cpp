@@ -11163,6 +11163,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 6, false, 64, n, 2560));
     }
 
+    for (int queries : {9, 17}) {
+        test_cases.emplace_back(new test_flash_attn_ext(192, 128, 2, {1, 1}, 512, queries, true, false, 0, 0,
+                                                       GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
     // test src1 f16 overflow
     for (int n : {16, 32, 64}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 4, false, 4096, n, 2048, 1e5f));

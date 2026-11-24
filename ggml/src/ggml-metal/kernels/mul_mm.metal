@@ -9,6 +9,8 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
+constant bool FC_mul_mm_out_f16 [[function_constant(FC_MUL_MM + 8)]];
+constant bool FC_mul_mm_append  [[function_constant(FC_MUL_MM + 9)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -320,7 +322,33 @@ kernel void kernel_mul_mm(
         }
     }
 
-    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+    if (FC_mul_mm_out_f16) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device half  * D  = (device half  *) (dst + (uint64_t)im*args.nbd2 + (uint64_t)(r1 + j)*args.nbd1) + r0;
+                threadgroup float * C = temp_str + (j*NR0);
+                for (int i = 0; i < nr0; i++) {
+                    D[i] = (half) C[i];
+                }
+                if (FC_mul_mm_append && r0 == 0) {
+                    // append the extra dims of the same src1 row (elements ne00 .. ne00+nx-1) after the ne0 computed outputs of this dst row
+                    // (dst row stride nbd1 is wider than ne0: the K buffer is [ne0 + nx] wide)
+                    const int nx = (int) (args.nbd1/sizeof(half)) - args.ne0;
+                    device const half4 * s4 = (device const half4 *) (src1 + args.nb13*i13 + args.nb12*i12 + args.nb11*(r1 + j)) + args.ne00/4;
+                    device half4 * d4 = (device half4 *) ((device half *) (dst + (uint64_t)im*args.nbd2 + (uint64_t)(r1 + j)*args.nbd1) + args.ne0);
+                    for (int i = 0; i < nx/4; ++i) {
+                        d4[i] = s4[i];
+                    }
+                }
+            }
+        }
+    } else if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \

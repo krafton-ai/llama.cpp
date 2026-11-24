@@ -128,6 +128,7 @@
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
 #define OP_FLASH_ATTN_EXT_NCPSG 64
+#define OP_FLASH_ATTN_EXT_NQPSG_DK192 16 // queries per threadgroup of the F16 dk192/dv128 non-vec kernel (two 8-row blocks)
 
 #define OP_FLASH_ATTN_EXT_TENSOR_NQPSG       32
 #define OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE 16
@@ -514,6 +515,8 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    uint64_t nbd1;
+    uint64_t nbd2;
 } ggml_metal_kargs_mul_mm;
 
 typedef struct {

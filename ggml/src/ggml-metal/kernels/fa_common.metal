@@ -87,6 +87,7 @@ void kernel_flash_attn_ext_impl(
   //constexpr short PV16 = PV/16;
 
     constexpr short NW  = N_SIMDWIDTH;
+    constexpr short QB  = Q/8;   // number of 8-row query blocks per threadgroup (2 for dk192/dv128 F16)
     constexpr short NQ  = Q/NSG;
     constexpr short SH  = 2*C; // shared memory per simdgroup (s_t == float)
 
@@ -300,7 +301,11 @@ void kernel_flash_attn_ext_impl(
                 constexpr short NC = (C/8)/NSG;
 
                 FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
-                    qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
+                    qk8x8_t mqk[QB];
+
+                    FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                        mqk[rb] = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
+                    }
 
                     if (DK % 16 != 0) {
                         k8x8_t mk;
@@ -310,11 +315,14 @@ void kernel_flash_attn_ext_impl(
                             simdgroup_barrier(mem_flags::mem_none);
 
                             simdgroup_load(mk, pk + 8*i, NS10, 0, true);
-                            simdgroup_load(mq, pq + 8*i, DK);
 
-                            simdgroup_barrier(mem_flags::mem_none);
+                            FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                                simdgroup_load(mq, pq + rb*8*DK + 8*i, DK);
 
-                            simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+                                simdgroup_barrier(mem_flags::mem_none);
+
+                                simdgroup_multiply_accumulate(mqk[rb], mq, mk, mqk[rb]);
+                            }
                         }
                     } else {
                         k8x8_t mk[2];
@@ -325,20 +333,24 @@ void kernel_flash_attn_ext_impl(
                         for (short i = 0; i < DK8/2; ++i) {
                             simdgroup_barrier(mem_flags::mem_none);
 
-                            simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
-                            simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
-
                             simdgroup_load(mk[0], pk + 0*8 + 16*i, NS10, 0, true);
                             simdgroup_load(mk[1], pk + 1*8 + 16*i, NS10, 0, true);
 
-                            simdgroup_barrier(mem_flags::mem_none);
+                            FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                                simdgroup_load(mq[0], pq + rb*8*DK + 0*8 + 16*i, DK);
+                                simdgroup_load(mq[1], pq + rb*8*DK + 1*8 + 16*i, DK);
 
-                            simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
-                            simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
+                                simdgroup_barrier(mem_flags::mem_none);
+
+                                simdgroup_multiply_accumulate(mqk[rb], mq[0], mk[0], mqk[rb]);
+                                simdgroup_multiply_accumulate(mqk[rb], mq[1], mk[1], mqk[rb]);
+                            }
                         }
                     }
 
-                    simdgroup_store(mqk, ps, SH, 0, false);
+                    FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                        simdgroup_store(mqk[rb], ps + rb*8*SH, SH, 0, false);
+                    }
 
                     pk += 8*(NSG*NS10);
                     ps += 8*(NSG);
@@ -463,15 +475,17 @@ void kernel_flash_attn_ext_impl(
 
                     constexpr short NO = PV8/NSG;
 
-                    o8x8_t lo[NO];
+                    o8x8_t lo[QB][NO];
 
                     {
-                        auto sot = so + 8*sgitg;
+                        FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                            auto sot = so + rb*8*PV + 8*sgitg;
 
-                        FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
-                            simdgroup_load(lo[ii], sot, PV, 0, false);
+                            FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+                                simdgroup_load(lo[rb][ii], sot, PV, 0, false);
 
-                            sot += 8*NSG;
+                                sot += 8*NSG;
+                            }
                         }
                     }
 
@@ -482,8 +496,11 @@ void kernel_flash_attn_ext_impl(
 
                         if (DV <= 64) {
                             FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
-                                s8x8_t vs;
-                                simdgroup_load(vs, ss + 8*cc, SH, 0, false);
+                                s8x8_t vs[QB];
+
+                                FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                                    simdgroup_load(vs[rb], ss + rb*8*SH + 8*cc, SH, 0, false);
+                                }
 
                                 FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
                                     v8x8_t mv[2];
@@ -491,8 +508,10 @@ void kernel_flash_attn_ext_impl(
                                     simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
                                     simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
 
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
+                                    FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                                        simdgroup_multiply_accumulate(lo[rb][2*ii + 0], vs[rb], mv[0], lo[rb][2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[rb][2*ii + 1], vs[rb], mv[1], lo[rb][2*ii + 1]);
+                                    }
                                 }
 
                                 pv  += 8*NS20;
@@ -501,10 +520,12 @@ void kernel_flash_attn_ext_impl(
                             constexpr short NC = (C/8)/2;
 
                             FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
-                                s8x8_t vs[2];
+                                s8x8_t vs[QB][2];
 
-                                simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
-                                simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
+                                FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                                    simdgroup_load(vs[rb][0], ss + rb*8*SH + 16*cc + 0, SH, 0, false);
+                                    simdgroup_load(vs[rb][1], ss + rb*8*SH + 16*cc + 8, SH, 0, false);
+                                }
 
                                 FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
                                     v8x8_t mv[4];
@@ -514,10 +535,12 @@ void kernel_flash_attn_ext_impl(
                                     simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
                                     simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
 
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
+                                    FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                                        simdgroup_multiply_accumulate(lo[rb][2*ii + 0], vs[rb][0], mv[0], lo[rb][2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[rb][2*ii + 1], vs[rb][0], mv[1], lo[rb][2*ii + 1]);
+                                        simdgroup_multiply_accumulate(lo[rb][2*ii + 0], vs[rb][1], mv[2], lo[rb][2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[rb][2*ii + 1], vs[rb][1], mv[3], lo[rb][2*ii + 1]);
+                                    }
                                 }
 
                                 pv  += 2*8*NS20;
@@ -526,12 +549,14 @@ void kernel_flash_attn_ext_impl(
                     }
 
                     {
-                        auto sot = so + 8*sgitg;
+                        FOR_UNROLL (short rb = 0; rb < QB; ++rb) {
+                            auto sot = so + rb*8*PV + 8*sgitg;
 
-                        FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
-                            simdgroup_store(lo[ii], sot, PV, 0, false);
+                            FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+                                simdgroup_store(lo[rb][ii], sot, PV, 0, false);
 
-                            sot += 8*NSG;
+                                sot += 8*NSG;
+                            }
                         }
                     }
                 } else {

@@ -946,8 +946,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
-             base, bc_inp, bc_out, ne12, ne13, r2, r3);
+    const bool out_f16 = op->type == GGML_TYPE_F16;
+    const bool append = out_f16 && ggml_get_op_params_i32(op, 8) != 0;   // fused rope-part append
+    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_of16=%d_app=%d",
+             base, bc_inp, bc_out, ne12, ne13, r2, r3, (int) out_f16, (int) append);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -958,6 +960,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
         ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
+        ggml_metal_cv_set_bool(cv, out_f16, FC_MUL_MM + 8);
+        ggml_metal_cv_set_bool(cv, append,  FC_MUL_MM + 9);
         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
@@ -975,7 +979,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.nr0 = 64;
         res.nr1 = 32;
 
-        res.smem = bc_out ? 8192 : (4096 + 2048);
+        res.smem = (bc_out || out_f16) ? 8192 : (4096 + 2048);
     }
 
     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
@@ -1911,7 +1915,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
 
     // do bounds checks for the mask?
-    const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
+    // the f16 dk192/dv128 kernel works on 16-query tiles
+    const int qtile = (dk == 192 && dv == 128 && use_kv_f16 == true) ? OP_FLASH_ATTN_EXT_NQPSG_DK192 : (dk == 192 && dv == 128 && op->src[1]->type == GGML_TYPE_F16) ? OP_FLASH_ATTN_EXT_NQPSG_DK192 : 8;
+    const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % qtile != 0);
 
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
             "flash_attn_ext",

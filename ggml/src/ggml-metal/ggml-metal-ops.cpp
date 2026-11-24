@@ -2970,10 +2970,12 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.nb11 =*/ nb11,
             /*.nb12 =*/ nb12,
             /*.nb13 =*/ nb13,
-            /*.ne0  =*/ ne0,
+            /*.ne0  =*/ (op->type == GGML_TYPE_F16 && ggml_get_op_params_i32(op, 8) != 0) ? ne01 : ne0,   // append mode computes only src0 rows
             /*.ne1  =*/ ne1,
             /*.r2   =*/ r2,
             /*.r3   =*/ r3,
+            /*.nbd1 =*/ op->nb[1],
+            /*.nbd2 =*/ op->nb[2],
         };
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -3927,7 +3929,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
     } else if (!use_sparse && !ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // half8x8 kernel
-        const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
+        // F16 K/V with dk192/dv128 (Raon MLA expanded prefill) uses a 16-query tile (two 8-row blocks sharing each K/V tile load)
+        const bool dk192_f16 = ne00 == 192 && ne20 == 128 && (use_kv_f16 || op->src[1]->type == GGML_TYPE_F16);   // = the kernel_flash_attn_ext_f16_dk192_dv128 pipeline
+        const int nqptg = dk192_f16 ? OP_FLASH_ATTN_EXT_NQPSG_DK192 : OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG; // cache values per simdgroup
 
         GGML_ASSERT(nqptg <= 32);
