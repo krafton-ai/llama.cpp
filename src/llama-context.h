@@ -119,6 +119,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_skip_recurrent_rollback(bool value) { cparams.skip_recurrent_rollback = value; }
     // device-resident extracted layer inputs
     void dev_feat_enable(const int32_t * layer_ids, int32_t n_layers);
     bool dev_feat_ready() const { return dev_feat_on; }

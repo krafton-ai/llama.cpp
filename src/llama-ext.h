@@ -102,6 +102,8 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+// Skip historical Raon convolution snapshots only if the caller will not roll back this decode.
+LLAMA_API void llama_set_skip_recurrent_rollback(struct llama_context * ctx, bool value);
 
 // keep the extracted target layer inputs on the device, concatenated per token row in the given layer order
 // ([n_layers * n_embd_layer_inp, n_batch] F32), and let a draft context read them from there instead of from host rows.

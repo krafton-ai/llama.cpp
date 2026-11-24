@@ -12,6 +12,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -521,7 +522,7 @@ struct server_slot {
     int get_n_draft_max() const {
         GGML_ASSERT(task);
 
-        if (!can_speculate()) {
+        if (!can_speculate() || task->params.spec_disable) {
             return 0;
         }
 
@@ -3326,6 +3327,14 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        // Keep draft state current, but a single generated token with no speculative work cannot be rejected.
+        llama_set_skip_recurrent_rollback(ctx_tgt, spec && batch.size() == 1 &&
+                batch.slot_batched->state == SLOT_STATE_GENERATING &&
+                std::all_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return !slot.is_processing() ||
+                            (slot.task && slot.task->params.spec_disable && slot.spec_draft.empty());
+                }));
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -3365,6 +3374,7 @@ private:
                 break; // stop any further processing
             }
         }
+        llama_set_skip_recurrent_rollback(ctx_tgt, false);
     }
 
     void pre_decode() {

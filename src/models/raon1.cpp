@@ -205,7 +205,8 @@ ggml_tensor * llama_model_raon1::graph::build_rda_conv(
 
     // group s holds the conv window s tokens back.
     // [TAG_RECURRENT_ROLLBACK_SPLITS]: the last K_rs tokens must share one ubatch.
-    for (int64_t s = 0; s < K_rs; ++s) {
+    const int64_t n_snapshots = cparams.skip_recurrent_rollback && n_tokens == 1 ? 1 : K_rs;
+    for (int64_t s = 0; s < n_snapshots; ++s) {
         const int64_t s_idx = std::max<int64_t>(0, n_seq_tokens - s);
         ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
             conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);

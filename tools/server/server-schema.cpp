@@ -34,6 +34,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 
+    add((new field_bool("spec_disable", params.spec_disable))
+        ->set_desc("Disable speculative decoding for this request while keeping the draft model loaded"));
+
     add((new field_bool("return_progress", params.return_progress))
         ->set_desc("Include prompt processing progress events in stream mode"));
 
