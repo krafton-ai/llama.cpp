@@ -957,9 +957,37 @@ static bool ggml_metal_fusion_check_ssm_conv_reshape_silu(
     return ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1);
 }
 
+// situ activation chains of the FFN/MoE gate and up projections (any contiguous F32 activation)
+static bool ggml_metal_raon_situ_common(const ggml_tensor * sc1, const ggml_tensor * th, const ggml_tensor * sc2, const ggml_tensor * mul) {
+    return ggml_metal_raon_unary_is(th, GGML_UNARY_OP_TANH) && sc1->op == GGML_OP_SCALE && sc2->op == GGML_OP_SCALE && th->src[0] == sc1 && sc2->src[0] == th &&
+           ggml_metal_raon_hc_f32c(mul) && ggml_nelements(mul) <= 65536 && ggml_metal_raon_hc_f32c(sc1->src[0]) && ggml_nelements(sc1->src[0]) == ggml_nelements(mul) &&
+           sc1->op_params != nullptr && sc2->op_params != nullptr && ggml_metal_raon_hc_f32c(sc1) && ggml_metal_raon_hc_f32c(sc2);
+}
+
+static bool ggml_metal_fusion_check_raon_situ1(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes, const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * sc1 = nodes[0], * th = nodes[1], * sc2 = nodes[2], * sg = nodes[3], * mul = nodes[4];
+    const int out_pos[1] = { 4 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1)) { return false; }
+    return ggml_metal_raon_situ_common(sc1, th, sc2, mul) && ggml_metal_raon_unary_is(sg, GGML_UNARY_OP_SIGMOID) && sg->src[0] == sc1->src[0] &&
+           mul->src[0] == sc2 && mul->src[1] == sg;
+}
+
+static bool ggml_metal_fusion_check_raon_situ2(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes, const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    GGML_UNUSED(mode);
+    const ggml_tensor * sc1 = nodes[0], * th = nodes[1], * sc2 = nodes[2], * mul = nodes[3];
+    const int out_pos[1] = { 3 };
+    if (!ggml_metal_raon_hc_subgraph(fusion, gf, node_idxs, idx, out_pos, 1)) { return false; }
+    return ggml_metal_raon_situ_common(sc1, th, sc2, mul) && mul->src[1] == sc2 && mul->src[0] != sc2 && ggml_metal_raon_hc_f32c(mul->src[0]) && ggml_nelements(mul->src[0]) == ggml_nelements(mul);
+}
+
 static const std::vector<ggml_op> ops_raon_rda_g = { GGML_OP_ADD, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_raon_rda_v = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_ssm_conv_reshape_silu = { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_UNARY };
+static const std::vector<ggml_op> ops_raon_situ1 = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_raon_situ2 = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_raon_rda_o = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_CONT };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
@@ -998,6 +1026,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_RAON_RDA_V,     ops_raon_rda_v,             {},     true,  ggml_metal_fusion_check_raon_rda_v },
     { GGML_METAL_FUSION_RAON_RDA_O,     ops_raon_rda_o,             {},     true,  ggml_metal_fusion_check_raon_rda_o },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_reshape_silu,  {},     true,  ggml_metal_fusion_check_ssm_conv_reshape_silu },
+    { GGML_METAL_FUSION_RAON_SITU1,     ops_raon_situ1,             {},     true,  ggml_metal_fusion_check_raon_situ1 },
+    { GGML_METAL_FUSION_RAON_SITU2,     ops_raon_situ2,             {},     true,  ggml_metal_fusion_check_raon_situ2 },
 };
 
 // ---- alloc deps -----------------------------------------------------------

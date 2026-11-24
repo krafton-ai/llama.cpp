@@ -1005,3 +1005,45 @@ kernel void kernel_raon_rda_o_f32(
     }
 }
 
+// pattern P1: SCALE -> TANH -> SCALE (softcap) and SIGMOID(x) of the same input -> MUL        out = (sc2*tanh(sc1*x+bi1)+bi2) * sigmoid(x)
+kernel void kernel_raon_situ1_f32(
+        constant ggml_metal_kargs_raon_rda & args,
+        device const float * x,
+        device       float * dst,
+        uint    gid  [[thread_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const uint ic = gid < (uint) args.n ? gid : 0;
+    const float xv = x[ic];
+    float t1 = args.sc1 * xv + args.bi1;
+    t1 = simd_shuffle(t1, tiisg);
+    float t2 = precise::tanh(t1);
+    t2 = simd_shuffle(t2, tiisg);
+    float t3 = args.sc2 * t2 + args.bi2;
+    t3 = simd_shuffle(t3, tiisg);
+    float sg = 1 / (1 + exp(-xv));
+    sg = simd_shuffle(sg, tiisg);
+    if (gid < (uint) args.n) {
+        dst[gid] = t3 * sg;
+    }
+}
+
+// pattern P2: SCALE -> TANH -> SCALE (softcap of the up projection) -> MUL(prev, .)
+kernel void kernel_raon_situ2_f32(
+        constant ggml_metal_kargs_raon_rda & args,
+        device const float * x,
+        device const float * prev,
+        device       float * dst,
+        uint    gid  [[thread_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const uint ic = gid < (uint) args.n ? gid : 0;
+    float t1 = args.sc1 * x[ic] + args.bi1;
+    t1 = simd_shuffle(t1, tiisg);
+    float t2 = precise::tanh(t1);
+    t2 = simd_shuffle(t2, tiisg);
+    float t3 = args.sc2 * t2 + args.bi2;
+    t3 = simd_shuffle(t3, tiisg);
+    if (gid < (uint) args.n) {
+        dst[gid] = prev[gid] * t3;
+    }
+}
+

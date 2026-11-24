@@ -50,6 +50,8 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_RAON_RDA_G,   // ADD MUL SCALE SIGMOID SCALE
     GGML_METAL_FUSION_RAON_RDA_V,   // ADD NEG SOFTPLUS SUB EXP MUL
     GGML_METAL_FUSION_RAON_RDA_O,   // SIGMOID MUL CONT
+    GGML_METAL_FUSION_RAON_SITU1,   // SCALE TANH SCALE SIGMOID MUL
+    GGML_METAL_FUSION_RAON_SITU2,   // SCALE TANH SCALE MUL
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
