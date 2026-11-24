@@ -3757,6 +3757,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_SCALE && cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_raon_situ_match(cgraph, i)) {
+        // SiTU chain (gate softcap, sigmoid gate, up softcap, product) in one kernel
+        const int outputs[1] = { i + 8 };
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, outputs, 1)) {
+            ggml_cuda_raon_situ_run(*cuda_ctx, cgraph, i);
+            return 8;
+        }
+    }
+
     {   // Raon mHC and RDA graph fusions.
         int n_skip = 0;
         if (ggml_cuda_raon_hc_try_fuse(*cuda_ctx, cgraph, i, &n_skip)) {

@@ -643,3 +643,73 @@ bool ggml_cuda_raon_hc_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * c
     return false;
 }
 
+// SiTU activation chain.
+// One kernel replaces softcap(gate) -> unary_gated(sigmoid, x softcap) -> softcap(up) -> mul. Every intermediate of the original kernels is
+// rounded to F32 in memory, so each stage below is a separate statement with the same expression as the kernel it replaces
+// (softcap_f32: tanhf(scale*x)*softcap, unary_gated_op_kernel: op_sigmoid(x)*g, k_bin_bcast mul: a*b).
+static __global__ void raon_situ_f32(const float * g, const float * u, float * dst, const int64_t n,
+        const float s1, const float c1, const float s3, const float c3) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float gv  = g[i];
+    const float uv  = u[i];
+    const float a   = tanhf(s1 * gv) * c1;
+    const float act = rhc_sigmoid(gv) * a;
+    const float b   = tanhf(s3 * uv) * c3;
+    dst[i] = act * b;
+}
+
+// nodes i..i+8: SCALE TANH SCALE SIGMOID MUL SCALE TANH SCALE MUL; the up projection (the source of nd[5]) was computed before the chain
+bool ggml_cuda_raon_situ_match(const ggml_cgraph * cgraph, int i) {
+    if (i + 9 > cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * const * nd = cgraph->nodes + i;
+    if (nd[0]->op != GGML_OP_SCALE || nd[1]->op != GGML_OP_UNARY || nd[2]->op != GGML_OP_SCALE || nd[3]->op != GGML_OP_UNARY || nd[4]->op != GGML_OP_MUL ||
+            nd[5]->op != GGML_OP_SCALE || nd[6]->op != GGML_OP_UNARY || nd[7]->op != GGML_OP_SCALE || nd[8]->op != GGML_OP_MUL ||
+            ggml_get_unary_op(nd[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(nd[3]) != GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(nd[6]) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+    ggml_tensor * g = nd[0]->src[0], * u = nd[5]->src[0], * dst = nd[8];
+    if (nd[1]->src[0] != nd[0] || nd[2]->src[0] != nd[1] || nd[3]->src[0] != g ||
+            !((nd[4]->src[0] == nd[2] && nd[4]->src[1] == nd[3]) || (nd[4]->src[0] == nd[3] && nd[4]->src[1] == nd[2])) ||
+            nd[6]->src[0] != nd[5] || nd[7]->src[0] != nd[6] ||
+            !((nd[8]->src[0] == nd[4] && nd[8]->src[1] == nd[7]) || (nd[8]->src[0] == nd[7] && nd[8]->src[1] == nd[4]))) {
+        return false;
+    }
+    for (int j = 0; j < 9; ++j) {
+        if (u == nd[j]) {
+            return false;
+        }
+    }
+    for (int j : { 0, 2, 5, 7 }) {
+        float b;
+        memcpy(&b, (const float *) nd[j]->op_params + 1, sizeof(float));
+        if (b != 0.0f) {
+            return false;
+        }
+    }
+    const int64_t n = ggml_nelements(dst);
+    if (n < 1 || !rhc_f32c(g) || !rhc_f32c(u) || !rhc_f32c(dst) || ggml_nelements(g) != n || ggml_nelements(u) != n ||
+            nd[0]->type != GGML_TYPE_F32 || nd[2]->type != GGML_TYPE_F32 || nd[7]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    static const enum ggml_op ops[9] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+                                         GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+    const int outputs[1] = { i + 8 };
+    return ggml_can_fuse_subgraph(cgraph, i, 9, ops, outputs, 1);
+}
+
+void ggml_cuda_raon_situ_run(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    ggml_tensor * const * nd = cgraph->nodes + i;
+    float s1, c1, s3, c3;
+    memcpy(&s1, (const float *) nd[0]->op_params + 0, sizeof(float));
+    memcpy(&c1, (const float *) nd[2]->op_params + 0, sizeof(float));
+    memcpy(&s3, (const float *) nd[5]->op_params + 0, sizeof(float));
+    memcpy(&c3, (const float *) nd[7]->op_params + 0, sizeof(float));
+    const int64_t n = ggml_nelements(nd[8]);
+    raon_situ_f32<<<(int) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const float *) nd[0]->src[0]->data, (const float *) nd[5]->src[0]->data,
+            (float *) nd[8]->data, n, s1, c1, s3, c3);
+}

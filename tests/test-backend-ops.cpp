@@ -3569,6 +3569,48 @@ struct test_softcap : public test_case {
     }
 };
 
+// SiTU chain: two softcapped branches, one gated by a sigmoid, multiplied together (graph fusion on backends that support it)
+struct test_raon_situ : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float s1;
+    const float c1;
+    const float s3;
+    const float c3;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, ne, s1, c1, s3, c3);
+    }
+
+    test_raon_situ(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {10, 10, 10, 10},
+            float s1 = 0.2f, float c1 = 5.0f, float s3 = 0.125f, float c3 = 8.0f)
+        : type(type), ne(ne), s1(s1), c1(c1), s3(s3), c3(c3) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * g = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * u = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(g, "gate");
+        ggml_set_name(u, "up");
+
+        ggml_tensor * capped_gate = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, g, s1)), c1);
+        ggml_tensor * act         = ggml_mul(ctx, capped_gate, ggml_sigmoid(ctx, g));
+        ggml_tensor * capped_up   = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, u, s3)), c3);
+
+        ggml_tensor * out = ggml_mul(ctx, act, capped_up);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -10501,6 +10543,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {100, 10, 10, 10}, 0.5f, 0.0f));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
+    test_cases.emplace_back(new test_raon_situ(GGML_TYPE_F32, {10, 10, 10, 10}));
+    test_cases.emplace_back(new test_raon_situ(GGML_TYPE_F32, {2560, 7, 1, 1}));
+    test_cases.emplace_back(new test_raon_situ(GGML_TYPE_F32, {6144, 1, 1, 1}, 0.5f, 2.0f, 0.25f, 3.0f));
     test_cases.emplace_back(new test_silu_back());
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
