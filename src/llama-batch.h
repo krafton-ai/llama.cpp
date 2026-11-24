@@ -221,6 +221,7 @@ private:
 
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
+    const float *               embd_ext = nullptr; // Embeddings referenced from the input batch (not owned)
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below

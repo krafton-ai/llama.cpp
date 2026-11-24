@@ -8,6 +8,7 @@
 #include "llama-context.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -121,6 +122,7 @@ bool llama_batch_allocr::init(
         }
     }
 
+    embd_ext = nullptr;
     if (mixed) {
         embd_vec.assign((size_t) n_tok*n_embd, 0.0f);
         for (int32_t i = 0; i < n_tok; ++i) {
@@ -130,7 +132,9 @@ bool llama_batch_allocr::init(
             }
         }
     } else if (has_embd) {
-        embd_vec = batch_inp.embd;
+        // The input batch outlives the decode.
+        embd_vec.clear();
+        embd_ext = batch_inp.embd.data();
     }
 
     if (has_state) {
@@ -229,7 +233,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = has_embd  ? (embd_ext ? const_cast<float *>(embd_ext) : embd_vec.data()) : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -882,7 +886,21 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
     const bool has_state = !state_vec.empty();
 
-    const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
+    float * embd_alias_ptr = nullptr; // read-only use: the graph only reads ubatch.embd
+    if (use_embd && !mixed && n_tokens > 0) {
+        bool contiguous = true;
+        for (uint32_t i = 1; i < n_tokens; ++i) {
+            if (idxs[i] != idxs[0] + (int32_t) i) {
+                contiguous = false;
+                break;
+            }
+        }
+        if (contiguous) {
+            embd_alias_ptr = const_cast<float *>(batch.embd + (int64_t) idxs[0]*n_embd);
+        }
+    }
+
+    const int64_t n_embd_all  = (use_embd && !embd_alias_ptr) ? (int64_t) n_tokens*n_embd       : 0;
     const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
 
@@ -908,7 +926,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (use_embd) {
+        if (use_embd && !embd_alias_ptr) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -965,7 +983,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
-        /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
+        /*.embd         =*/ use_embd  ? (embd_alias_ptr ? embd_alias_ptr : udata->embd.data()) : nullptr,
         /*.embd_state   =*/ has_state ? udata->embd_state.data() : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
