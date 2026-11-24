@@ -1755,7 +1755,13 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
+        const bool row_kernel = ne10 == 4 && ne1 == 1;   // keep in sync with ggml_metal_library_get_pipeline_ssm_conv
+        if (row_kernel) {
+            constexpr int NTG = 128;
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + NTG - 1)/NTG, ne1, ne02, NTG, 1, 1);
+        } else {
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
+        }
     }
 
     if (n_fuse > 1 && ggml_metal_fusion_info_debug(ctx->finfo) > 1) {

@@ -562,6 +562,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
 
     if (op->src[1]->ne[0] % 4 == 0) {
         suffix = "_4";
+        if (op->src[1]->ne[0] == 4 && op->ne[1] == 1) {
+            suffix = "_4_r";
+        }
     }
 
     snprintf(base, 256, "kernel_ssm_conv_%s_%s%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix);
