@@ -133,6 +133,11 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+// alpha of a request with thinking off: the model's "none" alpha when it defines one above 0, else 0.1
+static float server_no_thinking_alpha(float model_alpha) {
+    return model_alpha > 0.0f ? model_alpha : 0.1f;
+}
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -4951,7 +4956,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
 
         // reasoning effort steering: the model's efforts select their alpha, requests without one use the model's
-        // default effort, "none" (thinking off) uses its own alpha if the model defines it and 0 otherwise;
+        // default effort, "none" (thinking off) uses the model's own "none" alpha if it is above 0, else 0.1;
         // other efforts are refused
         float effort_alpha = 0.0f;
         if (ctx_server.model_tgt && llama_model_reasoning_effort_count(ctx_server.model_tgt) > 0) {
@@ -4960,7 +4965,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const std::string name = effort.is_string() ? effort.get<std::string>() : "";
             const bool known = effort.is_null() ? llama_model_reasoning_effort_alpha(model, nullptr, &effort_alpha)
                                                 : effort.is_string() && llama_model_reasoning_effort_alpha(model, name.c_str(), &effort_alpha);
-            if (!known && name != "none") {
+            if (name == "none") {
+                effort_alpha = server_no_thinking_alpha(known ? effort_alpha : 0.0f);
+            } else if (!known) {
                 std::string names;
                 for (int32_t i = 0; i < llama_model_reasoning_effort_count(model); ++i) {
                     names += std::string(i ? ", " : "") + llama_model_reasoning_effort_name(model, i);
