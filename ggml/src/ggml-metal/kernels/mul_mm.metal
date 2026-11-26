@@ -142,6 +142,35 @@ kernel void kernel_mul_mm(
     const int tileM = min(NRA, M - ra);
     const int tileN = min(NRB, N - rb);
 
+    if (FC_mul_mm_out_f16) {
+        // F16 dst with explicit row/batch strides (MLA expand); see the simdgroup kernel below
+        // cooperative_tensor::store only writes its own element type (float), so convert element by element
+        // (index [0] runs along M and [1] along N, as in the float store below)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+            if (!cT.is_valid_element(i)) {
+                continue;
+            }
+            const auto idx = cT.get_multidimensional_index(i);
+            if (idx[0] < tileM && idx[1] < tileN) {
+                device half * d = (device half *) (dst + (uint64_t) im*args.nbd2 + (uint64_t) (rb + idx[1])*args.nbd1) + ra + idx[0];
+                *d = (half) cT[i];
+            }
+        }
+
+        if (FC_mul_mm_append && ra == 0) {
+            // append the extra dims of the same src1 row (elements ne00 .. ne00+nx-1) after the M computed outputs
+            const int nx = (int) (args.nbd1/sizeof(half)) - M;
+            for (int j = tiitg; j < tileN; j += NUM_THREADS) {
+                device const half4 * s4 = (device const half4 *) (srcB + args.nb13*i13 + args.nb12*i12 + args.nb11*(rb + j)) + K/4;
+                device half4 * d4 = (device half4 *) ((device half *) (dst + (uint64_t) im*args.nbd2 + (uint64_t) (rb + j)*args.nbd1) + M);
+                for (int i = 0; i < nx/4; ++i) {
+                    d4[i] = s4[i];
+                }
+            }
+        }
+        return;
+    }
+
     device float * dstTile = (device float *)dst + (uint64_t) im * N * M + (uint64_t) rb * M + ra;
 
     auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, tileN), array<int, 2>({1, M}));

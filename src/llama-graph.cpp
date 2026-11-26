@@ -3437,7 +3437,9 @@ ggml_tensor * llm_graph_context::build_attn_mla_expand(
     ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
 
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);   // [576, n_kv, 1, ns]
-    if (k->type != GGML_TYPE_F16 || k->ne[3] != 1 || k->ne[1] != 1) {
+    // the F16-output GEMMs below exist only in the Metal mul_mm kernels, which are picked for more than
+    // 16 src1 rows (fewer rows go to the MMA / mul_mv kernels, which would write F32 into the F16 buffers)
+    if (k->type != GGML_TYPE_F16 || k->ne[3] != 1 || k->ne[1] != 1 || k->ne[2] <= 16) {
         return nullptr;
     }
     const int64_t rank = v_cur->ne[0];             // 512
